@@ -24,7 +24,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY src ./src
 COPY bin ./bin
-COPY entrypoint.sh ./
+COPY --chmod=755 entrypoint.sh ./
 # Our accumulated agent knowledge: plugin (skills, agents, hooks) + user-level CLAUDE.md.
 COPY agent ./agent
 COPY --chown=node:node agent/CLAUDE.md /home/node/.claude/CLAUDE.md
