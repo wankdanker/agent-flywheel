@@ -33,7 +33,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     (e.g. a CI cache mount) can't let two issues' clones collide;
   - runs the worker;
   - maps the outcome to an exit code: 0 done, 10 asked a question, 1 incomplete, 2 bad config. Both CIs treat 10 as success.
-- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them.
+- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`.
 - `src/worker.ts` renders the issue and its thread into one prompt, then runs `query()` with:
   - `bypassPermissions`;
