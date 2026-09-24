@@ -1,0 +1,10 @@
+# Agent Flywheel on GitLab. Jobs live in .gitlab/ci/; this file only wires them up.
+# - Pushes build the agent image (build.yml).
+# - Issue/comment webhooks hit the pipeline trigger API; we dispatch one job per actionable issue (agent.yml).
+# Secrets (ANTHROPIC_API_KEY, AGENT_GITLAB_TOKEN) are masked project CI/CD variables.
+# Set AGENT_IMAGE (e.g. $CI_REGISTRY_IMAGE:sha-1a2b3c4d) to pin the image issues run on.
+
+stages: [build, dispatch, work]
+
+include:
+  - local: .gitlab/ci/*.yml

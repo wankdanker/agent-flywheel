@@ -1,0 +1,27 @@
+# Work issues. Sources:
+#   trigger → a project webhook (issue + comment events) pointed at the pipeline trigger API;
+#             GitLab hands us the event as the TRIGGER_PAYLOAD file.
+#   web     → "Run pipeline" with ISSUE=<iid> (and optionally AGENT_IMAGE) to run one issue by hand.
+
+.agent-rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+    - if: $CI_PIPELINE_SOURCE == "web" && $ISSUE
+
+agent-dispatch:
+  extends: .agent-rules
+  stage: dispatch
+  # Zero deps (plain fetch), so stock node from our checkout; no image pull needed.
+  image: node:24-slim
+  script:
+    - node bin/dispatch-gitlab.ts > agent-jobs.yml
+  artifacts:
+    paths: [agent-jobs.yml]
+
+agent-work:
+  extends: .agent-rules
+  stage: work
+  trigger:
+    include:
+      - artifact: agent-jobs.yml
+        job: agent-dispatch

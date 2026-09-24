@@ -1,0 +1,5 @@
+{
+  "name": "agent-flywheel",
+  "version": "0.1.0",
+  "description": "Our shared skills, subagents, and hooks for the Agent Flywheel issue worker."
+}
