@@ -15,7 +15,8 @@ It's stateless. The only state is:
 
 ## Commands
 
-- `npm run typecheck` runs `tsc -p .`. It is the only static check; there are no tests or linter.
+- `npm run typecheck` runs `tsc -p .`. There is no linter.
+- `npm test` runs the `node:test` suite in `test/` (zero extra deps; Node runs the `.test.ts` files directly, same as `src`/`bin`).
 - `docker build -t agent-flywheel . && docker run --rm --env-file .env agent-flywheel` works one issue end to end. See `.env.example`.
 - `TRIGGER_PAYLOAD=payload.json CI_REGISTRY_IMAGE=x node bin/dispatch-gitlab.ts` prints the GitLab child-pipeline YAML for a saved webhook payload. Payloads for human comments also call the members API, which needs `CI_API_V4_URL`, `CI_PROJECT_ID` and `AGENT_GITLAB_TOKEN`.
 
@@ -33,9 +34,10 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     (e.g. a CI cache mount) can't let two issues' clones collide;
   - runs the worker;
   - maps the outcome to an exit code: 0 done, 10 asked a question, 1 incomplete, 2 bad config. Both CIs treat 10 as success.
-- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent.
-- `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`.
-- `src/worker.ts` renders the issue and its thread into one prompt, then runs `query()` with:
+- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent. `toComment` only honors `BOT_MARKER` when the poster is independently trusted (or a GitHub `Bot`-type account) — the marker text alone, e.g. pasted by an attacker, is not enough.
+- `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
+- `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`. Both attach a `Trust` to the issue (from its author) and to every comment (from that comment's author) when building a `Ticket`.
+- `src/worker.ts`'s `buildPrompt` renders the issue into a prompt, gated by trust (see README's "Trust model"): a trusted-authored issue's title/body/trusted-thread are used as before; an untrusted-authored issue's title/body are never included, and only trusted human comments (`trustedDirectives`) become the task. `runTicket` short-circuits to `agent/blocked` before ever calling the model when an untrusted-authored issue has no trusted directive yet. It then runs `query()` with:
   - `bypassPermissions`;
   - our plugin;
   - an in-process MCP server with `ask_question` (→ blocked) and `finish` (→ review).

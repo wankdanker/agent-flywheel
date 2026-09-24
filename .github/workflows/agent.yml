@@ -33,6 +33,9 @@ concurrency:
 
 jobs:
   work:
+    # The author_association allowlist below must stay in sync with
+    # GITHUB_TRUSTED_ASSOCIATIONS in src/trust.ts, which gates what the agent reads as
+    # instructions using the same rule.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' && github.event.label.name == 'agent') ||

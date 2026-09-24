@@ -1,5 +1,6 @@
 // Our thin GitLab REST client for one issue.
 import { STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
+import { gitlabMemberTrust, type Trust } from "./trust.ts";
 
 // `project` is a numeric id or a `group/project` path.
 export function gitlabTracker(o: { token: string; apiUrl: string; project: string; issue: number }): Tracker {
@@ -14,6 +15,17 @@ export function gitlabTracker(o: { token: string; apiUrl: string; project: strin
     return res.json();
   }
 
+  // GitLab notes/issues carry an author id, not a ready-made trust level like GitHub's
+  // `author_association`; resolving it means a members-API call per author. Cache by user
+  // id so one ticket fetch with N comments from the same person costs one lookup, not N.
+  const membership = new Map<number, Promise<Trust>>();
+  function trustOf(userId: number): Promise<Trust> {
+    if (!membership.has(userId)) {
+      membership.set(userId, gitlabMemberTrust({ apiUrl: o.apiUrl, project: o.project, token: o.token, userId }));
+    }
+    return membership.get(userId)!;
+  }
+
   return {
     platform: "gitlab",
 
@@ -24,14 +36,21 @@ export function gitlabTracker(o: { token: string; apiUrl: string; project: strin
 
     async getTicket() {
       const [i, notes] = await Promise.all([gl(issue), gl(`${issue}/notes?sort=asc&order_by=created_at&per_page=100`)]);
+      // System notes are GitLab's own "added label X" lines, not conversation.
+      const humanNotes = notes.filter((n: any) => !n.system);
+      const [authorTrust, noteTrusts] = await Promise.all([
+        trustOf(i.author.id),
+        Promise.all(humanNotes.map((n: any) => trustOf(n.author.id))),
+      ]);
       return {
         number: i.iid,
         url: i.web_url,
         title: i.title,
         body: i.description ?? "",
+        author: i.author.username,
+        trust: authorTrust,
         labels: i.labels,
-        // System notes are GitLab's own "added label X" lines, not conversation.
-        comments: notes.filter((n: any) => !n.system).map((n: any) => toComment(n.author.username, n.body, n.created_at)),
+        comments: humanNotes.map((n: any, idx: number) => toComment(n.author.username, n.body, n.created_at, noteTrusts[idx])),
       };
     },
 

@@ -4,5 +4,5 @@
     "allowImportingTsExtensions": true, "noEmit": true, "strict": true,
     "erasableSyntaxOnly": true, "verbatimModuleSyntax": true, "skipLibCheck": true, "types": ["node"]
   },
-  "include": ["src", "bin"]
+  "include": ["src", "bin", "test"]
 }

@@ -1,5 +1,6 @@
 // Our thin GitHub REST client for one issue.
 import { STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
+import { trustFromGithubAssociation } from "./trust.ts";
 
 export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string }): Tracker {
   const apiUrl = o.apiUrl ?? "https://api.github.com";
@@ -34,8 +35,12 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
         url: i.html_url,
         title: i.title,
         body: i.body ?? "",
+        author: i.user.login,
+        trust: trustFromGithubAssociation(i.author_association),
         labels: i.labels.map((l: any) => l.name),
-        comments: comments.map((c: any) => toComment(c.user.login, c.body ?? "", c.created_at)),
+        comments: comments.map((c: any) =>
+          toComment(c.user.login, c.body ?? "", c.created_at, trustFromGithubAssociation(c.author_association), c.user?.type === "Bot"),
+        ),
       };
     },
 

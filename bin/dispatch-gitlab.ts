@@ -3,15 +3,21 @@
 // Runs on stock node with no npm install, so it (and what it imports) stays dependency-free.
 import { readFileSync } from "node:fs";
 import { BOT_MARKER, OPT_IN_LABEL, need } from "../src/tracker.ts";
+import { gitlabMemberTrust } from "../src/trust.ts";
 
 const titles = (labels: any[] = []) => labels.map((l) => l.title);
 
 // Anyone who can comment could otherwise start a run with our secrets; require Developer+.
+// Same membership check src/gitlab.ts uses to classify comment trust for the prompt, so
+// "who can trigger a run" and "whose content the model sees" can't drift apart.
 async function isDeveloper(userId: number) {
-  const res = await fetch(`${need("CI_API_V4_URL")}/projects/${need("CI_PROJECT_ID")}/members/all/${userId}`, {
-    headers: { "PRIVATE-TOKEN": need("AGENT_GITLAB_TOKEN") },
+  const trust = await gitlabMemberTrust({
+    apiUrl: need("CI_API_V4_URL"),
+    project: need("CI_PROJECT_ID"),
+    token: need("AGENT_GITLAB_TOKEN"),
+    userId,
   });
-  return res.ok && (await res.json()).access_level >= 30;
+  return trust === "trusted";
 }
 
 async function actionableIssue(p: any): Promise<number | undefined> {
