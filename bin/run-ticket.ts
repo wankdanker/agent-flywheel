@@ -4,6 +4,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { githubTracker } from "../src/github.ts";
 import { gitlabTracker } from "../src/gitlab.ts";
+import { notionTracker } from "../src/notion.ts";
 import { need, type Tracker } from "../src/tracker.ts";
 import { branchFor, runTicket } from "../src/worker.ts";
 
@@ -17,19 +18,23 @@ if (!process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
 
 function detectTracker(): Tracker {
   const platform = process.env.AGENT_PLATFORM || (process.env.GITLAB_CI ? "gitlab" : process.env.GITHUB_ACTIONS ? "github" : "");
-  const issue = Number(need("ISSUE"));
   if (platform === "github") {
-    return githubTracker({ token: need("GH_TOKEN"), repo: need("GITHUB_REPOSITORY"), issue, apiUrl: process.env.GITHUB_API_URL });
+    return githubTracker({ token: need("GH_TOKEN"), repo: need("GITHUB_REPOSITORY"), issue: Number(need("ISSUE")), apiUrl: process.env.GITHUB_API_URL });
   }
   if (platform === "gitlab") {
     return gitlabTracker({
       token: need("AGENT_GITLAB_TOKEN"),
       apiUrl: process.env.CI_API_V4_URL || `https://${need("CI_SERVER_HOST")}/api/v4`,
       project: process.env.CI_PROJECT_ID || need("CI_PROJECT_PATH"),
-      issue,
+      issue: Number(need("ISSUE")),
     });
   }
-  console.error("can't tell the platform; set AGENT_PLATFORM to github or gitlab");
+  if (platform === "notion") {
+    // One ticket per container run, like GitHub/GitLab: the poller (or a
+    // manual run) picks the page id, not this script.
+    return notionTracker({ token: need("NOTION_TOKEN"), pageId: need("NOTION_TICKET_ID") });
+  }
+  console.error("can't tell the platform; set AGENT_PLATFORM to github, gitlab or notion");
   process.exit(2);
 }
 

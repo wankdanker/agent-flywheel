@@ -33,8 +33,17 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     (e.g. a CI cache mount) can't let two issues' clones collide;
   - runs the worker;
   - maps the outcome to an exit code: 0 done, 10 asked a question, 1 incomplete, 2 bad config. Both CIs treat 10 as success.
-- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent.
+- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how GitHub/GitLab avoid re-triggering on them; Notion has no hidden-comment syntax, so `toComment`'s substring match still finds it, just visibly. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`.
+- `src/notion.ts` is a third `Tracker` adapter, also plain `fetch`. Unlike GitHub/GitLab, a
+  Notion ticket has no inherent repo and the database schema isn't pinned down, so property
+  names/values are read from `NOTION_*` env vars (see `.env.example`) with best-guess
+  defaults, and `bin/list-notion-tickets.ts` (a poller) matches values generically across
+  property types rather than assuming one. `.github/workflows/notion-poll.yml` runs the
+  poller on a schedule (and via manual dispatch) and `docker run`s the image per ticket
+  found, same as `agent.yml` for a labeled issue (see README's Notion section). The
+  `notion-ticket` skill resolves the target repo per ticket and keeps
+  `agent/notion-repo-map.md` current.
 - `src/worker.ts` renders the issue and its thread into one prompt, then runs `query()` with:
   - `bypassPermissions`;
   - our plugin;
@@ -57,7 +66,8 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 ## `agent/` holds the bot's instructions, not yours
 
 - `agent/CLAUDE.md` is baked into the image as `/home/node/.claude/CLAUDE.md`. It holds the house rules for the unattended agent.
-- `agent/plugin/` is loaded via the SDK `plugins` option. It contains the skills `gitlab-mr` (push options) and `github-pr` (`gh`).
+- `agent/plugin/` is loaded via the SDK `plugins` option. It contains the skills `gitlab-mr` (push options), `github-pr` (`gh`), and `notion-ticket` (resolving a Notion ticket's target repo).
+- `agent/notion-repo-map.md` is the bot's own knowledge of which Notion tickets map to which repos, maintained by the `notion-ticket` skill.
 
 ## Docker notes
 

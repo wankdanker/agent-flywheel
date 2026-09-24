@@ -1,0 +1,80 @@
+# Poll the Notion tickets database for tickets assigned to the bot and ready for
+# pickup, and work each one as its own container run, same as a labeled issue.
+# Secrets: ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, NOTION_TOKEN; optional AGENT_GH_TOKEN
+# (a PAT or app token) so the agent can open PRs and its own PRs trigger CI. Falls back to the
+# repo-scoped GITHUB_TOKEN, which only works when a ticket's resolved repo is this one.
+# Variables: NOTION_DATABASE_ID, NOTION_ASSIGNEE_VALUE (required, see README's Notion section);
+# NOTION_*_PROPERTY overrides; AGENT_IMAGE pins the image; CLAUDE_MODEL, MAX_TURNS.
+name: notion-poll
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  packages: read
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      ticket_ids: ${{ steps.list.outputs.ticket_ids }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - id: list
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ vars.NOTION_DATABASE_ID }}
+          NOTION_ASSIGNEE_VALUE: ${{ vars.NOTION_ASSIGNEE_VALUE }}
+          NOTION_ASSIGNEE_PROPERTY: ${{ vars.NOTION_ASSIGNEE_PROPERTY }}
+          NOTION_READY_PROPERTY: ${{ vars.NOTION_READY_PROPERTY }}
+          NOTION_READY_VALUE: ${{ vars.NOTION_READY_VALUE }}
+        run: |
+          ids=$(node bin/list-notion-tickets.ts)
+          echo "ticket_ids=$ids" >> "$GITHUB_OUTPUT"
+
+  work:
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        ticket: ${{ fromJSON(needs.list.outputs.ticket_ids) }}
+    concurrency:
+      # Never two runs on one ticket; a newer poll queues behind the running one.
+      group: agent-notion-${{ matrix.ticket }}
+      cancel-in-progress: false
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Work the ticket
+        env:
+          IMAGE: ${{ vars.AGENT_IMAGE }}
+          NOTION_TICKET_ID: ${{ matrix.ticket }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          MAX_TURNS: ${{ vars.MAX_TURNS }}
+        run: |
+          image="${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}:latest}"
+          docker pull "$image" || { echo "::error::No agent image $image. Run the build workflow first."; exit 2; }
+          # docker run rather than `container:`: same as a local run, no workspace uid fights.
+          set +e
+          docker run --rm -e AGENT_PLATFORM=notion -e NOTION_TICKET_ID -e GH_TOKEN -e NOTION_TOKEN \
+            -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS \
+            -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
+            "$image"
+          code=$?
+          # 10 = asked a question on the ticket; not a failure for us.
+          if [ "$code" = 10 ]; then echo "::notice::Asked a question on Notion ticket $NOTION_TICKET_ID"; exit 0; fi
+          exit "$code"

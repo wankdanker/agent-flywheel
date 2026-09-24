@@ -79,6 +79,36 @@ Optional settings:
 Every issue event starts a small dispatch pipeline. `bin/dispatch-gitlab.ts` drops the events
 that don't need a run. To run one issue by hand, use *Run pipeline* with `ISSUE=<iid>`.
 
+## Set up Notion polling (GitHub only, for now)
+
+Notion tickets aren't filed on this repo, so they work a bit differently: a scheduled
+GitHub Action polls a Notion database for tickets assigned to the bot and ready for
+pickup, and works each one as its own container run, same as a labeled issue. There's no
+GitLab equivalent yet and no webhook option — see the issue thread for why.
+
+1. Create a [Notion internal integration](https://www.notion.so/my-integrations) and share
+   your tickets database with it. That gives you `NOTION_TOKEN`.
+2. Add `NOTION_TOKEN` as a GitHub Actions secret, and `NOTION_DATABASE_ID` (from the
+   database's URL) as a repository variable.
+3. Figure out how your database marks a ticket "assigned to the bot" and set
+   `NOTION_ASSIGNEE_VALUE` (a person id or a select/status option name) as a variable too.
+   The property *names* the bot guesses (`Assignee`, `Status`, ...) are only guesses — see
+   `.env.example` for the full list of `NOTION_*` overrides, and the `notion-ticket` skill
+   for where the bot's own understanding of the schema lives. Set the matching
+   `NOTION_*_PROPERTY` variables if your database uses different names.
+4. `.github/workflows/notion-poll.yml` runs `bin/list-notion-tickets.ts` on a schedule (or
+   via manual dispatch) and `docker run`s the agent image per ticket found, the same way
+   `.github/workflows/agent.yml` does for a labeled issue. It needs the same
+   `Allow GitHub Actions to create and approve pull requests` repo setting (or an
+   `AGENT_GH_TOKEN`) as labeled-issue runs, plus an `AGENT_GH_TOKEN` specifically if a
+   ticket resolves to a repo other than this one, since the default `GITHUB_TOKEN` only
+   reaches this repo.
+
+A Notion ticket has no inherent target repo, unlike a GitHub/GitLab issue. The
+`notion-ticket` skill works that out per ticket (asking if it can't tell), and may end up
+opening two PRs: one with the requested work, one updating this repo's own
+ticket-to-repo notes.
+
 ## Run locally
 
     docker build -t agent-flywheel .
