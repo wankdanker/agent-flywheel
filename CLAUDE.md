@@ -27,13 +27,27 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 
 ## Architecture
 
-- `bin/run-ticket.ts` is the container entry, run via `entrypoint.sh`, which first sets up git token auth for `GH_TOKEN` or `AGENT_GITLAB_TOKEN`. It:
+- `bin/run-ticket.ts` is the container entry, run via `entrypoint.sh` (which only sets git identity and `safe.directory`, no credentials — see below). It:
   - detects the platform from `AGENT_PLATFORM`, `GITLAB_CI` or `GITHUB_ACTIONS`;
   - builds a `Tracker`;
+  - checks the ticket's repo against the allowlist (`src/allowlist.ts`, `AGENT_REPO_ALLOWLIST`,
+    defaulting to just `GITHUB_REPOSITORY`/`CI_PROJECT_PATH`) and refuses (exit 2, no clone) if
+    it isn't listed;
   - namespaces the work dir as `<WORK_DIR>/issue-<n>`, so a `WORK_DIR` shared across issues
     (e.g. a CI cache mount) can't let two issues' clones collide;
+  - clones (or resumes) that one repo itself via `src/clone.ts`'s `prepareRepo`, before the
+    agent's own shell starts, using the forge token only as a `GIT_ASKPASS` scoped to that one
+    `git` subprocess — never written to git config, so nothing token-bearing is left for the
+    model's bash tool calls (`bypassPermissions`) to read back out of `~/.gitconfig` or
+    `.git-credentials`. Re-checks the resulting `origin` URL against the allowlist in case a
+    cached work dir predates today's config;
   - runs the worker;
   - maps the outcome to an exit code: 0 done, 10 asked a question or split into sub-issues, 1 incomplete, 2 bad config. Both CIs treat 10 as success.
+  - Pushing (opening the PR/MR) still happens inside the agent's own shell, via the
+    `github-pr`/`gitlab-mr` skills, which pass `GH_TOKEN`/`AGENT_GITLAB_TOKEN` to a one-shot
+    `git -c credential.helper=...` on the push command itself rather than persistent config.
+    Those env vars are still readable by the agent process; removing that needs splitting
+    execution from a separate, privileged publish step, which is future work.
 - `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent. `toComment` only honors `BOT_MARKER` when the poster is independently trusted (or a GitHub `Bot`-type account) — the marker text alone, e.g. pasted by an attacker, is not enough.
 - `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`. Both attach a `Trust` to the issue (from its author) and to every comment (from that comment's author) when building a `Ticket`.

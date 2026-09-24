@@ -7,8 +7,13 @@ description: Push a branch and open a GitHub pull request with the gh CLI. Use w
 
 `gh` is installed and already authenticated through `GH_TOKEN`. Run it from inside the clone.
 
+Git itself isn't pre-authenticated (nothing token-bearing is left in git config for your
+shell to read), so pass the credential inline, only for this one push, rather than adding
+it to config:
+
 ```bash
-git push -u origin HEAD
+git -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+  push -u origin HEAD
 gh pr view --json url -q .url 2>/dev/null || gh pr create \
   --base "$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)" \
   --title "<issue title>" \
