@@ -28,8 +28,17 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - builds a `Tracker`;
   - runs the worker;
   - maps the outcome to an exit code: 0 done, 10 asked a question, 1 incomplete, 2 bad config. Both CIs treat 10 as success.
-- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them.
+- `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker tags our own comments so both CIs (and Notion, via a plain substring match) can tell them apart from a human's; on GitHub/GitLab it's a hidden HTML comment, but Notion has no such syntax so it's visible there.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`.
+- `src/notion.ts` is a third `Tracker` adapter, also plain `fetch`. Unlike GitHub/GitLab, a
+  Notion ticket has no inherent repo and the database schema isn't pinned down, so property
+  names/values are read from `NOTION_*` env vars (see `.env.example`) with best-guess
+  defaults, and `bin/list-notion-tickets.ts` (a poller) matches values generically across
+  property types rather than assuming one. Nothing calls the poller yet: it needs a
+  scheduled GitHub Actions workflow that a maintainer adds by hand, since our own PR token
+  can't create `.github/workflows/*` files (see README's Notion section). The
+  `notion-ticket` skill resolves the target repo per ticket and keeps
+  `agent/notion-repo-map.md` current.
 - `src/worker.ts` renders the issue and its thread into one prompt, then runs `query()` with:
   - `bypassPermissions`;
   - our plugin;
@@ -46,7 +55,8 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 ## `agent/` holds the bot's instructions, not yours
 
 - `agent/CLAUDE.md` is baked into the image as `/home/node/.claude/CLAUDE.md`. It holds the house rules for the unattended agent.
-- `agent/plugin/` is loaded via the SDK `plugins` option. It contains the skills `gitlab-mr` (push options) and `github-pr` (`gh`).
+- `agent/plugin/` is loaded via the SDK `plugins` option. It contains the skills `gitlab-mr` (push options), `github-pr` (`gh`), and `notion-ticket` (resolving a Notion ticket's target repo).
+- `agent/notion-repo-map.md` is the bot's own knowledge of which Notion tickets map to which repos, maintained by the `notion-ticket` skill.
 
 ## Docker notes
 

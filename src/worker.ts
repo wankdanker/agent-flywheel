@@ -18,22 +18,34 @@ export const branchFor = (t: Ticket) => `agent/issue-${t.number}`;
 // We render the whole issue, including prior Q&A, into the prompt so every
 // run is self-contained. A human reply + a re-run is our "resume".
 export function buildPrompt(t: Ticket, cfg: WorkerConfig) {
+  const platform = cfg.tracker.platform;
   const thread = t.comments.map((c) => `[${c.at}] ${c.fromBot ? "BOT" : `HUMAN @${c.author}`}: ${c.text}`).join("\n");
-  const skill = cfg.tracker.platform === "github" ? "github-pr" : "gitlab-mr";
-  return `You are working ${cfg.tracker.platform} issue #${t.number} "${t.title}" (${t.url}).
+  const noun = platform === "notion" ? "ticket" : "issue";
+  const id = platform === "notion" ? t.number : `#${t.number}`;
 
-<issue_body>
+  // Unlike a GitHub/GitLab issue, a Notion ticket has no inherent repo: the
+  // `notion-ticket` skill works out where the change belongs (and updates
+  // this repo's own mapping of tickets to repos once it does).
+  const closing = platform === "notion"
+    ? `This ticket lives in Notion and has no inherent target repo${cfg.repo.cloneUrl ? ` (it names ${cfg.repo.cloneUrl}, unconfirmed)` : ""}.
+Start with the \`notion-ticket\` skill to work out which repo it's for, then branch \`${branchFor(t)}\` there and
+open its PR/MR with \`github-pr\` or \`gitlab-mr\`, whichever matches that repo's host.`
+    : `Repository: ${cfg.repo.cloneUrl} (default branch ${cfg.repo.defaultBranch}). This is the project the
+issue was filed on, and also the source of your own worker image. Work here unless the issue names another repo.
+Branch: ${branchFor(t)}
+Open the ${platform === "github" ? "PR" : "MR"} with the \`${platform === "github" ? "github-pr" : "gitlab-mr"}\` skill.`;
+
+  return `You are working ${platform} ${noun} ${id} "${t.title}" (${t.url}).
+
+<${noun}_body>
 ${t.body || "(empty)"}
-</issue_body>
+</${noun}_body>
 
 <comment_thread>
 ${thread || "(no comments yet)"}
 </comment_thread>
 
-Repository: ${cfg.repo.cloneUrl} (default branch ${cfg.repo.defaultBranch}). This is the project the
-issue was filed on, and also the source of your own worker image. Work here unless the issue names another repo.
-Branch: ${branchFor(t)}
-Open the ${cfg.tracker.platform === "github" ? "PR" : "MR"} with the \`${skill}\` skill.`;
+${closing}`;
 }
 
 export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> {

@@ -11,7 +11,9 @@ export type TicketState = keyof typeof STATE_LABELS;
 export type Comment = { author: string; fromBot: boolean; text: string; at: string };
 
 export type Ticket = {
-  number: number;
+  // GitHub/GitLab give us a sequential issue number; Notion tickets get a short id
+  // derived from the page id instead (see src/notion.ts).
+  number: number | string;
   url: string;
   title: string;
   body: string;
@@ -22,7 +24,7 @@ export type Ticket = {
 export type Repo = { cloneUrl: string; webUrl: string; defaultBranch: string };
 
 export interface Tracker {
-  platform: "github" | "gitlab";
+  platform: "github" | "gitlab" | "notion";
   repo(): Promise<Repo>;
   getTicket(): Promise<Ticket>;
   comment(text: string): Promise<void>;
