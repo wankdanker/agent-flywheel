@@ -72,3 +72,21 @@ test("gitlab getTicket: untrusted author (non-member)", async (t) => {
   assert.equal(ticket.trust, "untrusted");
   assert.equal(ticket.author, "outside-reporter");
 });
+
+test("gitlab createSubIssue: creates the issue with the agent label in a single call", async (t) => {
+  const calls: { url: string; method: string; body: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    calls.push({ url, method: init.method ?? "GET", body: (init.body as string) ?? "" });
+    if (url.includes("/issues") && init.method === "POST") {
+      return jsonResponse({ iid: 17, web_url: "https://gitlab.example/g/p/-/issues/17" });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 9 });
+  const created = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part." });
+
+  assert.deepEqual(created, { number: 17, url: "https://gitlab.example/g/p/-/issues/17" });
+  assert.equal(calls.length, 1, "one call is enough: GitLab actions on a newly-opened issue that already has the label");
+  assert.deepEqual(JSON.parse(calls[0]!.body), { title: "Sub-task 1", description: "Do the first part.", labels: "agent" });
+});

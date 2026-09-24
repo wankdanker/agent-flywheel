@@ -27,12 +27,19 @@ export type Ticket = {
 
 export type Repo = { cloneUrl: string; webUrl: string; defaultBranch: string };
 
+export type NewSubIssue = { title: string; body: string };
+export type CreatedIssue = { number: number; url: string };
+
 export interface Tracker {
   platform: "github" | "gitlab";
   repo(): Promise<Repo>;
   getTicket(): Promise<Ticket>;
   comment(text: string): Promise<void>;
   setState(state: TicketState): Promise<void>;
+  // Opens a new issue with the `agent` label already applied, so it starts its own run
+  // (see worker.ts's split_into_subtasks). Implementations must ensure the opt-in label
+  // actually fires that platform's trigger — see github.ts/gitlab.ts for why they differ.
+  createSubIssue(input: NewSubIssue): Promise<CreatedIssue>;
 }
 
 export const need = (k: string): string => process.env[k] || (console.error(`missing env ${k}`), process.exit(2));

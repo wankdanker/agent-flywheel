@@ -17,9 +17,14 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
 
 - **Label `agent`:** a run starts.
 - **Status labels:** the agent sets `agent/working`, then either:
-  - `agent/blocked`, when it asked a question or ran out of turns, or
+  - `agent/blocked`, when it asked a question, split the work into sub-issues, or ran out of turns, or
   - `agent/review`, when it opened an MR/PR.
 - **Reply on the issue:** a new run reads the whole thread and continues on branch `agent/issue-<n>`.
+- **Large issues:** if the agent judges the task too big to finish in one run, it can open
+  smaller sub-issues instead of attempting the whole thing (each gets the `agent` label, so
+  it starts its own run) and comment back on the parent with links to them. Nothing closes
+  the parent automatically; merge or close each sub-issue's PR/MR, then close the parent
+  once its sub-issues are done, or comment on it to resume broader work.
 - **State:** there is none besides the issue and the git remote. Every run is a fresh container.
   CI does cache the work dir per issue, so a run that dies partway usually resumes from its
   existing clone instead of starting over, but that cache isn't guaranteed to survive.
@@ -30,7 +35,8 @@ Only trusted people can start a run:
 
 This matters because the agent runs with permissions bypassed and holds your secrets.
 
-Exit codes are 0 done, 10 asked a question, 1 incomplete, 2 bad config. CI treats 10 as a success.
+Exit codes are 0 done, 10 asked a question or split into sub-issues, 1 incomplete, 2 bad config.
+CI treats 10 as a success.
 
 ## Trust model
 

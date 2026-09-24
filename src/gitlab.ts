@@ -1,5 +1,5 @@
 // Our thin GitLab REST client for one issue.
-import { STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
+import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
 import { gitlabMemberTrust, type Trust } from "./trust.ts";
 
 // `project` is a numeric id or a `group/project` path.
@@ -61,6 +61,13 @@ export function gitlabTracker(o: { token: string; apiUrl: string; project: strin
     async setState(state) {
       const others = Object.values(STATE_LABELS).filter((l) => l !== STATE_LABELS[state]);
       await gl(issue, { method: "PUT", body: JSON.stringify({ add_labels: STATE_LABELS[state], remove_labels: others.join(",") }) });
+    },
+
+    // Unlike GitHub, dispatch-gitlab.ts treats any newly-opened issue that already carries
+    // `agent` as actionable, so one create call (label included) is enough to start a run.
+    async createSubIssue({ title, body }) {
+      const created = await gl("/issues", { method: "POST", body: JSON.stringify({ title, description: body, labels: OPT_IN_LABEL }) });
+      return { number: created.iid, url: created.web_url };
     },
   };
 }

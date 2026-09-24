@@ -1,5 +1,5 @@
 // Our thin GitHub REST client for one issue.
-import { STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
+import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
 import { trustFromGithubAssociation } from "./trust.ts";
 
 export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string }): Tracker {
@@ -54,6 +54,15 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
       const states: string[] = Object.values(STATE_LABELS);
       const labels = i.labels.map((l: any) => l.name).filter((n: string) => !states.includes(n));
       await gh(issue, { method: "PATCH", body: JSON.stringify({ labels: [...labels, STATE_LABELS[state]] }) });
+    },
+
+    // Two calls, not one create-with-labels: GitHub doesn't fire a `labeled` webhook event
+    // for labels included in the creation payload, only `opened` — and agent.yml only
+    // triggers on `labeled`. Adding the label as a follow-up guarantees the new run starts.
+    async createSubIssue({ title, body }) {
+      const created = await gh("/issues", { method: "POST", body: JSON.stringify({ title, body }) });
+      await gh(`/issues/${created.number}/labels`, { method: "POST", body: JSON.stringify({ labels: [OPT_IN_LABEL] }) });
+      return { number: created.number, url: created.html_url };
     },
   };
 }
