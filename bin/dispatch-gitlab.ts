@@ -43,9 +43,16 @@ console.error(iid ? `[dispatch] issue #${iid} on ${image}` : "[dispatch] event n
 console.log(iid ? `
 agent-issue-${iid}:
   image: { name: ${JSON.stringify(image)}, entrypoint: [""] }
-  variables: { ISSUE: "${iid}", GIT_STRATEGY: none }
+  variables: { ISSUE: "${iid}", GIT_STRATEGY: none, WORK_DIR: "$CI_PROJECT_DIR/work" }
   resource_group: agent-issue-${iid}   # never two runs on one issue
   timeout: 2h
+  # Cached per issue so a run that dies partway (turn limit, crash) doesn't lose its
+  # clone; the next run on that issue resumes from it. "when: always" saves it even
+  # when the job fails, which is the case that most needs resuming.
+  cache:
+    key: agent-work-issue-${iid}
+    paths: [work]
+    when: always
   script: [/opt/agent/entrypoint.sh]
   allow_failure: { exit_codes: [10] }   # 10 = asked a question; not a failure for us
 ` : `

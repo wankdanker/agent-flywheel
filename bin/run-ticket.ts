@@ -1,5 +1,7 @@
 // CLI: work one issue, configured entirely by env. Exit codes let whatever
 // invokes us (CI, a human) branch on the outcome.
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { githubTracker } from "../src/github.ts";
 import { gitlabTracker } from "../src/gitlab.ts";
 import { need, type Tracker } from "../src/tracker.ts";
@@ -36,10 +38,15 @@ const [ticket, repo] = await Promise.all([tracker.getTicket(), tracker.repo()]);
 console.log(`[ticket] #${ticket.number} ${ticket.title}, ${ticket.comments.length} comments`);
 await tracker.setState("working");
 
+// Namespaced per issue: if WORK_DIR is cached/persisted across runs (so a failed
+// run doesn't lose its clone), two issues sharing that cache must not collide.
+const workDir = join(process.env.WORK_DIR ?? "/work", `issue-${ticket.number}`);
+mkdirSync(workDir, { recursive: true });
+
 const outcome = await runTicket(ticket, {
   tracker,
   repo,
-  workDir: process.env.WORK_DIR ?? "/work",
+  workDir,
   pluginDir: process.env.PLUGIN_DIR ?? "/opt/agent/agent/plugin",
   model: process.env.CLAUDE_MODEL,
   maxTurns: Number(process.env.MAX_TURNS ?? 80),

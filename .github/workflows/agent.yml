@@ -47,6 +47,17 @@ jobs:
     steps:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # Work dir is cached per issue so a run that dies partway (turn limit, crash) doesn't
+      # lose its clone; the next run on that issue resumes from it instead of recloning.
+      # A fresh cache key per run, with the issue's latest entry as a restore-key fallback,
+      # keeps it updated even though actions/cache only saves on a key miss.
+      - name: Restore work directory cache
+        uses: actions/cache@v4
+        with:
+          path: agent-work
+          key: agent-work-issue-${{ github.event.issue.number || inputs.issue }}-${{ github.run_id }}
+          restore-keys: |
+            agent-work-issue-${{ github.event.issue.number || inputs.issue }}-
       - name: Work the issue
         env:
           IMAGE: ${{ inputs.image || vars.AGENT_IMAGE }}
@@ -59,11 +70,17 @@ jobs:
         run: |
           image="${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}:latest}"
           docker pull "$image" || { echo "::error::No agent image $image. Run the build workflow first."; exit 2; }
-          # docker run rather than `container:`: same as a local run, no workspace uid fights.
+          # docker run rather than `container:`: same as a local run. The one bind mount we do
+          # have (the work dir cache) needs its owner matched to the image's user at run time
+          # (never hardcoded, in case the image changes it), so it isn't a uid fight.
+          mkdir -p agent-work
+          uid="$(docker run --rm --entrypoint id "$image" -u)"
+          sudo chown -R "$uid:$uid" agent-work
           set +e
           docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN \
             -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS \
             -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
+            -v "$PWD/agent-work:/work" \
             "$image"
           code=$?
           # 10 = asked a question on the issue; not a failure for us.
