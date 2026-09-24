@@ -40,22 +40,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-  labels:
-    # Keep issue labels in sync with labels.json. Only on the default branch, since
-    # that's the version of the file we want live.
-    needs: [image]
-    if: github.ref_name == github.event.repository.default_branch
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - env:
-          AGENT_PLATFORM: github
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node bin/sync-labels.ts
