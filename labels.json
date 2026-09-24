@@ -1,0 +1,9 @@
+{
+  "prune": false,
+  "labels": [
+    { "name": "agent", "color": "5319e7", "description": "Run the agent on this issue" },
+    { "name": "agent/working", "color": "fbca04", "description": "Agent is working this issue" },
+    { "name": "agent/blocked", "color": "d93f0b", "description": "Agent asked a question or ran out of turns" },
+    { "name": "agent/review", "color": "0e8a16", "description": "Agent opened an MR/PR for review" }
+  ]
+}

@@ -47,6 +47,12 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 
   Keep `bin/dispatch-gitlab.ts` and `src/tracker.ts` free of npm dependencies.
 - `.gitlab-ci.yml` only declares stages and includes `.gitlab/ci/*.yml`. Put new GitLab jobs in their own file there.
+- `labels.json` at the repo root is the platform-neutral source of truth for issue labels (name,
+  color, description). `bin/sync-labels.ts` applies it via each platform's REST API: the `labels`
+  job in `.github/workflows/build.yml`, and `.gitlab/ci/labels.yml`, both on pushes to the default
+  branch. It creates missing labels and fixes drift; it only deletes labels absent from the file
+  when `labels.json` sets `"prune": true`, since deleting a label also strips it from every issue
+  that has it. Keep `bin/sync-labels.ts` free of npm dependencies, same as the dispatcher.
 
 ## `agent/` holds the bot's instructions, not yours
 
