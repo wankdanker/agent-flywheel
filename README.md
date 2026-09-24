@@ -81,10 +81,10 @@ What this means per issue:
   it.
 
 **Limitations.** This is a first cut at an input boundary, not a full sandbox:
-- Trust is checked at fetch time, live against the platform API — an offboarded
-  maintainer's *old* comments stop counting as trusted on the next run, but a directive
-  from someone trusted *when they posted it* still stands even if their access changes
-  later.
+- Trust is checked at fetch time, live against the platform API, not persisted from when
+  a comment was posted. An offboarded maintainer's *old* directives stop counting as
+  trusted on the next run, same as any other comment of theirs — approve or restate the
+  task again from a currently-trusted account if that happens.
 - A trusted maintainer can still be socially engineered into pasting attacker text into
   their own directive, or into approving a bad task outright. That's a human judgment
   call this system can't make for you.

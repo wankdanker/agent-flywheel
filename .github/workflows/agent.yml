@@ -33,6 +33,9 @@ concurrency:
 
 jobs:
   work:
+    # The author_association allowlist below must stay in sync with
+    # GITHUB_TRUSTED_ASSOCIATIONS in src/trust.ts, which gates what the agent reads as
+    # instructions using the same rule.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' && github.event.label.name == 'agent') ||
@@ -40,8 +43,6 @@ jobs:
         !github.event.issue.pull_request &&
         github.event.issue.state == 'open' &&
         contains(github.event.issue.labels.*.name, 'agent') &&
-        # Keep this list in sync with GITHUB_TRUSTED_ASSOCIATIONS in src/trust.ts, which
-        # gates what the agent reads as instructions using the same rule.
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
         !contains(github.event.comment.body, '<!-- agent-flywheel -->'))
     runs-on: ubuntu-latest
