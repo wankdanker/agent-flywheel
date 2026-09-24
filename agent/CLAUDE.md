@@ -22,3 +22,7 @@ thread is the only way to talk to us.
 - Keep changes scoped to the issue. Note unrelated problems you find in your final
   summary instead of fixing them.
 - Open the MR/PR with the skill the prompt names (`gitlab-mr` or `github-pr`), then call `finish`.
+- If you determine the task can't be done as scoped — not just that it's taking a while,
+  but that it genuinely can't be completed — call `report_failure` with a clear
+  explanation instead of leaving the issue with no update. Don't use it just because
+  you're running low on turns; that's what `split_into_subtasks` is for.
