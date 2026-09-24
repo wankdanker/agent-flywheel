@@ -1,6 +1,6 @@
 import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import type { Comment, Repo, Ticket, Tracker } from "./tracker.ts";
+import type { Comment, NewSubIssue, Repo, Ticket, Tracker } from "./tracker.ts";
 
 export type WorkerConfig = {
   tracker: Tracker;
@@ -11,7 +11,16 @@ export type WorkerConfig = {
   maxTurns: number;
 };
 
-export type Outcome = { kind: "asked" | "done" | "split" | "incomplete"; detail: string };
+// What an MCP tool handler records in memory during the agent's turn — no forge writes
+// happen from here. A trusted post-agent step (applyOutcome) turns this into the actual
+// tracker.comment/setState/createSubIssue calls once the agent's turn is fully over.
+export type AgentOutcome =
+  | { status: "blocked"; question: string }
+  | { status: "ready_for_review"; summary: string; mrUrl: string }
+  | { status: "split"; summary: string; subtasks: NewSubIssue[] }
+  | { status: "failed"; summary: string };
+
+export type Outcome = { kind: "blocked" | "ready_for_review" | "split" | "failed" | "incomplete"; detail: string };
 
 export const branchFor = (t: Ticket) => `agent/issue-${t.number}`;
 
@@ -68,6 +77,38 @@ Branch: ${branchFor(t)}
 Open the ${cfg.tracker.platform === "github" ? "PR" : "MR"} with the \`${skill}\` skill.`;
 }
 
+// The single trusted post-agent step: turns whatever the agent's tool calls recorded in
+// memory into the actual forge writes. Runs once, after the agent's turn is fully over —
+// never from inside a tool handler the model can invoke mid-session.
+export async function applyOutcome(t: Ticket, cfg: WorkerConfig, recorded: AgentOutcome | undefined): Promise<Outcome> {
+  if (!recorded) {
+    return { kind: "incomplete", detail: "Agent stopped without asking, splitting, or finishing." };
+  }
+  switch (recorded.status) {
+    case "blocked":
+      await cfg.tracker.comment(recorded.question);
+      await cfg.tracker.setState("blocked");
+      return { kind: "blocked", detail: recorded.question };
+    case "ready_for_review":
+      await cfg.tracker.comment(`${recorded.summary}\n\nReview: ${recorded.mrUrl}`);
+      await cfg.tracker.setState("review");
+      return { kind: "ready_for_review", detail: recorded.mrUrl };
+    case "split": {
+      const created = await Promise.all(
+        recorded.subtasks.map((s) => cfg.tracker.createSubIssue({ title: s.title, body: `${s.body}\n\nSplit from #${t.number} (${t.url}).` })),
+      );
+      const list = created.map((c, i) => `- ${c.url} — ${recorded.subtasks[i]!.title}`).join("\n");
+      await cfg.tracker.comment(`${recorded.summary}\n\nSplit into ${created.length} sub-issues, each will run on its own:\n${list}`);
+      await cfg.tracker.setState("blocked");
+      return { kind: "split", detail: list };
+    }
+    case "failed":
+      await cfg.tracker.comment(recorded.summary);
+      await cfg.tracker.setState("blocked");
+      return { kind: "failed", detail: recorded.summary };
+  }
+}
+
 export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> {
   // Untrusted-authored issue, no trusted maintainer has approved a task yet: stop before
   // the model ever sees the issue. This mirrors what ask_question does (comment + blocked),
@@ -76,30 +117,30 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
     const message = blockedNoDirectiveMessage(t);
     await cfg.tracker.comment(message);
     await cfg.tracker.setState("blocked");
-    return { kind: "asked", detail: message };
+    return { kind: "blocked", detail: message };
   }
 
-  let outcome: Outcome = { kind: "incomplete", detail: "Agent stopped without asking, splitting, or finishing." };
+  // Tool handlers below only record what the agent decided, in memory — they must never
+  // call cfg.tracker.* themselves, since they run while the untrusted/sandboxed agent turn
+  // is still live, in the same process that holds the tracker's forge token. applyOutcome,
+  // called once the query() loop below has fully finished, does the actual forge writes.
+  let recorded: AgentOutcome | undefined;
 
   const ticketTools = createSdkMcpServer({
     name: "ticket",
     version: "1.0.0",
     tools: [
-      tool("ask_question", "Post a clarifying question on the issue and mark it blocked. Stop working after calling this.",
+      tool("ask_question", "Record a clarifying question to post on the issue and mark it blocked. Stop working after calling this.",
         { question: z.string() },
         async ({ question }) => {
-          await cfg.tracker.comment(question);
-          await cfg.tracker.setState("blocked");
-          outcome = { kind: "asked", detail: question };
-          return { content: [{ type: "text", text: "Question posted. End your turn now." }] };
+          recorded = { status: "blocked", question };
+          return { content: [{ type: "text", text: "Question recorded. End your turn now." }] };
         }),
       tool("finish", "Report completed work on the issue and mark it for review.",
         { summary: z.string(), mr_url: z.string() },
         async ({ summary, mr_url }) => {
-          await cfg.tracker.comment(`${summary}\n\nReview: ${mr_url}`);
-          await cfg.tracker.setState("review");
-          outcome = { kind: "done", detail: mr_url };
-          return { content: [{ type: "text", text: "Issue updated. You're done." }] };
+          recorded = { status: "ready_for_review", summary, mrUrl: mr_url };
+          return { content: [{ type: "text", text: "Outcome recorded. You're done." }] };
         }),
       tool("split_into_subtasks",
         "Break this issue into smaller, independently-doable sub-issues instead of doing the work " +
@@ -114,14 +155,17 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
               "run only sees the sub-issue, not this one, so restate whatever context it needs."),
         },
         async ({ summary, subtasks }) => {
-          const created = await Promise.all(
-            subtasks.map((s) => cfg.tracker.createSubIssue({ title: s.title, body: `${s.body}\n\nSplit from #${t.number} (${t.url}).` })),
-          );
-          const list = created.map((c, i) => `- ${c.url} — ${subtasks[i]!.title}`).join("\n");
-          await cfg.tracker.comment(`${summary}\n\nSplit into ${created.length} sub-issues, each will run on its own:\n${list}`);
-          await cfg.tracker.setState("blocked");
-          outcome = { kind: "split", detail: list };
-          return { content: [{ type: "text", text: "Sub-issues created and this issue marked blocked. End your turn now." }] };
+          recorded = { status: "split", summary, subtasks };
+          return { content: [{ type: "text", text: "Split recorded. End your turn now." }] };
+        }),
+      tool("report_failure",
+        "Record that you could not complete this task and explain why, marking the issue blocked for " +
+          "a human to review. Use this when you've determined the task can't be done as scoped (as " +
+          "opposed to running out of turns), instead of leaving the issue with no explanation.",
+        { summary: z.string() },
+        async ({ summary }) => {
+          recorded = { status: "failed", summary };
+          return { content: [{ type: "text", text: "Failure recorded. End your turn now." }] };
         }),
     ],
   });
@@ -154,5 +198,5 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
     }
     if (msg.type === "result") console.log(`[result] ${msg.subtype} turns=${msg.num_turns} cost=$${msg.total_cost_usd.toFixed(2)}`);
   }
-  return outcome;
+  return applyOutcome(t, cfg, recorded);
 }
