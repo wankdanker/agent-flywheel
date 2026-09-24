@@ -101,6 +101,110 @@ What this means per issue:
   prompt. A future version may summarize or excerpt untrusted context more richly, but only
   behind the same trust check, never as a way to sneak raw untrusted text back in.
 
+## Threat model
+
+The Trust model above answers *whose words the agent treats as instructions*. This
+section answers a different question: *what can the agent process reach*, once it's
+running with permissions bypassed on an issue it decided (or was told) to act on.
+
+### Three trust domains, one process
+
+Every run currently combines three things that would ideally never share an execution
+environment:
+
+1. **Repository code and build scripts** — the checkout the agent edits and tests.
+   `npm install`/`pip install` scripts, Makefiles, test fixtures, and any command the
+   agent runs can all execute attacker-controlled logic, whether it came from a
+   malicious dependency, a booby-trapped repo command, or a prompt injection that talked
+   the model into running something it shouldn't. The Trust model section limits what
+   reaches the model *as an instruction*; it says nothing about what the checked-out
+   tree can *contain and execute* once the agent starts building and testing it.
+2. **The model credential** (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`) —
+   authenticates every request the agent makes to the model.
+3. **The forge write credential** (`GH_TOKEN` / `AGENT_GITLAB_TOKEN`) — can push
+   commits, open PRs/MRs, and edit issues on every repository it reaches (a broad PAT or
+   GitHub App token may cover more than just this repo).
+
+Putting all three in one process means anything that can run code in that process —
+including code from domain 1 — can potentially read or exfiltrate the credentials from
+domains 2 and 3. That's the risk [#12](https://github.com/wankdanker/agent-flywheel/issues/12)
+opened against.
+
+### Where this stands today
+
+#12 lays out a target design that separates preparation, agent execution, and
+publication into different processes, so no single one of them holds all three domains
+at once. As of this writing none of that split has landed (see sibling issues #21, #22,
+#23, #24, #26) — this repo still runs the pre-split architecture #12 describes as the
+problem, not the separated one:
+
+```text
+Target (from #12; not yet built):
+
+  trusted dispatcher
+      |  no credentials
+      v
+  prepare -------------------- forge token: clone + checkout, then stripped
+      |                        before the agent starts
+      v
+  unprivileged agent sandbox -- model credential only, no forge token
+      |
+      v
+  patch + structured outcome
+      |
+      v
+  privileged publisher -------- forge token; never runs code from the checkout
+      |
+      v
+  push branch / open PR·MR / comment + relabel the issue
+
+
+Current (this repo, today):
+
+  CI job (dispatcher)
+      |
+      v
+  one container/process -- entrypoint.sh writes the forge token into GLOBAL git
+      |                     config, then execs run-ticket.ts -> worker.ts in the
+      |                     same process, which also holds the model credential
+      |                     (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)
+      v
+  the SAME agent (bypassPermissions, full shell) clones, edits, tests, AND
+  pushes the branch + opens the PR/MR + comments/relabels the issue itself,
+  using the forge token, per agent/plugin/skills/github-pr and gitlab-mr
+```
+
+Concretely, none of #12's acceptance criteria are met yet:
+
+- `entrypoint.sh` writes the forge token into **global** git config
+  (`url."https://x-access-token:$GH_TOKEN@...".insteadOf`) before the agent starts, so
+  it's readable by any command the agent's shell tool runs (`cat ~/.gitconfig`, `env`,
+  a subprocess that inherited it) — all in-bounds for a `bypassPermissions` agent.
+- The same container also holds `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`: model and
+  forge credentials are in the same execution environment, not just the same run.
+- There is no separate publisher. `agent/plugin/skills/github-pr/SKILL.md` and
+  `gitlab-mr/SKILL.md` are instructions the agent follows with its own shell access — it
+  runs `git push` / `gh pr create` itself, with the same token, from the same process
+  that just built and tested the (possibly untrusted) repository code.
+- There is no repository allowlist. The prompt built by `buildPrompt` (`src/worker.ts`)
+  tells the agent "Work here unless the issue names another repo" with no enforcement
+  behind it — a trusted directive (or a compromised trusted account) can currently point
+  the agent at any repository the same broad token reaches.
+- There is no patch validation. Nothing rejects an unexpected submodule, a path outside
+  the workspace, or a diff touching credential files before it's pushed.
+- The agent's outcome isn't structured and validated separately from the side effect:
+  the `ask_question`/`finish`/`split_into_subtasks` tools (`src/worker.ts`) post the
+  comment and flip the issue's status label directly, in the same call that reports what
+  happened — there's no intermediate `{ status, summary }` a separate component checks
+  before acting on it.
+
+The one piece already in place is the *input*-trust boundary described in Trust model
+above (`src/trust.ts`): untrusted issue text never reaches the model as instructions.
+That narrows how an attacker gets the agent to act, but it doesn't close the credential
+exposure described here — a task from a genuinely trusted maintainer can still point the
+agent at a repository whose build/test tooling turns out to be malicious or compromised,
+and today that code runs in the same process that holds both credentials.
+
 ## Image versions and rollback
 
 | Push to | Tags |
