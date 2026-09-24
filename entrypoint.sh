@@ -11,5 +11,8 @@ if [ -n "${AGENT_GITLAB_TOKEN:-}" ]; then
 fi
 git config --global user.name  "${GIT_AUTHOR_NAME:-Agent Flywheel}"
 git config --global user.email "${GIT_AUTHOR_EMAIL:-agent-flywheel@users.noreply.localhost}"
+# WORK_DIR may be a cache restored by CI onto a bind mount owned by a different uid
+# (e.g. the GitHub Actions runner user); git refuses to touch those by default.
+git config --global --add safe.directory "*"
 
 exec node /opt/agent/bin/run-ticket.ts "$@"

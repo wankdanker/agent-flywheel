@@ -21,6 +21,8 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
   - `agent/review`, when it opened an MR/PR.
 - **Reply on the issue:** a new run reads the whole thread and continues on branch `agent/issue-<n>`.
 - **State:** there is none besides the issue and the git remote. Every run is a fresh container.
+  CI does cache the work dir per issue, so a run that dies partway usually resumes from its
+  existing clone instead of starting over, but that cache isn't guaranteed to survive.
 
 Only trusted people can start a run:
 - **Labels:** GitHub needs triage access and GitLab needs Reporter+.
@@ -49,8 +51,9 @@ To try an image change before merging, run a single issue on the branch's image:
 
 1. Push this repo to GitHub.
 2. Add the `ANTHROPIC_API_KEY` repository secret, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`.
-3. *Actions → build → Run workflow* to make the first image.
-4. Create an `agent` label, open an issue, and apply the label.
+3. *Actions → build → Run workflow* to make the first image. This also syncs labels from
+   `labels.json`, including `agent`.
+4. Open an issue and apply the `agent` label.
 
 Optional settings:
 - **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `MAX_TURNS`.
@@ -70,7 +73,8 @@ Optional settings:
 5. *Settings → Webhooks*: add
    `https://<host>/api/v4/projects/<id>/trigger/pipeline?token=<trigger token>&ref=<default branch>`,
    with **Issues events** and **Comments** enabled.
-6. Create an `agent` label, open an issue, and apply the label.
+6. Push again (or *Run pipeline*) to sync labels from `labels.json`, including `agent`, now
+   that `AGENT_GITLAB_TOKEN` is set. Then open an issue and apply the label.
 
 Every issue event starts a small dispatch pipeline. `bin/dispatch-gitlab.ts` drops the events
 that don't need a run. To run one issue by hand, use *Run pipeline* with `ISSUE=<iid>`.

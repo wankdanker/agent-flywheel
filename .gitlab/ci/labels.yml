@@ -1,0 +1,14 @@
+# Keep issue labels in sync with labels.json. Only on pushes to the default branch,
+# since that's the version of the file we want live. Zero deps (plain fetch), so
+# stock node from our checkout; no image pull needed.
+
+sync-labels:
+  stage: build
+  image: node:24-slim
+  rules:
+    # Same triggers as build-image, plus: skip until AGENT_GITLAB_TOKEN exists (e.g. the
+    # very first push, before it's configured), and only for the default branch's file.
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $AGENT_GITLAB_TOKEN
+    - if: $CI_PIPELINE_SOURCE == "web" && $ISSUE == null && $AGENT_GITLAB_TOKEN
+  script:
+    - AGENT_PLATFORM=gitlab node bin/sync-labels.ts
