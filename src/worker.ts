@@ -9,6 +9,10 @@ export type WorkerConfig = {
   pluginDir: string;     // our baked-in skills/agents/hooks
   model?: string;
   maxTurns: number;
+  // Env for the SDK's own subprocess. bin/run-ticket.ts sets this to sandboxEnv(...) so
+  // the real model credential never reaches it (see src/model-proxy.ts); defaults to
+  // process.env (real credential included) so tests and other callers don't need to care.
+  env?: NodeJS.ProcessEnv;
 };
 
 export type Outcome = { kind: "asked" | "done" | "split" | "incomplete"; detail: string };
@@ -137,6 +141,7 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
       cwd: cfg.workDir,
       model: cfg.model,
       maxTurns: cfg.maxTurns,
+      env: cfg.env ?? process.env,
       mcpServers: { ticket: ticketTools },
       // Our house rules come from ~/.claude/CLAUDE.md; skills/agents/hooks from our plugin.
       plugins: [{ type: "local", path: cfg.pluginDir }],

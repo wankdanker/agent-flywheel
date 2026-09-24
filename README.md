@@ -100,6 +100,43 @@ What this means per issue:
   prompt. A future version may summarize or excerpt untrusted context more richly, but only
   behind the same trust check, never as a way to sneak raw untrusted text back in.
 
+## Model credential exposure
+
+The agent needs `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` to call the model, and
+that call happens from the very process whose Bash tool runs repository-controlled code
+(the issue's own instructions, or code the issue asks the agent to run). Without
+mitigation, that code could read the real credential straight out of its own environment.
+
+`src/model-proxy.ts` closes that specific hole: `bin/run-ticket.ts` reads the real
+credential once, hands it to a small HTTP proxy bound to `127.0.0.1` on an ephemeral
+port, then launches the agent (the Claude Agent SDK's own subprocess, and everything its
+Bash tool spawns under it) with that credential stripped from its env, a placeholder
+`ANTHROPIC_API_KEY` in its place, and `ANTHROPIC_BASE_URL` pointed at the proxy. The
+proxy swaps the placeholder for the real credential only when forwarding to
+`https://api.anthropic.com`, and enforces `MODEL_PROXY_MAX_REQUESTS`,
+`MODEL_PROXY_MAX_LIFETIME_MS`, and `MODEL_PROXY_REQUEST_TIMEOUT_MS` (see `.env.example`)
+so a run that goes off the rails can only spend so much of it, on top of the existing
+`MAX_TURNS` budget.
+
+**What this does not eliminate:**
+
+- The proxy and the agent subprocess still share one OS-level sandbox: this container,
+  as the same `node` user. Repository-controlled code can still reach the proxy on
+  `localhost` and spend its request/time budget making real model calls — that's the
+  intended channel, not a bug, since the agent is supposed to call the model — but it
+  means the limits above are the actual ceiling on that exposure, not a hard wall. A bug
+  or container escape that let one process on this host read another's memory or
+  `/proc/<pid>/environ` would still reach the real credential, because both processes
+  are on the same side of that boundary. Splitting the proxy into a genuinely separate
+  container or host process would close this, but is out of scope here (tracked under
+  the parent #12).
+- The proxy forwards request bodies and headers to `api.anthropic.com` unfiltered other
+  than swapping the auth header, so it does not, for example, screen prompts leaving the
+  container.
+- `claude setup-token`'s own OAuth login flow talks to `api.anthropic.com` directly and
+  runs before any of this, outside the container; it isn't something this proxy needs to
+  cover.
+
 ## Image versions and rollback
 
 | Push to | Tags |
@@ -124,7 +161,8 @@ To try an image change before merging, run a single issue on the branch's image:
 4. Open an issue and apply the `agent` label.
 
 Optional settings:
-- **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `MAX_TURNS`.
+- **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
+  `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
 - **`AGENT_GH_TOKEN` secret:** a PAT or GitHub App token. The built-in `GITHUB_TOKEN` can't
   change `.github/workflows/`, and PRs it opens don't start CI. Merging still builds the image,
   because the merge is yours.
@@ -136,7 +174,8 @@ Optional settings:
 3. Add CI/CD variables, masked:
    - `AGENT_GITLAB_TOKEN`: the token from step 2.
    - `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`.
-   - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `MAX_TURNS`.
+   - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
+     `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
 4. *Settings → CI/CD → Pipeline trigger tokens*: create a token.
 5. *Settings → Webhooks*: add
    `https://<host>/api/v4/projects/<id>/trigger/pipeline?token=<trigger token>&ref=<default branch>`,

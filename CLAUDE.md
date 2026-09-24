@@ -32,7 +32,9 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - builds a `Tracker`;
   - namespaces the work dir as `<WORK_DIR>/issue-<n>`, so a `WORK_DIR` shared across issues
     (e.g. a CI cache mount) can't let two issues' clones collide;
-  - runs the worker;
+  - starts `src/model-proxy.ts` with the real `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`
+    and runs the worker with that credential stripped from its env (see README's "Model
+    credential exposure"), closing the proxy in a `finally` regardless of outcome;
   - maps the outcome to an exit code: 0 done, 10 asked a question or split into sub-issues, 1 incomplete, 2 bad config. Both CIs treat 10 as success.
 - `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent. `toComment` only honors `BOT_MARKER` when the poster is independently trusted (or a GitHub `Bot`-type account) — the marker text alone, e.g. pasted by an attacker, is not enough.
 - `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
@@ -46,6 +48,12 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     GitLab differ in what makes a newly-created issue's label actually fire the trigger).
 
   If the agent calls none of these tools, the outcome is `incomplete`.
+- `src/model-proxy.ts` is the loopback-only HTTP proxy `bin/run-ticket.ts` puts in front of
+  the real model credential (`startModelProxy`, `credentialFromEnv`, `sandboxEnv`; see
+  README's "Model credential exposure"). It enforces `maxRequests`/`maxLifetimeMs` (on top
+  of `MAX_TURNS`) and a per-request `requestTimeoutMs`, and forwards to
+  `upstream ?? DEFAULT_UPSTREAM` so tests can point it at a fake server instead of the real
+  API.
 - CI on each platform:
   - **GitHub:** `.github/workflows/agent.yml` gates on the label and the commenter's association, then `docker run`s the image on a plain runner. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work`; its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid.
   - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline that runs the image, with a native GitLab `cache:` (`when: always`, so a failed run still saves) on `WORK_DIR`.

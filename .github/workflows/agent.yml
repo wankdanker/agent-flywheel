@@ -3,7 +3,9 @@
 # collaborator comments on an `agent` issue (our resume). Manual runs can pick the issue and image.
 # Secrets: ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN; optional AGENT_GH_TOKEN (a PAT or app
 # token) so the agent can edit .github/workflows and its PRs trigger CI.
-# Variables: AGENT_IMAGE pins the image (e.g. ghcr.io/owner/repo:sha-1a2b3c4); CLAUDE_MODEL, MAX_TURNS.
+# Variables: AGENT_IMAGE pins the image (e.g. ghcr.io/owner/repo:sha-1a2b3c4); CLAUDE_MODEL, MAX_TURNS;
+# optional MODEL_PROXY_MAX_REQUESTS/MODEL_PROXY_MAX_LIFETIME_MS/MODEL_PROXY_REQUEST_TIMEOUT_MS
+# (see src/model-proxy.ts and README "Model credential exposure").
 name: agent
 
 on:
@@ -70,6 +72,9 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
           MAX_TURNS: ${{ vars.MAX_TURNS }}
+          MODEL_PROXY_MAX_REQUESTS: ${{ vars.MODEL_PROXY_MAX_REQUESTS }}
+          MODEL_PROXY_MAX_LIFETIME_MS: ${{ vars.MODEL_PROXY_MAX_LIFETIME_MS }}
+          MODEL_PROXY_REQUEST_TIMEOUT_MS: ${{ vars.MODEL_PROXY_REQUEST_TIMEOUT_MS }}
         run: |
           image="${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}:latest}"
           docker pull "$image" || { echo "::error::No agent image $image. Run the build workflow first."; exit 2; }
@@ -82,6 +87,7 @@ jobs:
           set +e
           docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN \
             -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS \
+            -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS \
             -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
             -v "$PWD/agent-work:/work" \
             "$image"
