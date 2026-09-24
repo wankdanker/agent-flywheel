@@ -11,7 +11,7 @@ export type WorkerConfig = {
   maxTurns: number;
 };
 
-export type Outcome = { kind: "asked" | "done" | "incomplete"; detail: string };
+export type Outcome = { kind: "asked" | "done" | "split" | "incomplete"; detail: string };
 
 export const branchFor = (t: Ticket) => `agent/issue-${t.number}`;
 
@@ -79,7 +79,7 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
     return { kind: "asked", detail: message };
   }
 
-  let outcome: Outcome = { kind: "incomplete", detail: "Agent stopped without asking or finishing." };
+  let outcome: Outcome = { kind: "incomplete", detail: "Agent stopped without asking, splitting, or finishing." };
 
   const ticketTools = createSdkMcpServer({
     name: "ticket",
@@ -100,6 +100,28 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
           await cfg.tracker.setState("review");
           outcome = { kind: "done", detail: mr_url };
           return { content: [{ type: "text", text: "Issue updated. You're done." }] };
+        }),
+      tool("split_into_subtasks",
+        "Break this issue into smaller, independently-doable sub-issues instead of doing the work " +
+          "yourself, for when the full task is too large to finish in one run before hitting the turn " +
+          "limit (which loses whatever wasn't committed). Call this as soon as you recognize the scope " +
+          "is too big, not after burning turns on a partial attempt. Each sub-issue is opened with the " +
+          "`agent` label, so it gets its own run. Stop working after calling this.",
+        {
+          summary: z.string().describe("What you're splitting and why; posted as a comment on this issue."),
+          subtasks: z.array(z.object({ title: z.string(), body: z.string() })).min(2)
+            .describe("Each item becomes its own issue. Write bodies as self-contained tasks: a future " +
+              "run only sees the sub-issue, not this one, so restate whatever context it needs."),
+        },
+        async ({ summary, subtasks }) => {
+          const created = await Promise.all(
+            subtasks.map((s) => cfg.tracker.createSubIssue({ title: s.title, body: `${s.body}\n\nSplit from #${t.number} (${t.url}).` })),
+          );
+          const list = created.map((c, i) => `- ${c.url} — ${subtasks[i]!.title}`).join("\n");
+          await cfg.tracker.comment(`${summary}\n\nSplit into ${created.length} sub-issues, each will run on its own:\n${list}`);
+          await cfg.tracker.setState("blocked");
+          outcome = { kind: "split", detail: list };
+          return { content: [{ type: "text", text: "Sub-issues created and this issue marked blocked. End your turn now." }] };
         }),
     ],
   });

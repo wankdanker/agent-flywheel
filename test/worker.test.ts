@@ -41,6 +41,9 @@ function fakeTracker(platform: "github" | "gitlab"): Tracker & { comments: strin
     async setState(state: string) {
       t.states.push(state);
     },
+    async createSubIssue() {
+      throw new Error("not used in these tests");
+    },
   };
   return t;
 }

@@ -70,3 +70,26 @@ test("github getTicket: untrusted author on a public repo", async (t) => {
   assert.equal(ticket.trust, "untrusted");
   assert.equal(ticket.author, "outside-reporter");
 });
+
+test("github createSubIssue: creates the issue, then adds the agent label as a separate call", async (t) => {
+  const calls: { url: string; method: string; body: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    calls.push({ url, method: init.method ?? "GET", body: (init.body as string) ?? "" });
+    if (url.endsWith("/issues") && init.method === "POST") {
+      return jsonResponse({ number: 99, html_url: "https://github.com/o/r/issues/99" });
+    }
+    if (url.endsWith("/issues/99/labels") && init.method === "POST") {
+      return jsonResponse([{ name: "agent" }]);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 42 });
+  const created = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part." });
+
+  assert.deepEqual(created, { number: 99, url: "https://github.com/o/r/issues/99" });
+  assert.equal(calls.length, 2, "must create, then add the label, as two separate requests");
+  assert.deepEqual(JSON.parse(calls[0]!.body), { title: "Sub-task 1", body: "Do the first part." });
+  assert.ok(!calls[0]!.body.includes('"labels"'), "the create call must not include labels");
+  assert.deepEqual(JSON.parse(calls[1]!.body), { labels: ["agent"] });
+});

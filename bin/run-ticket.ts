@@ -49,7 +49,7 @@ const outcome = await runTicket(ticket, {
   workDir,
   pluginDir: process.env.PLUGIN_DIR ?? "/opt/agent/agent/plugin",
   model: process.env.CLAUDE_MODEL,
-  maxTurns: Number(process.env.MAX_TURNS ?? 80),
+  maxTurns: Number(process.env.MAX_TURNS ?? 120),
 });
 
 if (outcome.kind === "incomplete") {
@@ -57,4 +57,6 @@ if (outcome.kind === "incomplete") {
   await tracker.setState("blocked");
 }
 console.log(`[outcome] ${outcome.kind}: ${outcome.detail}`);
-process.exit({ done: 0, asked: 10, incomplete: 1 }[outcome.kind]);
+// split behaves like asked for CI's purposes: not a failure, nothing merged yet, the
+// issue is left `blocked` for a human or a sub-issue's own run to pick back up.
+process.exit({ done: 0, asked: 10, split: 10, incomplete: 1 }[outcome.kind]);
