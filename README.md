@@ -92,11 +92,13 @@ GitLab equivalent yet and no webhook option — see the issue thread for why.
    `.env.example` for the full list of `NOTION_*` overrides, and the `notion-ticket` skill
    for where the bot's own understanding of the schema lives. Set the matching
    `NOTION_*_PROPERTY` variables if your database uses different names.
-4. Add a `notion-poll` workflow that runs `bin/list-notion-tickets.ts` on a schedule and
-   `docker run`s the agent image per ticket found, the same way `.github/workflows/agent.yml`
-   does for a labeled issue — see its PR for a ready-to-use one. A maintainer has to add
-   this file by hand: the bot's own PR token can't touch `.github/workflows/*` (same
-   restriction noted for `AGENT_GH_TOKEN` above), so it can't add its own trigger.
+4. `.github/workflows/notion-poll.yml` runs `bin/list-notion-tickets.ts` on a schedule (or
+   via manual dispatch) and `docker run`s the agent image per ticket found, the same way
+   `.github/workflows/agent.yml` does for a labeled issue. It needs the same
+   `Allow GitHub Actions to create and approve pull requests` repo setting (or an
+   `AGENT_GH_TOKEN`) as labeled-issue runs, plus an `AGENT_GH_TOKEN` specifically if a
+   ticket resolves to a repo other than this one, since the default `GITHUB_TOKEN` only
+   reaches this repo.
 
 A Notion ticket has no inherent target repo, unlike a GitHub/GitLab issue. The
 `notion-ticket` skill works that out per ticket (asking if it can't tell), and may end up

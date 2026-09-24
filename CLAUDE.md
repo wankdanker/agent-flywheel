@@ -34,9 +34,9 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   Notion ticket has no inherent repo and the database schema isn't pinned down, so property
   names/values are read from `NOTION_*` env vars (see `.env.example`) with best-guess
   defaults, and `bin/list-notion-tickets.ts` (a poller) matches values generically across
-  property types rather than assuming one. Nothing calls the poller yet: it needs a
-  scheduled GitHub Actions workflow that a maintainer adds by hand, since our own PR token
-  can't create `.github/workflows/*` files (see README's Notion section). The
+  property types rather than assuming one. `.github/workflows/notion-poll.yml` runs the
+  poller on a schedule (and via manual dispatch) and `docker run`s the image per ticket
+  found, same as `agent.yml` for a labeled issue (see README's Notion section). The
   `notion-ticket` skill resolves the target repo per ticket and keeps
   `agent/notion-repo-map.md` current.
 - `src/worker.ts` renders the issue and its thread into one prompt, then runs `query()` with:
