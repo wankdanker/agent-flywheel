@@ -42,7 +42,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     `.git-credentials`. Re-checks the resulting `origin` URL against the allowlist in case a
     cached work dir predates today's config;
   - runs the worker;
-  - maps the outcome to an exit code: 0 done, 10 asked a question or split into sub-issues, 1 incomplete, 2 bad config. Both CIs treat 10 as success.
+  - maps the outcome to an exit code: 0 ready for review, 10 blocked (question or split into sub-issues), 1 incomplete or failed, 2 bad config. Both CIs treat 10 as success.
   - Pushing (opening the PR/MR) still happens inside the agent's own shell, via the
     `github-pr`/`gitlab-mr` skills, which pass `GH_TOKEN`/`AGENT_GITLAB_TOKEN` to a one-shot
     `git -c credential.helper=...` on the push command itself rather than persistent config.
@@ -54,12 +54,18 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 - `src/worker.ts`'s `buildPrompt` renders the issue into a prompt, gated by trust (see README's "Trust model"): a trusted-authored issue's title/body/trusted-thread are used as before; an untrusted-authored issue's title/body are never included, and only trusted human comments (`trustedDirectives`) become the task. `runTicket` short-circuits to `agent/blocked` before ever calling the model when an untrusted-authored issue has no trusted directive yet. It then runs `query()` with:
   - `bypassPermissions`;
   - our plugin;
-  - an in-process MCP server with `ask_question` (→ blocked), `finish` (→ review), and
-    `split_into_subtasks` (→ blocked; opens sub-issues, each carrying the `agent` label so
-    it starts its own run — `Tracker#createSubIssue`, one per platform since GitHub and
-    GitLab differ in what makes a newly-created issue's label actually fire the trigger).
+  - an in-process MCP server with `ask_question`, `finish`, `split_into_subtasks` and
+    `report_failure`. None of these tool handlers touch the tracker directly — while the
+    agent's turn is running, in the same process that holds the tracker's forge token, they
+    only record a structured `AgentOutcome` in memory and return a short confirmation to the
+    model. `runTicket` calls `applyOutcome` once the `query()` loop is fully over, which is
+    the single place that actually calls `tracker.comment`/`setState`/`createSubIssue`:
+    `ask_question` → blocked; `finish` → review; `split_into_subtasks` → blocked, opening
+    sub-issues, each carrying the `agent` label so it starts its own run
+    (`Tracker#createSubIssue`, one per platform since GitHub and GitLab differ in what makes
+    a newly-created issue's label actually fire the trigger); `report_failure` → blocked.
 
-  If the agent calls none of these tools, the outcome is `incomplete`.
+  If the agent calls none of these tools, `applyOutcome` reports `incomplete`.
 - CI on each platform:
   - **GitHub:** `.github/workflows/agent.yml` gates on the label and the commenter's association, then `docker run`s the image on a plain runner. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work`; its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid.
   - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline that runs the image, with a native GitLab `cache:` (`when: always`, so a failed run still saves) on `WORK_DIR`.

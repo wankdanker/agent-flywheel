@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildPrompt, runTicket, trustedDirectives, type WorkerConfig } from "../src/worker.ts";
-import type { Comment, Ticket, Tracker } from "../src/tracker.ts";
+import { applyOutcome, buildPrompt, runTicket, trustedDirectives, type WorkerConfig } from "../src/worker.ts";
+import type { Comment, CreatedIssue, Ticket, Tracker } from "../src/tracker.ts";
 
 const comment = (over: Partial<Comment>): Comment => ({
   author: "someone",
@@ -24,11 +24,12 @@ const ticket = (over: Partial<Ticket>): Ticket => ({
   ...over,
 });
 
-function fakeTracker(platform: "github" | "gitlab"): Tracker & { comments: string[]; states: string[] } {
+function fakeTracker(platform: "github" | "gitlab"): Tracker & { comments: string[]; states: string[]; subIssues: CreatedIssue[] } {
   const t: any = {
     platform,
     comments: [],
     states: [],
+    subIssues: [],
     async repo() {
       return { cloneUrl: "https://example.test/repo.git", webUrl: "https://example.test/repo", defaultBranch: "main" };
     },
@@ -42,7 +43,9 @@ function fakeTracker(platform: "github" | "gitlab"): Tracker & { comments: strin
       t.states.push(state);
     },
     async createSubIssue() {
-      throw new Error("not used in these tests");
+      const created = { number: 100 + t.subIssues.length, url: `https://example.test/issues/${100 + t.subIssues.length}` };
+      t.subIssues.push(created);
+      return created;
     },
   };
   return t;
@@ -156,9 +159,87 @@ test("runTicket short-circuits to blocked when an untrusted author has no truste
   const tracker = fakeTracker("github");
   const outcome = await runTicket(t, cfgFor(tracker));
 
-  assert.equal(outcome.kind, "asked");
+  assert.equal(outcome.kind, "blocked");
   assert.deepEqual(tracker.states, ["blocked"]);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /outside-reporter/);
   assert.match(tracker.comments[0]!, /trusted maintainer/);
+});
+
+// applyOutcome is the single trusted post-agent step that turns what an MCP tool handler
+// recorded in memory (no tracker calls of its own — see worker.ts) into the actual forge
+// writes. These exercise it directly, the same way runTicket calls it after query() ends.
+
+test("applyOutcome: ready_for_review comments the summary + review link and sets state to review", async () => {
+  const t = ticket({ number: 42, url: "https://example.test/issues/42" });
+  const tracker = fakeTracker("github");
+  const outcome = await applyOutcome(t, cfgFor(tracker), {
+    status: "ready_for_review",
+    summary: "Implemented pagination and added tests.",
+    mrUrl: "https://example.test/repo/pull/7",
+  });
+
+  assert.equal(outcome.kind, "ready_for_review");
+  assert.deepEqual(tracker.states, ["review"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /Implemented pagination/);
+  assert.match(tracker.comments[0]!, /https:\/\/example\.test\/repo\/pull\/7/);
+});
+
+test("applyOutcome: blocked (question) comments the question and sets state to blocked", async () => {
+  const t = ticket({ number: 42, url: "https://example.test/issues/42" });
+  const tracker = fakeTracker("github");
+  const outcome = await applyOutcome(t, cfgFor(tracker), {
+    status: "blocked",
+    question: "Which repo should this change land in?",
+  });
+
+  assert.equal(outcome.kind, "blocked");
+  assert.deepEqual(tracker.states, ["blocked"]);
+  assert.deepEqual(tracker.comments, ["Which repo should this change land in?"]);
+});
+
+test("applyOutcome: split creates a sub-issue per subtask and sets state to blocked", async () => {
+  const t = ticket({ number: 42, url: "https://example.test/issues/42" });
+  const tracker = fakeTracker("github");
+  const outcome = await applyOutcome(t, cfgFor(tracker), {
+    status: "split",
+    summary: "Too big for one run, splitting by concern.",
+    subtasks: [
+      { title: "Part one", body: "Do the first part." },
+      { title: "Part two", body: "Do the second part." },
+    ],
+  });
+
+  assert.equal(outcome.kind, "split");
+  assert.deepEqual(tracker.states, ["blocked"]);
+  assert.equal(tracker.subIssues.length, 2);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /Too big for one run/);
+  assert.match(tracker.comments[0]!, /Part one/);
+  assert.match(tracker.comments[0]!, /Part two/);
+  assert.match(tracker.comments[0]!, new RegExp(tracker.subIssues[0]!.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("applyOutcome: failed comments the explanation and sets state to blocked", async () => {
+  const t = ticket({ number: 42, url: "https://example.test/issues/42" });
+  const tracker = fakeTracker("github");
+  const outcome = await applyOutcome(t, cfgFor(tracker), {
+    status: "failed",
+    summary: "The acceptance criteria conflict with the existing API contract; needs a maintainer decision.",
+  });
+
+  assert.equal(outcome.kind, "failed");
+  assert.deepEqual(tracker.states, ["blocked"]);
+  assert.deepEqual(tracker.comments, ["The acceptance criteria conflict with the existing API contract; needs a maintainer decision."]);
+});
+
+test("applyOutcome: no recorded outcome is incomplete and touches the tracker not at all", async () => {
+  const t = ticket({ number: 42, url: "https://example.test/issues/42" });
+  const tracker = fakeTracker("github");
+  const outcome = await applyOutcome(t, cfgFor(tracker), undefined);
+
+  assert.equal(outcome.kind, "incomplete");
+  assert.deepEqual(tracker.states, []);
+  assert.deepEqual(tracker.comments, []);
 });
