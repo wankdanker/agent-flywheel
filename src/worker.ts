@@ -5,7 +5,7 @@ import type { Comment, NewSubIssue, Repo, Ticket, Tracker } from "./tracker.ts";
 export type WorkerConfig = {
   tracker: Tracker;
   repo: Repo;            // the project the issue lives on; our own source by default
-  workDir: string;       // where we clone repos
+  workDir: string;       // the repo, already cloned here before the agent starts
   pluginDir: string;     // our baked-in skills/agents/hooks
   model?: string;
   maxTurns: number;
@@ -71,9 +71,10 @@ export function buildPrompt(t: Ticket, cfg: WorkerConfig) {
 ${thread}
 </comment_thread>
 
-Repository: ${cfg.repo.cloneUrl} (default branch ${cfg.repo.defaultBranch}). This is the project the
-issue was filed on, and also the source of your own worker image. Work here unless the issue names another repo.
-Branch: ${branchFor(t)}
+Repository: ${cfg.repo.cloneUrl} (default branch ${cfg.repo.defaultBranch}), already cloned into your
+working directory on branch ${branchFor(t)}. This is the project the issue was filed on, and also the
+source of your own worker image. It's the only repo you have credentials for — work here even if the
+issue asks about another repo.
 Open the ${cfg.tracker.platform === "github" ? "PR" : "MR"} with the \`${skill}\` skill.`;
 }
 

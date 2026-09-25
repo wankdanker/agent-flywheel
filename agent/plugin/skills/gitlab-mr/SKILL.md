@@ -5,10 +5,13 @@ description: Push a branch and open a GitLab merge request without the API or gl
 
 # Opening a merge request
 
-We create MRs with GitLab push options, in the same command as the push:
+We create MRs with GitLab push options, in the same command as the push. Git itself isn't
+pre-authenticated (nothing token-bearing is left in git config for your shell to read), so
+pass the credential inline, only for this one push, rather than adding it to config:
 
 ```bash
-git push -u origin HEAD \
+git -c credential.helper='!f() { echo username=oauth2; echo "password=$AGENT_GITLAB_TOKEN"; }; f' \
+  push -u origin HEAD \
   -o merge_request.create \
   -o merge_request.target="$(git remote show origin | sed -n 's/.*HEAD branch: //p')" \
   -o merge_request.title="<issue title>" \
