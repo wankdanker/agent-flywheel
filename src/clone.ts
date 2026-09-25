@@ -64,7 +64,7 @@ export function prepareRepo(o: {
     // fresh off the default branch rather than whatever HEAD the cache happened to leave.
     const remoteBranch = git(["ls-remote", "--heads", "origin", o.branch], { cwd: o.workDir, env });
     const baseBranch = remoteBranch ? o.branch : o.defaultBranch;
-    git(["fetch", "origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], { cwd: o.workDir, env });
+    git(["fetch", "origin", `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`], { cwd: o.workDir, env });
     const base = `origin/${baseBranch}`;
     git(["checkout", "-B", o.branch, base], { cwd: o.workDir, env });
   });
