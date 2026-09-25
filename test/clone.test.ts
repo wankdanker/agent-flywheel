@@ -49,7 +49,7 @@ test("prepareRepo clones fresh, checks out the issue branch, and leaves no token
     assert.doesNotMatch(localConfig, new RegExp(TOKEN));
     const globalConfig = spawnSync("git", ["config", "--global", "--list"], { encoding: "utf8" }).stdout;
     assert.doesNotMatch(globalConfig, new RegExp(TOKEN));
-    assert.equal(process.env.GIT_ASKPASS, undefined);
+    assert.ok(!process.env.GIT_ASKPASS);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
