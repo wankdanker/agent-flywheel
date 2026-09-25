@@ -63,6 +63,7 @@ export function prepareRepo(o: {
     const remoteBranch = git(["ls-remote", "--heads", "origin", o.branch], { cwd: o.workDir, env });
     const baseBranch = remoteBranch ? o.branch : o.defaultBranch;
     git(["fetch", "origin", `refs/heads/${baseBranch}`], { cwd: o.workDir, env });
+    git(["update-ref", `refs/remotes/origin/${baseBranch}`, "FETCH_HEAD"], { cwd: o.workDir, env });
     git(["checkout", "-B", o.branch, "FETCH_HEAD"], { cwd: o.workDir, env });
   });
 }
