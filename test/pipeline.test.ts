@@ -102,7 +102,7 @@ test("successful publication: agent reports ready_for_review -> issue commented 
     tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
   });
 
-  assert.equal(outcome.kind, "done");
+  assert.equal(outcome.kind, "ready_for_review");
   assert.deepEqual(tracker.states, ["review"]);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /Implemented pagination/);
@@ -119,7 +119,7 @@ test("blocked work: agent asks a question -> comment posted, label set to blocke
     tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
   });
 
-  assert.equal(outcome.kind, "asked");
+  assert.equal(outcome.kind, "blocked");
   assert.deepEqual(tracker.states, ["blocked"]);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /cursor- or offset-based/);
@@ -140,7 +140,7 @@ test("blocked work: an untrusted-authored issue with no trusted directive short-
     tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
   });
 
-  assert.equal(outcome.kind, "asked");
+  assert.equal(outcome.kind, "blocked");
   assert.deepEqual(tracker.states, ["blocked"]);
 });
 
@@ -165,7 +165,7 @@ test("repeated runs target the same branch and each republication updates (not d
       tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
     });
 
-    assert.equal(outcome.kind, "done");
+    assert.equal(outcome.kind, "ready_for_review");
     assert.deepEqual(tracker.states, ["review"]);
     assert.equal(branchForRun(t), "agent/issue-77");
     mocked.restore();
