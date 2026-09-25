@@ -76,6 +76,6 @@ if (outcome.kind === "incomplete") {
   await tracker.setState("blocked");
 }
 console.log(`[outcome] ${outcome.kind}: ${outcome.detail}`);
-// split behaves like asked for CI's purposes: not a failure, nothing merged yet, the
+// split behaves like blocked for CI's purposes: not a failure, nothing merged yet, the
 // issue is left `blocked` for a human or a sub-issue's own run to pick back up.
-process.exit({ done: 0, asked: 10, split: 10, incomplete: 1 }[outcome.kind]);
+process.exit({ ready_for_review: 0, blocked: 10, split: 10, incomplete: 1, failed: 1 }[outcome.kind]);
