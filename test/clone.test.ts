@@ -64,6 +64,7 @@ test("prepareRepo resumes a cached work dir on the branch a previous run already
     prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
     git(["checkout", "-b", "topic"], workDir); // simulate the agent's own work
     git(["push", "-q", "origin", "agent/issue-1"], workDir);
+    git(["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"], workDir);
 
     prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
 

@@ -63,7 +63,9 @@ export function prepareRepo(o: {
     // Continue the issue's branch if an earlier run already pushed it; otherwise start it
     // fresh off the default branch rather than whatever HEAD the cache happened to leave.
     const remoteBranch = git(["ls-remote", "--heads", "origin", o.branch], { cwd: o.workDir, env });
-    const base = remoteBranch ? `origin/${o.branch}` : `origin/${o.defaultBranch}`;
+    const baseBranch = remoteBranch ? o.branch : o.defaultBranch;
+    git(["fetch", "origin", `${baseBranch}:refs/remotes/origin/${baseBranch}`], { cwd: o.workDir, env });
+    const base = `origin/${baseBranch}`;
     git(["checkout", "-B", o.branch, base], { cwd: o.workDir, env });
   });
 }
