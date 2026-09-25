@@ -57,8 +57,6 @@ export function prepareRepo(o: {
   withCredential(o.credential, (env) => {
     if (!resuming) {
       git(["clone", o.cloneUrl, o.workDir], { env });
-    } else {
-      git(["fetch", "origin"], { cwd: o.workDir, env });
     }
     // Continue the issue's branch if an earlier run already pushed it; otherwise start it
     // fresh off the default branch rather than whatever HEAD the cache happened to leave.
