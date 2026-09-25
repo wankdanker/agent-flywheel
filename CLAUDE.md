@@ -41,7 +41,9 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     model's bash tool calls (`bypassPermissions`) to read back out of `~/.gitconfig` or
     `.git-credentials`. Re-checks the resulting `origin` URL against the allowlist in case a
     cached work dir predates today's config;
-  - runs the worker;
+  - starts `src/model-proxy.ts` with the real `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`
+    and runs the worker with that credential stripped from its env (see README's "Model
+    credential exposure"), closing the proxy in a `finally` regardless of outcome;
   - maps the outcome to an exit code: 0 ready for review, 10 blocked (question or split into sub-issues), 1 incomplete or failed, 2 bad config. Both CIs treat 10 as success.
   - Pushing (opening the PR/MR) still happens inside the agent's own shell, via the
     `github-pr`/`gitlab-mr` skills, which pass `GH_TOKEN`/`AGENT_GITLAB_TOKEN` to a one-shot
@@ -66,6 +68,12 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     a newly-created issue's label actually fire the trigger); `report_failure` → blocked.
 
   If the agent calls none of these tools, `applyOutcome` reports `incomplete`.
+- `src/model-proxy.ts` is the loopback-only HTTP proxy `bin/run-ticket.ts` puts in front of
+  the real model credential (`startModelProxy`, `credentialFromEnv`, `sandboxEnv`; see
+  README's "Model credential exposure"). It enforces `maxRequests`/`maxLifetimeMs` (on top
+  of `MAX_TURNS`) and a per-request `requestTimeoutMs`, and forwards to
+  `upstream ?? DEFAULT_UPSTREAM` so tests can point it at a fake server instead of the real
+  API.
 - CI on each platform:
   - **GitHub:** `.github/workflows/agent.yml` gates on the label and the commenter's association, then `docker run`s the image on a plain runner. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work`; its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid.
   - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline that runs the image, with a native GitLab `cache:` (`when: always`, so a failed run still saves) on `WORK_DIR`.

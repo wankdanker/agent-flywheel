@@ -49,7 +49,7 @@ test("prepareRepo clones fresh, checks out the issue branch, and leaves no token
     assert.doesNotMatch(localConfig, new RegExp(TOKEN));
     const globalConfig = spawnSync("git", ["config", "--global", "--list"], { encoding: "utf8" }).stdout;
     assert.doesNotMatch(globalConfig, new RegExp(TOKEN));
-    assert.equal(process.env.GIT_ASKPASS, undefined);
+    assert.ok(!process.env.GIT_ASKPASS);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -64,6 +64,7 @@ test("prepareRepo resumes a cached work dir on the branch a previous run already
     prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
     git(["checkout", "-b", "topic"], workDir); // simulate the agent's own work
     git(["push", "-q", "origin", "agent/issue-1"], workDir);
+    git(["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"], workDir);
 
     prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
 
