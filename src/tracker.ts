@@ -69,6 +69,8 @@ export interface ChainForge {
   release(issue: number): Promise<void>;
   close(issue: number): Promise<void>;
   getReview(number: number): Promise<ReviewInfo>;
+  // The PR/MR (open or not) from `branch` whose head is `sha`, if any.
+  findReview(branch: string, sha: string): Promise<number | undefined>;
   // Merges the PR/MR only if its head is still `sha` (what was tested).
   mergeReview(number: number, sha: string): Promise<void>;
 }

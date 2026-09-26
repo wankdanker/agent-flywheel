@@ -200,6 +200,12 @@ export function githubChain(o: { token: string; repo: string; apiUrl?: string })
       };
     },
 
+    async findReview(branch, sha) {
+      const owner = o.repo.split("/")[0]!;
+      const prs = await gh(`/pulls?state=all&head=${encodeURIComponent(`${owner}:${branch}`)}&sort=updated&direction=desc&per_page=30`);
+      return prs.find((pr: any) => pr.head.sha === sha)?.number;
+    },
+
     async mergeReview(number, sha) {
       await gh(`/pulls/${number}/merge`, { method: "PUT", body: JSON.stringify({ sha, merge_method: "merge" }) });
     },

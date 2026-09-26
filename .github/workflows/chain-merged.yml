@@ -1,0 +1,23 @@
+# Marks a sub-issue PR merged into its integration branch some other way than chain.yml's own
+# merge (by hand, say), so chain.yml's workflow_run trigger picks it up and starts the next
+# sub-issue. Does nothing itself: it has no secrets, and, as a `pull_request` workflow, runs the
+# PR's own copy of this file.
+name: chain-merged
+
+on:
+  pull_request:
+    types: [closed]
+    branches: ["agent/issue-*"]
+
+permissions: {}
+
+jobs:
+  merged:
+    if: >-
+      github.event.pull_request.merged &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'agent/issue-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "sub-issue PR #${{ github.event.pull_request.number }} merged into ${{ github.event.pull_request.base.ref }}"

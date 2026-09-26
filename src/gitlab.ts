@@ -180,6 +180,11 @@ export function gitlabChain(o: Project): ChainForge {
       };
     },
 
+    async findReview(branch, sha) {
+      const mrs = await gl(`/merge_requests?state=all&source_branch=${encodeURIComponent(branch)}&order_by=updated_at&per_page=30`);
+      return mrs.find((mr: any) => mr.sha === sha)?.iid;
+    },
+
     async mergeReview(number, sha) {
       await request(`/merge_requests/${number}/merge`, { method: "PUT", body: JSON.stringify({ sha }) });
     },

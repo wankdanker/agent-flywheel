@@ -1,0 +1,59 @@
+# Moves a split's chain of sub-issues along (src/chain.ts), triggered by the one job
+# bin/dispatch-gitlab.ts emits for a sub-issue MR (agent/issue-<n> → agent/issue-<parent>), with
+# MR_IID, MR_SHA and CHAIN_ACTION set:
+#   test     new commits: chain-test runs typecheck + tests on exactly MR_SHA, then chain-merge
+#            merges that sha and labels the next queued sub-issue `agent` (or, after the last one,
+#            opens the integration MR into the default branch)
+#   advance  merged some other way (by hand): chain-advance does the second half only
+# The MR's code only ever runs inside chain-test's inner `docker run`, which gets no variables at
+# all: a job's own env holds every project CI/CD variable (forge token and model key included).
+# chain-merge/chain-advance run our own bin/advance-chain.ts from this pipeline's ref (the default
+# branch), never the MR's code.
+# This file isn't under .gitlab/ci/, so .gitlab-ci.yml's include doesn't pick it up.
+
+stages: [test, advance]
+
+chain-test:
+  stage: test
+  rules:
+    - if: $CHAIN_ACTION == "test"
+  image: docker:27
+  services: [docker:27-dind]
+  timeout: 20m
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - apk add --no-cache git
+    - git fetch -q origin "refs/merge-requests/$MR_IID/head"
+    # Test the sha the webhook named; if the MR has moved on, its own event tests the new head.
+    - '[ "$(git rev-parse FETCH_HEAD)" = "$MR_SHA" ] || { echo "MR !$MR_IID moved on from $MR_SHA"; exit 1; }'
+    # The tree only (no .git, so no job token in a remote URL), and no `-e`: nothing secret goes in.
+    - |
+      git archive --format=tar "$MR_SHA" | docker run -i --rm node:24 sh -c '
+        mkdir /src && cd /src && tar -xf - &&
+        git init -q && git add -A && git -c user.name=ci -c user.email=ci@localhost commit -qm tested &&
+        npm ci && npm run typecheck && npm test'
+
+chain-merge:
+  stage: advance
+  rules:
+    - if: $CHAIN_ACTION == "test"
+  needs: [chain-test]
+  # Zero deps (plain fetch), so stock node from our checkout.
+  image: node:24-slim
+  timeout: 10m
+  variables:
+    AGENT_PLATFORM: gitlab
+  script:
+    - REVIEW="$MR_IID" MERGE_SHA="$MR_SHA" node bin/advance-chain.ts
+
+chain-advance:
+  stage: advance
+  rules:
+    - if: $CHAIN_ACTION == "advance"
+  image: node:24-slim
+  timeout: 10m
+  variables:
+    AGENT_PLATFORM: gitlab
+  script:
+    - REVIEW="$MR_IID" node bin/advance-chain.ts
