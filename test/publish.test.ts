@@ -207,7 +207,7 @@ test("applyOutcome with the real publisher: invalid branch -> failed, nothing pu
   const outcome = await applyOutcome(t, cfg, { status: "ready_for_review", summary: "Done." });
   assert.equal(outcome.kind, "failed");
   assert.equal(remoteBranch(f.origin), "");
-  assert.deepEqual(calls.reviews, []);
+  assert.equal(calls.reviews.length, 0);
   assert.deepEqual(calls.states, ["blocked"]);
   assert.match(calls.comments[0]!, /id_rsa: looks like a credential file/);
 

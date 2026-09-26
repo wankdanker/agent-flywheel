@@ -55,11 +55,11 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     and runs the worker with that credential stripped from its env (see README's "Model
     credential exposure"), closing the proxy in a `finally` regardless of outcome;
   - maps the outcome to an exit code: 0 ready for review, 10 blocked (question or split into sub-issues), 20 checkpoint (paused at the turn limit, work pushed), 1 incomplete or failed, 2 bad config. Both CIs treat 10 and 20 as success.
-  - Pushing (opening the PR/MR) still happens inside the agent's own shell, via the
-    `github-pr`/`gitlab-mr` skills, which pass `GH_TOKEN`/`AGENT_GITLAB_TOKEN` to a one-shot
-    `git -c credential.helper=...` on the push command itself rather than persistent config.
-    Those env vars are still readable by the agent process; removing that needs splitting
-    execution from a separate, privileged publish step, which is future work.
+  - The agent never pushes: `sandboxEnv` strips the forge tokens (`FORGE_TOKEN_VARS`) as well as
+    the model credential, and the `github-pr`/`gitlab-mr` skills only tell it to commit. `main()`
+    builds a `gitPublisher` (`src/publish.ts`, a `RunDeps` seam) with the scoped credential and
+    passes it in `WorkerConfig.publisher`; see `applyOutcome` below. Full process isolation of
+    the publisher is the CI-split work (#22).
 - `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent. `toComment` only honors `BOT_MARKER` when the poster is independently trusted (or a GitHub `Bot`-type account) — the marker text alone, e.g. pasted by an attacker, is not enough.
 - `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`. Both attach a `Trust` to the issue (from its author) and to every comment (from that comment's author) when building a `Ticket`.
@@ -76,12 +76,23 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     sub-issues, each carrying the `agent` label so it starts its own run
     (`Tracker#createSubIssue`, one per platform since GitHub and GitLab differ in what makes
     a newly-created issue's label actually fire the trigger); `report_failure` → blocked; `checkpoint` → blocked, with a done/next comment, exit 20.
+    For `finish` and `checkpoint` (explicit or implicit), `applyOutcome` first calls
+    `publisher.pushBranch()`, then for `finish` `Tracker#openReview` (opens the PR/MR, or reuses the
+    open one for the branch). A `PublishRejected` turns the outcome into `failed` (blocked, reasons
+    commented, nothing pushed); any other push/open failure throws a `SettlementError`.
   - It also registers `turnHooks`: a `PostToolUse` hook appends `[Turn X/Y | Z turns remaining]`
     (`TurnGauge`, counting main-thread assistant messages seen by `drain`) to every tool result, and
     a `PreToolUse` hook denies everything but git Bash commands and the `mcp__ticket__*` tools once
-    `CHECKPOINT_AT` (2) or fewer turns remain, telling the agent to commit, push, and call `checkpoint`.
+    `CHECKPOINT_AT` (2) or fewer turns remain, telling the agent to commit and call `checkpoint`.
 
   If the agent calls none of these tools, `applyOutcome` reports `incomplete`, unless the session ended with `error_max_turns`, which is an implicit `checkpoint`. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
+- `src/publish.ts` is the privileged publisher. `gitPublisher().pushBranch()` fetches the agent's
+  `agent/issue-<n>` over `file://` into a fresh scratch repo (minimal env, no credential, fsck on,
+  hooks off), fetches the base from the forge, runs `validateRange` over every commit in
+  `base..head` (each diffed against the base; `checkChange` rejects gitlinks, `.gitmodules`, `.git`
+  paths, escaping paths/symlinks, credential-looking files), and only then pushes from the scratch
+  repo. It must never run `git` against the work dir's own config/hooks or execute anything from
+  the checkout. `test/publish.test.ts` covers it against real git, including a hostile work-dir config.
 - `src/smoke.ts` (`bin/smoke.ts`, `entrypoint.sh --smoke`) is the image's pre-`:latest` smoke test (see README's "Image versions and rollback"). It deliberately reuses `src/run.ts`'s `stripEmptyEnv`, `requireModelCredential` and `startProxyFromEnv`, plus `sandboxEnv`, instead of copying them, so it can't drift from the path a real run takes. Then it runs one `query()` (`maxTurns: 1`, no tools, `SMOKE_MODEL` falling back to `CLAUDE_MODEL`, aborted after `SMOKE_TIMEOUT_MS`) and passes only on a `success` result with at least one request through the proxy. Keep any new proxy/env setup for issue runs in those shared helpers.
 - `src/model-proxy.ts` is the loopback-only HTTP proxy `bin/run-ticket.ts` puts in front of
   the real model credential (`startModelProxy`, `credentialFromEnv`, `sandboxEnv`; see

@@ -177,6 +177,14 @@ test("trustedDirectives excludes bot comments and untrusted comments, keeps trus
   assert.equal(directives[0]!.text, "do the thing");
 });
 
+test("buildPrompt tells the agent to commit and leave pushing and the PR/MR to the publisher", () => {
+  const gh = buildPrompt(ticket({ trust: "trusted" }), cfgFor(fakeTracker("github")));
+  assert.match(gh, /no forge credentials/);
+  assert.match(gh, /Commit your\s+work on agent\/issue-42/);
+  assert.match(gh, /publisher pushes the branch and opens the\s+PR/);
+  assert.match(buildPrompt(ticket({ trust: "trusted" }), cfgFor(fakeTracker("gitlab"))), /opens the\s+MR/);
+});
+
 test("runTicket short-circuits to blocked when an untrusted author has no trusted directive", async () => {
   const t = ticket({
     trust: "untrusted",
