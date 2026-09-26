@@ -6,6 +6,15 @@
 # Variables: AGENT_IMAGE pins the image (e.g. ghcr.io/owner/repo:sha-1a2b3c4); CLAUDE_MODEL, MAX_TURNS;
 # optional MODEL_PROXY_MAX_REQUESTS/MODEL_PROXY_MAX_LIFETIME_MS/MODEL_PROXY_REQUEST_TIMEOUT_MS
 # (see src/model-proxy.ts and README "Model credential exposure").
+#
+# One run is three jobs, each a `docker run` of the same image on its own runner, so the forge
+# token and the model credential are never in the same job (see src/stages.ts, README
+# "Credential separation"):
+#   prepare  GH_TOKEN only:  fetch the issue, set agent/working, clone/check out the branch
+#   agent    model key only: run the agent on that work dir, record its outcome in a file
+#   publish  GH_TOKEN only:  validate the outcome and the branch as data, push, open the PR, label
+# The work dir travels between them through the per-issue actions/cache, under a key unique to
+# this run, attempt and stage.
 name: agent
 
 on:
@@ -28,11 +37,33 @@ permissions:
   pull-requests: write
   packages: read
 
+# One run per issue at a time, across all three jobs. Runs whose event isn't ours to act on
+# (the same condition as the prepare job's `if`) get a group of their own, so our own label
+# changes and comments can't displace a pending human-triggered run. GitHub keeps one pending
+# run per group; that's fine, since each run reads the whole thread, so the latest pending run
+# covers every comment made in the meantime.
+concurrency:
+  group: >-
+    ${{ (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'agent') ||
+      (github.event_name == 'issue_comment' &&
+        !github.event.issue.pull_request &&
+        github.event.issue.state == 'open' &&
+        contains(github.event.issue.labels.*.name, 'agent') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        !contains(github.event.comment.body, '<!-- agent-flywheel -->')))
+      && format('agent-issue-{0}', github.event.issue.number || inputs.issue)
+      || format('agent-skip-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  ISSUE: ${{ github.event.issue.number || inputs.issue }}
+
 jobs:
-  work:
+  prepare:
     # The author_association allowlist below must stay in sync with
     # GITHUB_TRUSTED_ASSOCIATIONS in src/trust.ts, which gates what the agent reads as
-    # instructions using the same rule.
+    # instructions using the same rule, and with the concurrency group above.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' && github.event.label.name == 'agent') ||
@@ -42,41 +73,105 @@ jobs:
         contains(github.event.issue.labels.*.name, 'agent') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
         !contains(github.event.comment.body, '<!-- agent-flywheel -->'))
-    # Job-level, not workflow-level: only runs that pass the `if` above take a slot, so our
-    # own label changes and comments (skipped runs) can't displace a pending human-triggered
-    # run. GitHub keeps one pending run per group; that's fine, since each run reads the
-    # whole thread, so the latest pending run covers every comment made in the meantime.
-    concurrency:
-      group: agent-issue-${{ github.event.issue.number || inputs.issue }}
-      cancel-in-progress: false
     # GitHub gives issue/issue_comment-triggered runs a read-only cache by default (untrusted
-    # triggers), which silently dropped every work-dir save. This job only runs for trusted
-    # people (the `if` above), the agent container never sees the cache token, and the only
-    # thing saved is this issue's own work dir, restored only by later runs on this issue.
+    # triggers), which silently dropped every work-dir save. These jobs only run for trusted
+    # people (the `if` above), no container ever sees the cache token, and the only thing
+    # saved is this issue's own work dir, restored only by later jobs on this issue.
     cache-mode: write
+    permissions:
+      contents: read
+      issues: write
+      packages: read
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 20
+    outputs:
+      proceed: ${{ steps.prepare.outputs.proceed }}
+      image: ${{ steps.image.outputs.image }}
+      work-key: ${{ steps.prepare.outputs.work-key }}
     steps:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # Pinned by digest here and handed to the other two jobs, so all three run the same
+      # image even if :latest moves mid-run.
+      - name: Pull the agent image
+        id: image
+        env:
+          IMAGE: ${{ inputs.image || vars.AGENT_IMAGE }}
+        run: |
+          image="${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}:latest}"
+          docker pull "$image" || { echo "::error::No agent image $image. Run the build workflow first."; exit 2; }
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image" 2>/dev/null || true)"
+          echo "image=${digest:-$image}" >> "$GITHUB_OUTPUT"
       # Work dir is cached per issue so a run that dies partway (turn limit, crash) doesn't
-      # lose its clone; the next run on that issue resumes from it instead of recloning.
-      # A fresh cache key per run, with the issue's latest entry as a restore-key fallback,
-      # keeps it updated even though actions/cache only saves on a key miss. Restore and save
-      # are separate steps so the save runs `if: always()`: a failed run is exactly the one
-      # whose work we need to keep.
+      # lose its clone; the next run on that issue resumes from the newest entry (normally the
+      # agent job's save) instead of recloning. Each save gets a fresh key, since actions/cache
+      # only saves on a key miss.
       - name: Restore work directory cache
         uses: actions/cache/restore@v4
         with:
           path: agent-work
-          key: agent-work-issue-${{ github.event.issue.number || inputs.issue }}-${{ github.run_id }}
+          key: agent-work-issue-${{ env.ISSUE }}-${{ github.run_id }}-${{ github.run_attempt }}-prepared
           restore-keys: |
-            agent-work-issue-${{ github.event.issue.number || inputs.issue }}-
-      - name: Work the issue
+            agent-work-issue-${{ env.ISSUE }}-
+      - name: Prepare the work directory
+        id: prepare
         env:
-          IMAGE: ${{ inputs.image || vars.AGENT_IMAGE }}
-          ISSUE: ${{ github.event.issue.number || inputs.issue }}
+          IMAGE: ${{ steps.image.outputs.image }}
           GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # docker run rather than `container:`: same as a local run. The one bind mount (the
+          # work dir) needs its owner matched to the image's user at run time (never
+          # hardcoded, in case the image changes it), so it isn't a uid fight.
+          mkdir -p agent-work
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+          sudo chown -R "$uid:$uid" agent-work
+          set +e
+          docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN \
+            -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
+            -v "$PWD/agent-work:/work" \
+            "$IMAGE" --stage prepare
+          code=$?
+          echo "work-key=agent-work-issue-$ISSUE-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-prepared" >> "$GITHUB_OUTPUT"
+          if [ "$code" = 0 ]; then echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # 10 = blocked before the agent started (an untrusted issue awaiting a maintainer's go-ahead).
+          if [ "$code" = 10 ]; then echo "::notice::#$ISSUE is waiting on a trusted maintainer"; exit 0; fi
+          exit "$code"
+      - name: Hand the work directory to the agent job
+        if: steps.prepare.outputs.proceed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: agent-work
+          key: ${{ steps.prepare.outputs.work-key }}
+
+  agent:
+    needs: prepare
+    if: needs.prepare.outputs.proceed == 'true'
+    cache-mode: write
+    # No issues/contents/pull-requests scopes: nothing in this job can write to the forge.
+    permissions:
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      work-key: ${{ steps.key.outputs.work-key }}
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Restore the prepared work directory
+        uses: actions/cache/restore@v4
+        with:
+          path: agent-work
+          key: ${{ needs.prepare.outputs.work-key }}
+          fail-on-cache-miss: true
+      - name: Name this job's work directory save
+        id: key
+        run: echo "work-key=agent-work-issue-$ISSUE-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-agent" >> "$GITHUB_OUTPUT"
+      # The model credential and nothing else secret: no GH_TOKEN, so the agent (running Bash
+      # with permissions bypassed) has no forge credential to find. `--stage agent` also
+      # refuses to start if one reaches it (env, credential files or git config).
+      - name: Run the agent
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
@@ -85,34 +180,81 @@ jobs:
           MODEL_PROXY_MAX_LIFETIME_MS: ${{ vars.MODEL_PROXY_MAX_LIFETIME_MS }}
           MODEL_PROXY_REQUEST_TIMEOUT_MS: ${{ vars.MODEL_PROXY_REQUEST_TIMEOUT_MS }}
         run: |
-          image="${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}:latest}"
-          docker pull "$image" || { echo "::error::No agent image $image. Run the build workflow first."; exit 2; }
-          # docker run rather than `container:`: same as a local run. The one bind mount we do
-          # have (the work dir cache) needs its owner matched to the image's user at run time
-          # (never hardcoded, in case the image changes it), so it isn't a uid fight.
-          mkdir -p agent-work
-          uid="$(docker run --rm --entrypoint id "$image" -u)"
+          docker pull "$IMAGE"
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
           sudo chown -R "$uid:$uid" agent-work
-          set +e
-          docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN \
+          docker run --rm -e ISSUE \
             -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS \
             -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS \
+            -v "$PWD/agent-work:/work" \
+            "$IMAGE" --stage agent
+      # Always, so a failed or timed-out agent still keeps its work for the next run to resume,
+      # and the publish job still gets a work dir to settle the issue from.
+      - name: Save work directory cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: agent-work
+          key: ${{ steps.key.outputs.work-key }}
+
+  publish:
+    needs: [prepare, agent]
+    # Also after a failed agent job: with no recorded outcome to apply, the publish stage still
+    # takes the issue off agent/working (blocked, with a comment pointing at the logs).
+    if: always() && needs.prepare.outputs.proceed == 'true'
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # A miss (the agent job never saved) is left to the publish stage to report.
+      - name: Restore the agent's work directory
+        uses: actions/cache/restore@v4
+        with:
+          path: agent-work
+          key: ${{ needs.agent.outputs.work-key || 'none' }}
+      # The forge token and no model credential. The work dir (the agent's commits and its
+      # outcome.json) is only read as data: see src/handoff.ts and src/publish.ts.
+      - name: Publish the outcome
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          MAX_TURNS: ${{ vars.MAX_TURNS }}
+        run: |
+          docker pull "$IMAGE"
+          mkdir -p agent-work
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+          sudo chown -R "$uid:$uid" agent-work
+          set +e
+          docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e MAX_TURNS \
             -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
             -v "$PWD/agent-work:/work" \
-            "$image"
+            "$IMAGE" --stage publish
           code=$?
           # 10 = asked a question on the issue; not a failure for us.
           if [ "$code" = 10 ]; then echo "::notice::Asked a question on #$ISSUE"; exit 0; fi
           # 20 = paused at a checkpoint before the turn limit, work pushed; also not a failure.
           if [ "$code" = 20 ]; then echo "::notice::Checkpointed #$ISSUE; reply on the issue to continue"; exit 0; fi
           exit "$code"
-      # src/run.ts already leaves a terminal label on every failure it can catch. This covers
-      # what it can't: the container killed by the job timeout or a cancel before it could
-      # clean up. (Losing the runner itself runs nothing; see README "Stuck on agent/working".)
+
+  # The stages already leave a terminal label on every failure they can catch. This covers
+  # what they can't: a container killed by a job timeout or a cancel before it could clean up.
+  # (Losing a runner itself runs nothing; see README "Stuck on agent/working".)
+  unstick:
+    needs: [prepare, agent, publish]
+    if: (failure() || cancelled()) && needs.prepare.result != 'skipped'
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: Unstick agent/working
-        if: failure() || cancelled()
         env:
-          ISSUE: ${{ github.event.issue.number || inputs.issue }}
           GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           if gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' | grep -qx 'agent/working'; then
@@ -122,9 +264,3 @@ jobs:
               "The run was stopped (timed out or cancelled) before it could finish, so I've marked this issue blocked. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Reply here to have me retry." \
               '<!-- agent-flywheel -->')"
           fi
-      - name: Save work directory cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: agent-work
-          key: agent-work-issue-${{ github.event.issue.number || inputs.issue }}-${{ github.run_id }}
