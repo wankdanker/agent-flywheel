@@ -1,5 +1,5 @@
 // Our thin GitHub REST client for one issue.
-import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
+import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type ChainForge, type Tracker } from "./tracker.ts";
 import { trustFromGithubAssociation } from "./trust.ts";
 
 // A runaway-loop guard, not a thread-size limit: 1000 pages of 100 is far past any real issue.
@@ -34,6 +34,24 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
 
   async function gh(path: string, init: RequestInit = {}) {
     return (await request(`${apiUrl}/repos/${o.repo}${path}`, init, path)).json();
+  }
+
+  // Like gh(), but undefined for a 404 instead of throwing.
+  async function ghMaybe(path: string) {
+    const res = await fetch(`${apiUrl}/repos/${o.repo}${path}`, { headers: { Authorization: `Bearer ${o.token}`, Accept: "application/vnd.github+json" } });
+    if (res.status === 404) return undefined;
+    if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status} ${await res.text()}`);
+    return res.json();
+  }
+
+  // Native relations are a nicety on top of the chain header (src/chain.ts), and these APIs
+  // aren't on every GitHub plan or server version, so a failure is only logged.
+  async function bestEffort(what: string, f: () => Promise<unknown>) {
+    try {
+      await f();
+    } catch (err) {
+      console.error(`[github] couldn't ${what} (the issue body still records it):`, err instanceof Error ? err.message : err);
+    }
   }
 
   // Every page of a list endpoint, in the API's order, following `Link: <…>; rel="next"`
@@ -90,13 +108,32 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
       await gh(issue, { method: "PATCH", body: JSON.stringify({ labels: [...labels, STATE_LABELS[state]] }) });
     },
 
-    // Two calls, not one create-with-labels: GitHub doesn't fire a `labeled` webhook event
-    // for labels included in the creation payload, only `opened` — and agent.yml only
-    // triggers on `labeled`. Adding the label as a follow-up guarantees the new run starts.
-    async createSubIssue({ title, body }) {
-      const created = await gh("/issues", { method: "POST", body: JSON.stringify({ title, body }) });
-      await gh(`/issues/${created.number}/labels`, { method: "POST", body: JSON.stringify({ labels: [OPT_IN_LABEL] }) });
+    // A runnable one takes two calls, not one create-with-labels: GitHub doesn't fire a
+    // `labeled` webhook event for labels included in the creation payload, only `opened` — and
+    // agent.yml only triggers on `labeled`. Adding the label as a follow-up guarantees the new
+    // run starts. A queued one should start nothing, so its label goes in the payload.
+    async createSubIssue({ title, body, runnable, parent, blockedBy }) {
+      const created = await gh("/issues", {
+        method: "POST",
+        body: JSON.stringify(runnable ? { title, body } : { title, body, labels: [STATE_LABELS.queued] }),
+      });
+      if (runnable) await gh(`/issues/${created.number}/labels`, { method: "POST", body: JSON.stringify({ labels: [OPT_IN_LABEL] }) });
+      await bestEffort(`add #${created.number} as a sub-issue of #${parent}`, () =>
+        gh(`/issues/${parent}/sub_issues`, { method: "POST", body: JSON.stringify({ sub_issue_id: created.id }) }));
+      if (blockedBy) {
+        await bestEffort(`mark #${created.number} blocked by #${blockedBy}`, async () => {
+          const blocker = await gh(`/issues/${blockedBy}`);
+          await gh(`/issues/${created.number}/dependencies/blocked_by`, { method: "POST", body: JSON.stringify({ issue_id: blocker.id }) });
+        });
+      }
       return { number: created.number, url: created.html_url };
+    },
+
+    async ensureBranch(branch, from) {
+      if (await ghMaybe(`/git/ref/heads/${branch}`)) return false;
+      const base = await gh(`/git/ref/heads/${from}`);
+      await gh("/git/refs", { method: "POST", body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: base.object.sha }) });
+      return true;
     },
 
     // Pushing the branch already updated an open PR; only open one if there isn't one yet.
@@ -106,6 +143,65 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
       if (Array.isArray(open) && open.length) return { url: open[0].html_url, created: false };
       const pr = await gh("/pulls", { method: "POST", body: JSON.stringify({ title, head: branch, base, body }) });
       return { url: pr.html_url, created: true };
+    },
+  };
+}
+
+export function githubChain(o: { token: string; repo: string; apiUrl?: string }): ChainForge {
+  const apiUrl = o.apiUrl ?? "https://api.github.com";
+  async function gh(path: string, init: RequestInit = {}, okStatus: number[] = []) {
+    const res = await fetch(`${apiUrl}/repos/${o.repo}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${o.token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+      },
+    });
+    if (!res.ok && !okStatus.includes(res.status)) throw new Error(`GitHub ${init.method ?? "GET"} ${path}: ${res.status} ${await res.text()}`);
+    return res.status === 204 || !res.ok ? undefined : res.json();
+  }
+  return {
+    tracker: (issue) => githubTracker({ ...o, issue }),
+
+    async listQueued() {
+      const issues: any[] = [];
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const batch = await gh(`/issues?state=open&labels=${encodeURIComponent(STATE_LABELS.queued)}&per_page=100&page=${page}`);
+        issues.push(...batch);
+        if (batch.length < 100) break;
+      }
+      return issues
+        .filter((i) => !i.pull_request)
+        .map((i) => ({ number: i.number, url: i.html_url, body: i.body ?? "", trust: trustFromGithubAssociation(i.author_association) }));
+    },
+
+    // Remove first, then add: adding `agent` fires the `labeled` event that starts the run.
+    async release(issue) {
+      await gh(`/issues/${issue}/labels/${encodeURIComponent(STATE_LABELS.queued)}`, { method: "DELETE" }, [404]);
+      await gh(`/issues/${issue}/labels`, { method: "POST", body: JSON.stringify({ labels: [OPT_IN_LABEL] }) });
+    },
+
+    async close(issue) {
+      await gh(`/issues/${issue}`, { method: "PATCH", body: JSON.stringify({ state: "closed", state_reason: "completed" }) });
+    },
+
+    async getReview(number) {
+      const pr = await gh(`/pulls/${number}`);
+      return {
+        number,
+        open: pr.state === "open",
+        merged: Boolean(pr.merged),
+        head: pr.head.ref,
+        base: pr.base.ref,
+        sha: pr.head.sha,
+        sameRepo: pr.head.repo?.full_name === o.repo,
+      };
+    },
+
+    async mergeReview(number, sha) {
+      await gh(`/pulls/${number}/merge`, { method: "PUT", body: JSON.stringify({ sha, merge_method: "merge" }) });
     },
   };
 }

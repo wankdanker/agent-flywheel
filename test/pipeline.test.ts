@@ -80,6 +80,9 @@ function fakeTracker(forge: Forge = { openPrs: [] }): Tracker & { comments: stri
     async createSubIssue() {
       throw new Error("not used in these tests");
     },
+    async ensureBranch() {
+      return true;
+    },
     async openReview() {
       if (forge.openPrs.length) return { url: forge.openPrs[0]!, created: false };
       forge.openPrs.push(`https://example.test/repo/pull/${forge.openPrs.length + 1}`);

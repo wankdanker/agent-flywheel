@@ -72,27 +72,48 @@ test("github getTicket: untrusted author on a public repo", async (t) => {
   assert.equal(ticket.author, "outside-reporter");
 });
 
-test("github createSubIssue: creates the issue, then adds the agent label as a separate call", async (t) => {
+test("github createSubIssue: runnable → create, then add the agent label as a separate call; plus a native sub-issue link", async (t) => {
   const calls: { url: string; method: string; body: string }[] = [];
   t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
     calls.push({ url, method: init.method ?? "GET", body: (init.body as string) ?? "" });
     if (url.endsWith("/issues") && init.method === "POST") {
-      return jsonResponse({ number: 99, html_url: "https://github.com/o/r/issues/99" });
+      return jsonResponse({ id: 5099, number: 99, html_url: "https://github.com/o/r/issues/99" });
     }
-    if (url.endsWith("/issues/99/labels") && init.method === "POST") {
-      return jsonResponse([{ name: "agent" }]);
-    }
+    if (url.endsWith("/issues/99/labels") && init.method === "POST") return jsonResponse([{ name: "agent" }]);
+    if (url.endsWith("/issues/42/sub_issues") && init.method === "POST") return jsonResponse({});
     throw new Error(`unexpected fetch ${url}`);
   });
 
   const tracker = githubTracker({ token: "x", repo: "o/r", issue: 42 });
-  const created = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part." });
+  const created = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part.", runnable: true, parent: 42 });
 
   assert.deepEqual(created, { number: 99, url: "https://github.com/o/r/issues/99" });
-  assert.equal(calls.length, 2, "must create, then add the label, as two separate requests");
+  assert.equal(calls.length, 3);
   assert.deepEqual(JSON.parse(calls[0]!.body), { title: "Sub-task 1", body: "Do the first part." });
   assert.ok(!calls[0]!.body.includes('"labels"'), "the create call must not include labels");
   assert.deepEqual(JSON.parse(calls[1]!.body), { labels: ["agent"] });
+  assert.deepEqual(JSON.parse(calls[2]!.body), { sub_issue_id: 5099 });
+});
+
+test("github createSubIssue: queued → agent/queued in the create call, no agent label; native links are best effort", async (t) => {
+  const calls: { url: string; method: string; body: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    calls.push({ url, method: init.method ?? "GET", body: (init.body as string) ?? "" });
+    if (url.endsWith("/issues") && init.method === "POST") return jsonResponse({ id: 5100, number: 100, html_url: "https://github.com/o/r/issues/100" });
+    if (url.endsWith("/issues/42/sub_issues")) return new Response("not on this plan", { status: 404 });
+    if (url.endsWith("/issues/99")) return jsonResponse({ id: 5099, number: 99 });
+    if (url.endsWith("/issues/100/dependencies/blocked_by")) return jsonResponse({});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  t.mock.method(console, "error", () => {});
+
+  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 42 });
+  const created = await tracker.createSubIssue({ title: "Sub-task 2", body: "b", runnable: false, parent: 42, blockedBy: 99 });
+
+  assert.equal(created.number, 100);
+  assert.deepEqual(JSON.parse(calls[0]!.body), { title: "Sub-task 2", body: "b", labels: ["agent/queued"] });
+  assert.ok(!calls.some((c) => c.url.endsWith("/labels")), "a queued sub-issue must not get the agent label");
+  assert.deepEqual(JSON.parse(calls.at(-1)!.body), { issue_id: 5099 });
 });
 
 function issueResponse(n: number) {

@@ -51,6 +51,9 @@ function fakeTracker(fail: Fail = {}, comments: Comment[] = []) {
       if (fail.createSubIssue) throw new Error("GitHub POST /issues: 403");
       return { number: 8, url: "https://github.com/acme/widgets/issues/8" };
     },
+    async ensureBranch() {
+      return true;
+    },
     async openReview() {
       return { url: "https://x/pull/1", created: true };
     },

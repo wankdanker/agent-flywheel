@@ -42,6 +42,9 @@ function fakeTracker(over: Partial<Ticket> = {}) {
     async createSubIssue() {
       return { number: 8, url: "https://github.com/acme/widgets/issues/8" };
     },
+    async ensureBranch() {
+      return true;
+    },
     async openReview() {
       t.reviews++;
       return { url: "https://github.com/acme/widgets/pull/1", created: true };

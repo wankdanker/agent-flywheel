@@ -78,22 +78,30 @@ test("gitlab getTicket: untrusted author (non-member)", async (t) => {
   assert.equal(ticket.author, "outside-reporter");
 });
 
-test("gitlab createSubIssue: creates the issue with the agent label in a single call", async (t) => {
+test("gitlab createSubIssue: one create call carrying the agent label (runnable) or agent/queued, plus issue links", async (t) => {
   const calls: { url: string; method: string; body: string }[] = [];
   t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
     calls.push({ url, method: init.method ?? "GET", body: (init.body as string) ?? "" });
-    if (url.includes("/issues") && init.method === "POST") {
-      return jsonResponse({ iid: 17, web_url: "https://gitlab.example/g/p/-/issues/17" });
+    if (url.endsWith("/issues") && init.method === "POST") {
+      const n = calls.filter((c) => c.url.endsWith("/issues")).length;
+      return jsonResponse({ iid: 16 + n, project_id: 3, web_url: `https://gitlab.example/g/p/-/issues/${16 + n}` });
     }
+    if (url.endsWith("/links") && init.method === "POST") return jsonResponse({});
     throw new Error(`unexpected fetch ${url}`);
   });
 
   const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 9 });
-  const created = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part." });
-
-  assert.deepEqual(created, { number: 17, url: "https://gitlab.example/g/p/-/issues/17" });
-  assert.equal(calls.length, 1, "one call is enough: GitLab actions on a newly-opened issue that already has the label");
+  const first = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part.", runnable: true, parent: 9 });
+  assert.deepEqual(first, { number: 17, url: "https://gitlab.example/g/p/-/issues/17" });
   assert.deepEqual(JSON.parse(calls[0]!.body), { title: "Sub-task 1", description: "Do the first part.", labels: "agent" });
+  assert.match(calls[1]!.url, /\/issues\/9\/links$/);
+  assert.deepEqual(JSON.parse(calls[1]!.body), { target_project_id: 3, target_issue_iid: 17, link_type: "relates_to" });
+
+  calls.length = 0;
+  await tracker.createSubIssue({ title: "Sub-task 2", body: "b", runnable: false, parent: 9, blockedBy: 17 });
+  assert.equal(JSON.parse(calls[0]!.body).labels, "agent/queued");
+  assert.match(calls[2]!.url, /\/issues\/17\/links$/);
+  assert.equal(JSON.parse(calls[2]!.body).link_type, "blocks");
 });
 
 function issueResponse(iid: number) {

@@ -200,6 +200,7 @@ test("applyOutcome with the real publisher: invalid branch -> failed, nothing pu
     comment: async (text) => void calls.comments.push(text),
     setState: async (s) => void calls.states.push(s),
     createSubIssue: async () => { throw new Error("unused"); },
+    ensureBranch: async () => { throw new Error("unused"); },
     openReview: async (r) => (calls.reviews.push(r), { url: "https://x/pull/1", created: true }),
   };
   const t: Ticket = { number: 1, url: "https://x/issues/1", title: "t", body: "", author: "m", trust: "trusted", labels: [], comments: [] };

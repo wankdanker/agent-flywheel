@@ -1,26 +1,30 @@
 // Our thin GitLab REST client for one issue.
-import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type Tracker } from "./tracker.ts";
+import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type ChainForge, type Tracker } from "./tracker.ts";
 import { gitlabMemberTrust, type Trust } from "./trust.ts";
 
 // A runaway-loop guard, not a thread-size limit: 1000 pages of 100 is far past any real issue.
 const MAX_PAGES = 1000;
 
 // `project` is a numeric id or a `group/project` path.
-export function gitlabTracker(o: { token: string; apiUrl: string; project: string; issue: number }): Tracker {
-  const issue = `/issues/${o.issue}`;
+type Project = { token: string; apiUrl: string; project: string };
 
-  async function request(path: string, init: RequestInit = {}) {
+// `okStatus` are statuses that aren't errors to this caller; the response comes back either way.
+function projectApi(o: Project) {
+  async function request(path: string, init: RequestInit = {}, okStatus: number[] = []) {
     const res = await fetch(`${o.apiUrl}/projects/${encodeURIComponent(o.project)}${path}`, {
       ...init,
       headers: { "PRIVATE-TOKEN": o.token, "Content-Type": "application/json" },
     });
-    if (!res.ok) throw new Error(`GitLab ${init.method ?? "GET"} ${path}: ${res.status} ${await res.text()}`);
+    if (!res.ok && !okStatus.includes(res.status)) throw new Error(`GitLab ${init.method ?? "GET"} ${path}: ${res.status} ${await res.text()}`);
     return res;
   }
+  const gl = async (path: string, init: RequestInit = {}) => (await request(path, init)).json();
+  return { request, gl };
+}
 
-  async function gl(path: string, init: RequestInit = {}) {
-    return (await request(path, init)).json();
-  }
+export function gitlabTracker(o: Project & { issue: number }): Tracker {
+  const issue = `/issues/${o.issue}`;
+  const { request, gl } = projectApi(o);
 
   // Every page of a list endpoint, in the API's order, following `x-next-page` (blank on
   // the last page). `path` keeps its own query (sort, per_page); only `page` is added.
@@ -94,9 +98,31 @@ export function gitlabTracker(o: { token: string; apiUrl: string; project: strin
 
     // Unlike GitHub, dispatch-gitlab.ts treats any newly-opened issue that already carries
     // `agent` as actionable, so one create call (label included) is enough to start a run.
-    async createSubIssue({ title, body }) {
-      const created = await gl("/issues", { method: "POST", body: JSON.stringify({ title, description: body, labels: OPT_IN_LABEL }) });
+    // A queued one gets `agent/queued` instead, which dispatch ignores.
+    async createSubIssue({ title, body, runnable, parent, blockedBy }) {
+      const labels = runnable ? OPT_IN_LABEL : STATE_LABELS.queued;
+      const created = await gl("/issues", { method: "POST", body: JSON.stringify({ title, description: body, labels }) });
+      // Native links are a nicety on top of the chain header (src/chain.ts): logged, not fatal.
+      const link = async (from: number, type: string) => {
+        try {
+          await gl(`/issues/${from}/links`, {
+            method: "POST",
+            body: JSON.stringify({ target_project_id: created.project_id, target_issue_iid: created.iid, link_type: type }),
+          });
+        } catch (err) {
+          console.error(`[gitlab] couldn't link #${from} to #${created.iid} (the issue body still records it):`, err instanceof Error ? err.message : err);
+        }
+      };
+      await link(parent, "relates_to");
+      if (blockedBy) await link(blockedBy, "blocks");
       return { number: created.iid, url: created.web_url };
+    },
+
+    async ensureBranch(branch, from) {
+      const res = await request(`/repository/branches/${encodeURIComponent(branch)}`, {}, [404]);
+      if (res.ok) return false;
+      await gl(`/repository/branches?branch=${encodeURIComponent(branch)}&ref=${encodeURIComponent(from)}`, { method: "POST" });
+      return true;
     },
 
     // Pushing the branch already updated an open MR; only open one if there isn't one yet.
@@ -108,6 +134,54 @@ export function gitlabTracker(o: { token: string; apiUrl: string; project: strin
         body: JSON.stringify({ source_branch: branch, target_branch: base, title, description: body }),
       });
       return { url: mr.web_url, created: true };
+    },
+  };
+}
+
+export function gitlabChain(o: Project): ChainForge {
+  const { request, gl } = projectApi(o);
+  const membership = new Map<number, Promise<Trust>>();
+  const trustOf = (userId: number) => {
+    if (!membership.has(userId)) membership.set(userId, gitlabMemberTrust({ ...o, userId }));
+    return membership.get(userId)!;
+  };
+  return {
+    tracker: (issue) => gitlabTracker({ ...o, issue }),
+
+    async listQueued() {
+      const issues: any[] = [];
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const batch = await gl(`/issues?state=opened&labels=${encodeURIComponent(STATE_LABELS.queued)}&per_page=100&page=${page}`);
+        issues.push(...batch);
+        if (batch.length < 100) break;
+      }
+      return Promise.all(issues.map(async (i) => ({ number: i.iid, url: i.web_url, body: i.description ?? "", trust: await trustOf(i.author.id) })));
+    },
+
+    // One call: dispatch-gitlab.ts sees `agent` arrive in the update's label changes.
+    async release(issue) {
+      await gl(`/issues/${issue}`, { method: "PUT", body: JSON.stringify({ add_labels: OPT_IN_LABEL, remove_labels: STATE_LABELS.queued }) });
+    },
+
+    async close(issue) {
+      await gl(`/issues/${issue}`, { method: "PUT", body: JSON.stringify({ state_event: "close" }) });
+    },
+
+    async getReview(number) {
+      const mr = await gl(`/merge_requests/${number}`);
+      return {
+        number,
+        open: mr.state === "opened",
+        merged: mr.state === "merged",
+        head: mr.source_branch,
+        base: mr.target_branch,
+        sha: mr.sha,
+        sameRepo: mr.source_project_id === mr.target_project_id,
+      };
+    },
+
+    async mergeReview(number, sha) {
+      await request(`/merge_requests/${number}/merge`, { method: "PUT", body: JSON.stringify({ sha }) });
     },
   };
 }

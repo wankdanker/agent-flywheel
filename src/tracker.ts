@@ -4,7 +4,9 @@
 import type { Trust } from "./trust.ts";
 
 export const OPT_IN_LABEL = "agent";
-export const STATE_LABELS = { working: "agent/working", blocked: "agent/blocked", review: "agent/review" };
+// `queued` is a sub-issue waiting its turn in a split's chain (see src/chain.ts): it has no
+// `agent` label yet, so nothing runs it until the sub-issue before it merges.
+export const STATE_LABELS = { working: "agent/working", blocked: "agent/blocked", review: "agent/review", queued: "agent/queued" };
 // Hidden in rendered markdown; how we tell our own comments apart whatever token posted them.
 export const BOT_MARKER = "<!-- agent-flywheel -->";
 // Visible prefix so a comment still reads as ours when posted with a personal access token
@@ -28,6 +30,10 @@ export type Ticket = {
 export type Repo = { cloneUrl: string; webUrl: string; defaultBranch: string };
 
 export type NewSubIssue = { title: string; body: string };
+// `runnable` sub-issues get the `agent` label (their run starts right away); the rest get
+// `agent/queued`. `parent`/`blockedBy` are also recorded natively where the platform can
+// (best effort: the body's chain header, src/chain.ts, is the source of truth).
+export type SubIssueRequest = NewSubIssue & { runnable: boolean; parent: number; blockedBy?: number };
 export type CreatedIssue = { number: number; url: string };
 export type ReviewRequest = { branch: string; base: string; title: string; body: string };
 
@@ -37,14 +43,34 @@ export interface Tracker {
   getTicket(): Promise<Ticket>;
   comment(text: string): Promise<void>;
   setState(state: TicketState): Promise<void>;
-  // Opens a new issue with the `agent` label already applied, so it starts its own run
-  // (see worker.ts's split_into_subtasks). Implementations must ensure the opt-in label
-  // actually fires that platform's trigger — see github.ts/gitlab.ts for why they differ.
-  createSubIssue(input: NewSubIssue): Promise<CreatedIssue>;
+  // Opens a new issue. A `runnable` one gets the `agent` label, so it starts its own run (see
+  // worker.ts's split); implementations must ensure the opt-in label actually fires that
+  // platform's trigger — see github.ts/gitlab.ts for why they differ. The others get
+  // `agent/queued` and wait for src/chain.ts's advanceChain to release them.
+  createSubIssue(input: SubIssueRequest): Promise<CreatedIssue>;
+  // Creates `branch` from the current tip of `from`, unless it already exists. True if created.
+  ensureBranch(branch: string, from: string): Promise<boolean>;
   // Opens a PR/MR from `branch` into `base`, or returns the one already open for that branch
   // (`created: false`), so a retried or resumed publication never opens a duplicate. Only
   // the trusted publisher calls this (see worker.ts's applyOutcome), after pushing the branch.
   openReview(input: ReviewRequest): Promise<{ url: string; created: boolean }>;
+}
+
+// An open issue carrying `agent/queued`, as advanceChain needs it.
+export type QueuedIssue = Pick<Ticket, "number" | "url" | "body" | "trust">;
+export type ReviewInfo = { number: number; open: boolean; merged: boolean; head: string; base: string; sha: string; sameRepo: boolean };
+
+// The repo-level forge calls that advancing a split's chain needs (src/chain.ts), beyond one
+// issue's Tracker. Only the chain step (bin/advance-chain.ts) uses it, never the agent's run.
+export interface ChainForge {
+  tracker(issue: number): Tracker;
+  listQueued(): Promise<QueuedIssue[]>;
+  // `agent/queued` → `agent`, which starts that issue's run.
+  release(issue: number): Promise<void>;
+  close(issue: number): Promise<void>;
+  getReview(number: number): Promise<ReviewInfo>;
+  // Merges the PR/MR only if its head is still `sha` (what was tested).
+  mergeReview(number: number, sha: string): Promise<void>;
 }
 
 export const need = (k: string): string => process.env[k] || (console.error(`missing env ${k}`), process.exit(2));

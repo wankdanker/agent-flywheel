@@ -6,6 +6,7 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isAllowedRepo, parseAllowlist } from "./allowlist.ts";
+import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
 import { githubTracker } from "./github.ts";
 import { gitlabTracker } from "./gitlab.ts";
@@ -151,6 +152,7 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
     repo: () => tracker.repo(),
     getTicket: () => tracker.getTicket(),
     createSubIssue: (input) => tracker.createSubIssue(input),
+    ensureBranch: (branch, from) => tracker.ensureBranch(branch, from),
     openReview: (input) => tracker.openReview(input),
     async comment(text) {
       const key = text.trim();
@@ -294,7 +296,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
 
     // Cloning happens here, before the agent's own (permission-bypassed) shell ever starts, so
     // it never needs or sees forge credentials to get the repo it's meant to work on.
-    const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: repo.defaultBranch };
+    const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: baseBranchFor(ticket, repo.defaultBranch) };
     const credential = credentialFor(tracker.platform, env);
     prepareRepo({ ...target, credential });
 
