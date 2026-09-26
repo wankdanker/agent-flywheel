@@ -84,11 +84,12 @@ CI log. If even the label update fails, the log says so and what to fix by hand.
 Bad config (missing credential, invalid `MAX_TURNS`, repo outside the allowlist) is caught
 before the issue is touched at all.
 
-What a process can't do is clean up after being killed. On GitHub, a step in
-`.github/workflows/agent.yml` swaps a leftover `agent/working` for `agent/blocked` when the job
-times out or is cancelled. Nothing runs if the runner itself is lost, and GitLab has no
-equivalent yet, so an issue can still occasionally be stuck on `agent/working` with no job
-running. To recover, reply on the issue (the next run resets the label and settles it again),
+What a process can't do is clean up after being killed. In CI the publish job still runs after
+a failed or timed-out agent job, finds no `outcome.json`, and settles the issue as blocked. On
+GitHub, an `unstick` job in `.github/workflows/agent.yml` also swaps a leftover
+`agent/working` for `agent/blocked` when any of the three jobs times out or is cancelled.
+Nothing runs if a runner itself is lost, so an issue can still occasionally be stuck on
+`agent/working` with no job running. To recover, reply on the issue (the next run resets the label and settles it again),
 or swap the label for `agent/blocked` by hand.
 
 ## Trust model
@@ -215,10 +216,56 @@ parent process:
   `ask_question`, `split_into_subtasks` and `report_failure` push nothing.
 
 The push itself uses the same `GIT_ASKPASS`-scoped credential as the clone (`src/clone.ts`).
-This is a separate step, not a separate process: the parent still holds the forge token
-while the agent runs, as the same user in the same container, so something that can read
-another process's `/proc/<pid>/environ` could still reach it. Running the publisher as its
-own CI job is #22.
+In CI the publisher runs in its own job, with no model credential, after the agent's job has
+ended (see "Credential separation" below). In the combined single-container mode (a local
+`docker run` with no `--stage`) it's a separate step, not a separate process: the parent still
+holds the forge token while the agent runs, as the same user in the same container.
+
+## Credential separation
+
+In CI, one run is three jobs, each its own container, so the forge token and the model
+credential are never in the same execution environment (`src/stages.ts`,
+`entrypoint.sh --stage prepare|agent|publish`):
+
+| Job | Gets | Does |
+|---|---|---|
+| `prepare` | forge token | fetches the issue, sets `agent/working`, clones/checks out `agent/issue-<n>`, writes `prepared.json` |
+| `agent` | model credential | runs the agent on that work dir (behind `src/model-proxy.ts`), writes what it recorded to `outcome.json`; never talks to the forge |
+| `publish` | forge token | re-fetches the issue, reads `outcome.json` and the branch as data, then pushes, opens the PR/MR, comments and labels (`applyOutcome`) |
+
+The work dir travels between the jobs (GitHub: the per-issue `actions/cache`; GitLab:
+artifacts), with the handoff files next to the clone in `<WORK_DIR>/issue-<n>.handoff/`.
+
+- **The handoff is data, not instructions.** `outcome.json` is written from inside the agent's
+  container, so `src/handoff.ts` reads it without following symlinks, caps its size, and parses
+  it against a strict schema with length limits. It only carries the outcome the agent's tool
+  calls recorded. The issue, the branch name and the repo come from the forge in the publish
+  job, and the PR/MR URL comes from `openReview`, never from the file. The publisher treats the
+  branch the same way (see "Publication").
+- **The next run's prepare job doesn't trust the cached `.git`.** The agent could have written
+  hooks, a credential helper, a proxy or a different remote URL into the work dir's git
+  config. Before `prepareRepo` runs any git command there with the token, it replaces
+  `.git/config` with one of its own and deletes the hooks, alternates and similar pointers
+  (`distrustGitDir` in `src/clone.ts`).
+- **Each stage refuses the other side's credential.** `--stage prepare` and `--stage publish`
+  exit 2 if they're given a model credential. `--stage agent` exits 2 if a forge credential is
+  in reach: a forge token env var, `~/.git-credentials`/`.netrc`/`gh`'s hosts file, or a
+  credential helper, auth header or token-bearing URL in any git config scope
+  (`forgeCredentialLeaks`). Both checks run on every CI run, before anything else happens.
+- **The CI files are checked too.** `test/ci-config.test.ts` fails if the agent job's container
+  in `.github/workflows/agent.yml` or `.gitlab/agent-stages.yml` is handed a forge token, or
+  the prepare/publish ones a model credential.
+
+Limits of this:
+- Jobs pass each container only the `-e VAR`s they list. The job itself still has the platform's
+  usual env: on GitHub the runner's own `GITHUB_TOKEN` (the agent job's has only
+  `packages: read`, for pulling the image), and on GitLab every project CI/CD variable, both
+  secrets included, which is why GitLab runs the image with `docker run` on dind rather than as
+  the job's `image:`. None of it goes into the agent's container.
+- The agent job's container can write anything in the work dir, including what the next run's
+  prepare job and this run's publish job read. That's what the checks above are for.
+- A local `docker run` without `--stage` still runs all three stages in one container, holding
+  both credentials (the model one behind the proxy, the forge one out of the agent's env).
 
 ## Threat model
 
@@ -251,78 +298,38 @@ opened against.
 
 ### Where this stands today
 
-#12 lays out a target design that separates preparation, agent execution, and
-publication into different processes, so no single one of them holds all three domains
-at once. As of this writing none of that split has landed (see sibling issues #21, #22,
-#23, #24, #26) — this repo still runs the pre-split architecture #12 describes as the
-problem, not the separated one:
+#12's target design separates preparation, agent execution and publication so that no single
+execution environment holds all three domains at once. In CI, that's how a run works now:
 
 ```text
-Target (from #12; not yet built):
-
-  trusted dispatcher
-      |  no credentials
-      v
-  prepare -------------------- forge token: clone + checkout, then stripped
-      |                        before the agent starts
-      v
-  unprivileged agent sandbox -- model credential only, no forge token
+  trusted dispatcher (CI `if`/concurrency on GitHub, bin/dispatch-gitlab.ts on GitLab)
       |
       v
-  patch + structured outcome
+  prepare job ---------------- forge token only: allowlist check, clone + checkout with a
+      |                        GIT_ASKPASS-scoped token, never a git config entry
+      v
+  agent job ------------------ model credential only (behind the loopback proxy), no forge
+      |                        token in env, files or git config; the agent only commits
+      v
+  work dir: branch + outcome.json (validated as hostile data)
       |
       v
-  privileged publisher -------- forge token; never runs code from the checkout
+  publish job ---------------- forge token only; never runs code from the checkout
       |
       v
   push branch / open PR·MR / comment + relabel the issue
-
-
-Current (this repo, today):
-
-  CI job (dispatcher)
-      |
-      v
-  one container/process -- entrypoint.sh writes the forge token into GLOBAL git
-      |                     config, then execs run-ticket.ts -> worker.ts in the
-      |                     same process, which also holds the model credential
-      |                     (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)
-      v
-  the agent (bypassPermissions, full shell) edits, tests and commits, with
-  no forge token in its env (sandboxEnv); then, after query() returns, the
-  publisher step in that same parent process validates the branch, pushes
-  it, opens the PR/MR and comments/relabels the issue (src/publish.ts)
 ```
 
-Concretely, none of #12's acceptance criteria are met yet:
+See "Credential separation" above for the details and its limits. What's still shared:
 
-- `entrypoint.sh` writes the forge token into **global** git config
-  (`url."https://x-access-token:$GH_TOKEN@...".insteadOf`) before the agent starts, so
-  it's readable by any command the agent's shell tool runs (`cat ~/.gitconfig`, `env`,
-  a subprocess that inherited it) — all in-bounds for a `bypassPermissions` agent.
-- The same container also holds `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`: model and
-  forge credentials are in the same execution environment, not just the same run. (The
-  agent subprocess itself now only sees a placeholder key behind `src/model-proxy.ts` —
-  see "Model credential exposure" above — but the real one is still in this container.)
-- The publisher (see "Publication" above) is a separate *step*, not a separate process:
-  the agent no longer gets the forge token in its env or pushes itself, but the parent
-  process that runs it still holds that token in the same container.
-- There is no repository allowlist. The prompt built by `buildPrompt` (`src/worker.ts`)
-  tells the agent "Work here unless the issue names another repo" with no enforcement
-  behind it — a trusted directive (or a compromised trusted account) can currently point
-  the agent at any repository the same broad token reaches.
-- The agent's outcome isn't structured and validated separately from the side effect:
-  the `ask_question`/`finish`/`split_into_subtasks` tools (`src/worker.ts`) post the
-  comment and flip the issue's status label directly, in the same call that reports what
-  happened — there's no intermediate `{ status, summary }` a separate component checks
-  before acting on it.
+- Inside the agent job, repository code (domain 1) and the model credential (domain 2) share
+  one container: the real credential sits behind `src/model-proxy.ts` (see "Model credential
+  exposure"), not in a separate one.
+- A local `docker run` without `--stage` runs the three stages in one container.
 
-The one piece already in place is the *input*-trust boundary described in Trust model
-above (`src/trust.ts`): untrusted issue text never reaches the model as instructions.
-That narrows how an attacker gets the agent to act, but it doesn't close the credential
-exposure described here — a task from a genuinely trusted maintainer can still point the
-agent at a repository whose build/test tooling turns out to be malicious or compromised,
-and today that code runs in the same process that holds both credentials.
+The *input*-trust boundary in Trust model above (`src/trust.ts`) still decides whose words
+the agent treats as instructions; the job split limits what a compromised agent, or the
+repository code it runs, can reach.
 
 ## Image versions and rollback
 
@@ -372,6 +379,10 @@ Optional settings:
   change `.github/workflows/`, and PRs it opens don't start CI. Merging still builds the image,
   because the merge is yours.
 
+`.github/workflows/agent.yml` scopes the secrets per job (see "Credential separation"): the
+forge token only to `prepare`, `publish` and `unstick`, the model secret only to `agent`. Keep it
+that way if you edit the workflow; `test/ci-config.test.ts` checks it.
+
 ## Set up on GitLab
 
 1. Push this repo. The push pipeline builds the image. It moves `:latest` only once the model secret from step 3 is set and the smoke test passes, so re-run the pipeline after step 3.
@@ -389,13 +400,25 @@ Optional settings:
    that `AGENT_GITLAB_TOKEN` is set. Then open an issue and apply the label.
 
 Every issue event starts a small dispatch pipeline. `bin/dispatch-gitlab.ts` drops the events
-that don't need a run. To run one issue by hand, use *Run pipeline* with `ISSUE=<iid>`.
+that don't need a run. For one that does, it triggers `.gitlab/agent-stages.yml`: the prepare,
+agent and publish jobs (see "Credential separation"), on dind, each handing its container only
+the variables its stage needs, so `AGENT_GITLAB_TOKEN` never reaches the agent's container and
+the model secret never reaches the other two. GitLab can't scope a CI/CD variable to one job,
+so both stay plain masked project variables. To run one issue by hand, use *Run pipeline* with
+`ISSUE=<iid>`.
 
 ## Run locally
 
     docker build -t agent-flywheel .
     cp .env.example .env   # fill in
     docker run --rm --env-file .env agent-flywheel
+
+That runs all three stages in one container, with both credentials in it. To keep them apart
+the way CI does, run each stage with only its own env, sharing a work dir:
+
+    docker run --rm --env-file forge.env -v "$PWD/work:/work" agent-flywheel --stage prepare
+    docker run --rm --env-file model.env -e ISSUE -v "$PWD/work:/work" agent-flywheel --stage agent
+    docker run --rm --env-file forge.env -v "$PWD/work:/work" agent-flywheel --stage publish
 
 Need Docker inside issues? Hand the container the host socket. Only do this for trusted
 issues, because it is root-equivalent on the host.

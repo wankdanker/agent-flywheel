@@ -14,4 +14,6 @@ git config --global --add safe.directory "*"
 
 # `--smoke`: one real model turn through the same proxy path, no issue (see src/smoke.ts).
 if [ "${1:-}" = "--smoke" ]; then shift; exec node /opt/agent/bin/smoke.ts "$@"; fi
+# `--stage prepare|agent|publish`: one CI job's third of a run, with only that stage's
+# credential (see src/stages.ts); no args runs all three in this one container.
 exec node /opt/agent/bin/run-ticket.ts "$@"
