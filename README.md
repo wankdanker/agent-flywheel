@@ -273,12 +273,30 @@ and today that code runs in the same process that holds both credentials.
 
 | Push to | Tags |
 |---|---|
-| Default branch | `:latest`, `:sha-<short>` |
+| Default branch | `:sha-<short>`; then `:latest`, once that image passes the smoke test |
 | Git tag | `:<tag>` |
 | Other branch | `:<branch>` |
 
 Issues run on `AGENT_IMAGE` if you set it, otherwise on `:latest`. If a merged change breaks
 the agent, it can't fix itself. Pin `AGENT_IMAGE` to the last good `:sha-…` until it's fixed.
+
+To catch most such breaks before they reach `:latest`, a default-branch build pushes only
+`:sha-<short>` at first. It then runs that image with `--smoke` (`entrypoint.sh --smoke`, i.e.
+`bin/smoke.ts`), and moves `:latest` only if that passes. If the smoke test fails, `:latest` stays on
+the last good image. The smoke test makes one real model request through the exact path an issue run takes:
+the same env handling (unset vars as `""`), the same model proxy and `sandboxEnv`, the SDK's native
+`claude` binary, and the real API. It uses a one-turn "reply with OK" prompt and no tools, and passes
+only on a `success` result that went through the proxy. It gets the model secret (and
+`CLAUDE_MODEL`/`MODEL_PROXY_*`) the same way the agent job does, but no forge token, and it
+clones nothing and touches no issue. The unit suite mocks the SDK and the upstream, so only this
+catches a break like #28's proxy crash, or a missing OAuth beta header.
+- **Cost:** one tiny request per merge. Set the `SMOKE_MODEL` variable (e.g. a Haiku model) to
+  run it on a cheaper model than `CLAUDE_MODEL`.
+- **Time limit:** `SMOKE_TIMEOUT_MS` (default 180000). The CLI keeps retrying failed requests,
+  so a broken auth path would otherwise hang until the CI job timed out.
+- **Where it runs:** the `smoke` → `latest` jobs in `.github/workflows/build.yml`, and `smoke-image` in
+  `.gitlab/ci/build.yml`. Branch and tag builds aren't smoke-tested; they never move `:latest`.
+- **By hand:** `docker run --rm -e ANTHROPIC_API_KEY agent-flywheel --smoke`.
 
 To try an image change before merging, run a single issue on the branch's image:
 - **GitHub:** the `image` input of the *agent* workflow.
@@ -293,7 +311,7 @@ To try an image change before merging, run a single issue on the branch's image:
 4. Open an issue and apply the `agent` label.
 
 Optional settings:
-- **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
+- **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
   `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
 - **`AGENT_GH_TOKEN` secret:** a PAT or GitHub App token. The built-in `GITHUB_TOKEN` can't
   change `.github/workflows/`, and PRs it opens don't start CI. Merging still builds the image,
@@ -301,12 +319,12 @@ Optional settings:
 
 ## Set up on GitLab
 
-1. Push this repo. The push pipeline builds `:latest`.
+1. Push this repo. The push pipeline builds the image. It moves `:latest` only once the model secret from step 3 is set and the smoke test passes, so re-run the pipeline after step 3.
 2. Create a project access token with `api` + `write_repository` and the Developer role.
 3. Add CI/CD variables, masked:
    - `AGENT_GITLAB_TOKEN`: the token from step 2.
    - `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`.
-   - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
+   - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
      `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
 4. *Settings → CI/CD → Pipeline trigger tokens*: create a token.
 5. *Settings → Webhooks*: add

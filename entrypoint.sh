@@ -12,4 +12,6 @@ git config --global user.email "${GIT_AUTHOR_EMAIL:-agent-flywheel@users.noreply
 # (e.g. the GitHub Actions runner user); git refuses to touch those by default.
 git config --global --add safe.directory "*"
 
+# `--smoke`: one real model turn through the same proxy path, no issue (see src/smoke.ts).
+if [ "${1:-}" = "--smoke" ]; then shift; exec node /opt/agent/bin/smoke.ts "$@"; fi
 exec node /opt/agent/bin/run-ticket.ts "$@"
