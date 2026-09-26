@@ -58,6 +58,9 @@ function fakeTracker(fail: Fail = {}, comments: Comment[] = []) {
     async openReview() {
       return { url: "https://x/pull/1", created: true };
     },
+    async dispatchRelay() {
+      throw new Error("main() never relays");
+    },
   };
   return t satisfies Tracker;
 }

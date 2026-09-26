@@ -5,7 +5,7 @@
 // labels, so a queued run whose reason has since gone away (e.g. a second reply on a blocked
 // issue that the first reply's run already settled) never starts the agent.
 // No npm deps here, same as tracker.ts: bin/dispatch-gitlab.ts imports this on stock node.
-import { BOT_MARKER, OPT_IN_LABEL, STATE_LABELS } from "./tracker.ts";
+import { BOT_MARKER, OPT_IN_LABEL, STATE_LABELS, type Comment } from "./tracker.ts";
 
 export const CONTINUE_COMMAND = "/agent continue";
 
@@ -23,8 +23,10 @@ export function isContinueCommand(body: string): boolean {
 //   command  a trusted `/agent continue` comment: runs from any state.
 //   comment  any other trusted comment: resumes only an `agent/blocked` issue.
 //   manual   workflow_dispatch / a manual pipeline / a local run: always runs.
-export type Trigger = "label" | "command" | "comment" | "manual";
-export const TRIGGERS: readonly Trigger[] = ["label", "command", "comment", "manual"];
+//   relay    our own publish stage re-dispatching a checkpointed issue (see "Chained runs"
+//            below): runs only while that relay is still the latest word on a blocked issue.
+export type Trigger = "label" | "command" | "comment" | "manual" | "relay";
+export const TRIGGERS: readonly Trigger[] = ["label", "command", "comment", "manual", "relay"];
 export type Decision = { run: boolean; reason: string };
 
 export type CommentEvent = {
@@ -52,15 +54,57 @@ export function decideComment(e: CommentEvent): Decision & { trigger?: Trigger }
   return skip(`ordinary comment on ${state ? `a \`${state}\`` : "an unstarted"} issue; only \`${STATE_LABELS.blocked}\` resumes on a reply (use \`${CONTINUE_COMMAND}\` to force a run)`);
 }
 
+// ---- Chained runs ----
+//
+// A run nobody asked for in the thread (an auto-relay after a checkpoint) is "chained". How many
+// have run in a row is derived from the thread, not stored: each relay's announcement (our own
+// marker-tagged comment) carries a hidden CHAIN_MARKER with its position, and a trusted human
+// comment resets the count. MAX_CHAINED_RUNS caps it; past that, the issue waits on a human.
+export const DEFAULT_MAX_CHAINED_RUNS = 3;
+export const chainMarker = (n: number) => `<!-- agent-flywheel:chain=${n} -->`;
+const CHAIN_MARKER = /<!-- agent-flywheel:chain=(\d+) -->/;
+
+// Only our own comments count (`fromBot`, which toComment only grants to a trusted poster), so
+// pasting the marker into a comment does nothing.
+const chainPosition = (c: Comment) => (c.fromBot ? Number(CHAIN_MARKER.exec(c.text)?.[1] ?? NaN) : NaN);
+const isHuman = (c: Comment) => c.trust === "trusted" && !c.fromBot;
+
+// Consecutive chained runs so far: the latest relay's position, or 0 once a trusted human has
+// commented since (or there's never been one).
+export function chainedRuns(comments: Comment[]): number {
+  for (const c of [...comments].reverse()) {
+    if (isHuman(c)) return 0;
+    const n = chainPosition(c);
+    if (Number.isInteger(n)) return n;
+  }
+  return 0;
+}
+
+// The relay a `relay` run was started for, if it's still the latest trusted word on the thread:
+// the newest trusted comment is our relay announcement. Anything a human said since means that
+// comment's own run (or nobody) picks the issue up, not the relay.
+export function pendingRelay(comments: Comment[]): number | undefined {
+  const last = [...comments].reverse().find((c) => c.trust === "trusted");
+  const n = last ? chainPosition(last) : NaN;
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
 // The prepare stage's re-check of a trigger against the issue as it is now. `trigger` comes
 // from AGENT_TRIGGER, set by the CI gate that already checked trust and the bot marker; unset
-// means a manual or local run.
-export function recheckTrigger(trigger: Trigger | undefined, labels: string[]): Decision {
+// means a manual or local run. `comments` and `maxChained` only matter to a relay.
+export function recheckTrigger(trigger: Trigger | undefined, labels: string[], comments: Comment[] = [], maxChained = DEFAULT_MAX_CHAINED_RUNS): Decision {
   if (!trigger || trigger === "manual") return run("manual run");
   if (!labels.includes(OPT_IN_LABEL)) return skip(`\`${OPT_IN_LABEL}\` label is gone`);
   if (trigger === "label") return run(`\`${OPT_IN_LABEL}\` label added`);
   if (trigger === "command") return run(`explicit \`${CONTINUE_COMMAND}\``);
   const state = stateOf(labels);
+  if (trigger === "relay") {
+    if (state !== STATE_LABELS.blocked) return skip(`issue is now ${state ? `\`${state}\`` : "unstarted"}, not the \`${STATE_LABELS.blocked}\` a relay continues`);
+    const n = pendingRelay(comments);
+    if (n === undefined) return skip("the latest trusted comment isn't a relay announcement; someone has weighed in since");
+    if (n > maxChained) return skip(`relay ${n} is over MAX_CHAINED_RUNS (${maxChained})`);
+    return run(`chained run ${n} of at most ${maxChained}`);
+  }
   return state === STATE_LABELS.blocked
     ? run(`reply on a \`${state}\` issue`)
     : skip(`issue is now ${state ? `\`${state}\`` : "unstarted"}, not \`${STATE_LABELS.blocked}\`, so a reply no longer resumes it`);

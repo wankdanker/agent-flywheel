@@ -54,6 +54,10 @@ export interface Tracker {
   // (`created: false`), so a retried or resumed publication never opens a duplicate. Only
   // the trusted publisher calls this (see worker.ts's applyOutcome), after pushing the branch.
   openReview(input: ReviewRequest): Promise<{ url: string; created: boolean }>;
+  // Starts a fresh run on this issue with AGENT_TRIGGER=relay: the publish stage's auto-relay
+  // after a checkpoint (src/stages.ts), capped by MAX_CHAINED_RUNS (src/dispatch.ts). GitHub
+  // dispatches agent.yml; GitLab creates a pipeline that bin/dispatch-gitlab.ts picks up.
+  dispatchRelay(): Promise<void>;
 }
 
 // An open issue carrying `agent/queued`, as advanceChain needs it.

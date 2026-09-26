@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { isAllowedRepo, parseAllowlist } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
-import { recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
+import { DEFAULT_MAX_CHAINED_RUNS, recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
 import { githubTracker } from "./github.ts";
 import { gitlabTracker } from "./gitlab.ts";
 import { resetHandoff } from "./handoff.ts";
@@ -69,6 +69,28 @@ export function parseMaxTurns(raw: string | undefined): number {
   return n;
 }
 
+// How many chained (auto-relayed) runs in a row before a human has to weigh in; 0 turns relays off.
+export const MAX_CHAINED_RUNS_LIMIT = 20;
+
+export function parseMaxChainedRuns(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_MAX_CHAINED_RUNS;
+  const n = Number(raw);
+  if (!/^\d+$/.test(raw.trim()) || !Number.isInteger(n) || n > MAX_CHAINED_RUNS_LIMIT) {
+    throw new ConfigError(`MAX_CHAINED_RUNS must be an integer from 0 to ${MAX_CHAINED_RUNS_LIMIT}, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
+// The SDK's per-run spend cap (maxBudgetUsd), in US dollars. Unset means no cap beyond MAX_TURNS.
+export function parseMaxBudgetUsd(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  if (!/^\d+(\.\d+)?$/.test(raw.trim()) || !Number.isFinite(n) || n <= 0) {
+    throw new ConfigError(`MAX_BUDGET_USD must be a positive number of dollars, like 5 or 2.50, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
 // AGENT_TRIGGER (how CI says this run was started; see src/dispatch.ts), checked with the config.
 export function parseTrigger(env: NodeJS.ProcessEnv): Trigger | undefined {
   try {
@@ -81,8 +103,8 @@ export function parseTrigger(env: NodeJS.ProcessEnv): Trigger | undefined {
 // The run's reason re-checked against the issue as it is now (a queued run can outlive it). On
 // a skip nothing is touched but the handoff dir, cleared so no stale prepared.json from a
 // cached work dir can start the agent stage.
-export function triggerStillApplies(ticket: Ticket, trigger: Trigger | undefined, env: NodeJS.ProcessEnv): boolean {
-  const d = recheckTrigger(trigger, ticket.labels);
+export function triggerStillApplies(ticket: Ticket, trigger: Trigger | undefined, env: NodeJS.ProcessEnv, maxChained = DEFAULT_MAX_CHAINED_RUNS): boolean {
+  const d = recheckTrigger(trigger, ticket.labels, ticket.comments, maxChained);
   console.log(`[trigger] #${ticket.number} ${trigger ?? "manual"}: ${d.run ? "running" : "skipping"}, ${d.reason}`);
   if (!d.run) resetHandoff(workDirFor(env, ticket.number));
   return d.run;
@@ -182,6 +204,7 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
     createSubIssue: (input) => tracker.createSubIssue(input),
     ensureBranch: (branch, from) => tracker.ensureBranch(branch, from),
     openReview: (input) => tracker.openReview(input),
+    dispatchRelay: () => tracker.dispatchRelay(),
     async comment(text) {
       const key = text.trim();
       if (posted.has(key)) {
@@ -298,10 +321,12 @@ export async function main(deps: RunDeps = {}): Promise<number> {
   const createPublisher = deps.publisher ?? gitPublisher;
 
   // Everything that can be wrong with our config is checked before we touch the issue.
-  let tracker: Tracker, maxTurns: number, trigger: Trigger | undefined;
+  let tracker: Tracker, maxTurns: number, maxBudgetUsd: number | undefined, maxChained: number, trigger: Trigger | undefined;
   try {
     requireModelCredential(env);
     maxTurns = parseMaxTurns(env.MAX_TURNS);
+    maxBudgetUsd = parseMaxBudgetUsd(env.MAX_BUDGET_USD);
+    maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
     trigger = parseTrigger(env);
     tracker = deps.tracker ?? detectTracker(env);
   } catch (err) {
@@ -311,7 +336,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
   const allowed = await fetchAllowedTicket(tracker, env);
   if (!allowed) return 2;
   const { ticket, repo, allowlist } = allowed;
-  if (!triggerStillApplies(ticket, trigger, env)) return EXIT_SKIPPED;
+  if (!triggerStillApplies(ticket, trigger, env, maxChained)) return EXIT_SKIPPED;
   const guard = guardTracker(tracker, ticket);
 
   // From here on, whatever happens, we owe the issue a terminal label.
@@ -346,6 +371,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
       pluginDir: env.PLUGIN_DIR ?? DEFAULT_PLUGIN_DIR,
       model: env.CLAUDE_MODEL,
       maxTurns,
+      maxBudgetUsd,
       env: sandboxEnv(env, proxy.url),
       // Pushing is the publisher's, after the session: the agent's env has no forge token.
       publisher: createPublisher({ ...target, credential }),
