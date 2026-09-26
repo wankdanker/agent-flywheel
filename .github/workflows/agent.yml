@@ -49,6 +49,11 @@ jobs:
     concurrency:
       group: agent-issue-${{ github.event.issue.number || inputs.issue }}
       cancel-in-progress: false
+    # GitHub gives issue/issue_comment-triggered runs a read-only cache by default (untrusted
+    # triggers), which silently dropped every work-dir save. This job only runs for trusted
+    # people (the `if` above), the agent container never sees the cache token, and the only
+    # thing saved is this issue's own work dir, restored only by later runs on this issue.
+    cache-mode: write
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
