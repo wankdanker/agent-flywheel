@@ -266,6 +266,10 @@ Limits of this:
   prepare job and this run's publish job read. That's what the checks above are for.
 - A local `docker run` without `--stage` still runs all three stages in one container, holding
   both credentials (the model one behind the proxy, the forge one out of the agent's env).
+- On GitLab the work dir goes from job to job as an artifact, so it counts against the
+  instance's maximum artifact size (100 MB by default on self-managed GitLab). A clone that
+  grows past it (e.g. with installed dependencies) fails the artifact upload; raise the limit
+  under *Settings → CI/CD → General pipelines*.
 
 ## Threat model
 
