@@ -1,4 +1,4 @@
-import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { query, tool, createSdkMcpServer, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Comment, NewSubIssue, Repo, Ticket, Tracker } from "./tracker.ts";
 
@@ -82,6 +82,35 @@ issue asks about another repo.
 Open the ${cfg.tracker.platform === "github" ? "PR" : "MR"} with the \`${skill}\` skill.`;
 }
 
+// Thrown by applyOutcome when some of its forge writes failed. Carries the outcome the
+// agent actually reached, so a tracker failure never hides the worker's result: the caller
+// (src/run.ts) logs it and falls back to `blocked` if no terminal label got applied.
+export class SettlementError extends Error {
+  readonly outcome: Outcome;
+  readonly causes: unknown[];
+  constructor(outcome: Outcome, causes: unknown[]) {
+    super(`couldn't record the ${outcome.kind} outcome on the issue: ${causes.map((c) => (c instanceof Error ? c.message : String(c))).join("; ")}`);
+    this.name = "SettlementError";
+    this.outcome = outcome;
+    this.causes = causes;
+  }
+}
+
+// Runs every write even if an earlier one fails, e.g. still applies the label when the
+// comment didn't post, so a flaky comment endpoint doesn't also strand `agent/working`.
+export async function settle(outcome: Outcome, writes: (() => Promise<unknown>)[]): Promise<Outcome> {
+  const causes: unknown[] = [];
+  for (const w of writes) {
+    try {
+      await w();
+    } catch (err) {
+      causes.push(err);
+    }
+  }
+  if (causes.length) throw new SettlementError(outcome, causes);
+  return outcome;
+}
+
 // The single trusted post-agent step: turns whatever the agent's tool calls recorded in
 // memory into the actual forge writes. Runs once, after the agent's turn is fully over —
 // never from inside a tool handler the model can invoke mid-session.
@@ -89,28 +118,40 @@ export async function applyOutcome(t: Ticket, cfg: WorkerConfig, recorded: Agent
   if (!recorded) {
     return { kind: "incomplete", detail: "Agent stopped without asking, splitting, or finishing." };
   }
+  const { tracker } = cfg;
   switch (recorded.status) {
     case "blocked":
-      await cfg.tracker.comment(recorded.question);
-      await cfg.tracker.setState("blocked");
-      return { kind: "blocked", detail: recorded.question };
+      return settle({ kind: "blocked", detail: recorded.question }, [
+        () => tracker.comment(recorded.question),
+        () => tracker.setState("blocked"),
+      ]);
     case "ready_for_review":
-      await cfg.tracker.comment(`${recorded.summary}\n\nReview: ${recorded.mrUrl}`);
-      await cfg.tracker.setState("review");
-      return { kind: "ready_for_review", detail: recorded.mrUrl };
+      return settle({ kind: "ready_for_review", detail: recorded.mrUrl }, [
+        () => tracker.comment(`${recorded.summary}\n\nReview: ${recorded.mrUrl}`),
+        () => tracker.setState("review"),
+      ]);
     case "split": {
-      const created = await Promise.all(
-        recorded.subtasks.map((s) => cfg.tracker.createSubIssue({ title: s.title, body: `${s.body}\n\nSplit from #${t.number} (${t.url}).` })),
-      );
+      let created;
+      try {
+        created = await Promise.all(
+          recorded.subtasks.map((s) => tracker.createSubIssue({ title: s.title, body: `${s.body}\n\nSplit from #${t.number} (${t.url}).` })),
+        );
+      } catch (err) {
+        // Without the sub-issues there's nothing sensible to comment; leave the fallback
+        // (blocked + error comment) to the caller.
+        throw new SettlementError({ kind: "split", detail: recorded.summary }, [err]);
+      }
       const list = created.map((c, i) => `- ${c.url} — ${recorded.subtasks[i]!.title}`).join("\n");
-      await cfg.tracker.comment(`${recorded.summary}\n\nSplit into ${created.length} sub-issues, each will run on its own:\n${list}`);
-      await cfg.tracker.setState("blocked");
-      return { kind: "split", detail: list };
+      return settle({ kind: "split", detail: list }, [
+        () => tracker.comment(`${recorded.summary}\n\nSplit into ${created.length} sub-issues, each will run on its own:\n${list}`),
+        () => tracker.setState("blocked"),
+      ]);
     }
     case "failed":
-      await cfg.tracker.comment(recorded.summary);
-      await cfg.tracker.setState("blocked");
-      return { kind: "failed", detail: recorded.summary };
+      return settle({ kind: "failed", detail: recorded.summary }, [
+        () => tracker.comment(recorded.summary),
+        () => tracker.setState("blocked"),
+      ]);
   }
 }
 
@@ -180,22 +221,34 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
     yield { type: "user" as const, message: { role: "user" as const, content: buildPrompt(t, cfg) }, parent_tool_use_id: null };
   }
 
-  for await (const msg of query({
-    prompt: prompt(),
-    options: {
-      cwd: cfg.workDir,
-      model: cfg.model,
-      maxTurns: cfg.maxTurns,
-      env: cfg.env ?? process.env,
-      mcpServers: { ticket: ticketTools },
-      // Our house rules come from ~/.claude/CLAUDE.md; skills/agents/hooks from our plugin.
-      plugins: [{ type: "local", path: cfg.pluginDir }],
-      // The container is our sandbox; nobody is around to approve prompts.
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      systemPrompt: { type: "preset", preset: "claude_code" },
-    },
-  })) {
+  try {
+    await drain(query({
+      prompt: prompt(),
+      options: {
+        cwd: cfg.workDir,
+        model: cfg.model,
+        maxTurns: cfg.maxTurns,
+        env: cfg.env ?? process.env,
+        mcpServers: { ticket: ticketTools },
+        // Our house rules come from ~/.claude/CLAUDE.md; skills/agents/hooks from our plugin.
+        plugins: [{ type: "local", path: cfg.pluginDir }],
+        // The container is our sandbox; nobody is around to approve prompts.
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+        systemPrompt: { type: "preset", preset: "claude_code" },
+      },
+    }));
+  } catch (err) {
+    // The agent already decided (and e.g. already pushed a PR) before the SDK or model API
+    // blew up on the way out: honor that decision rather than discard it.
+    if (!recorded) throw err;
+    console.error(`[error] agent session failed after recording ${recorded.status}; applying it anyway:`, err);
+  }
+  return applyOutcome(t, cfg, recorded);
+}
+
+async function drain(messages: AsyncIterable<SDKMessage>) {
+  for await (const msg of messages) {
     if (msg.type === "assistant") {
       for (const b of msg.message.content) {
         if (b.type === "text") console.log(`[claude] ${b.text}`);
@@ -204,5 +257,4 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
     }
     if (msg.type === "result") console.log(`[result] ${msg.subtype} turns=${msg.num_turns} cost=$${msg.total_cost_usd.toFixed(2)}`);
   }
-  return applyOutcome(t, cfg, recorded);
 }

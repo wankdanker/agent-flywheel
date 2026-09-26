@@ -26,7 +26,7 @@ type ToolCall = { name: string; input: Record<string, unknown> };
 // real MCP tool handlers, then ends the turn. Caller must call `.restore()` (a fresh
 // mock.module() call fails if the previous one is still installed) and re-import
 // worker.ts through a cache-busted specifier so it picks up this mock.
-function mockAgentTurn(calls: ToolCall[]) {
+function mockAgentTurn(calls: ToolCall[], throwAtEnd?: Error) {
   let tools: any[] = [];
   const mocked = mock.module("@anthropic-ai/claude-agent-sdk", {
     cache: false,
@@ -44,6 +44,8 @@ function mockAgentTurn(calls: ToolCall[]) {
             if (!t) throw new Error(`no such tool: ${call.name}`);
             await t.handler(call.input, {});
           }
+          // e.g. the model API or the CLI subprocess failing mid-session (spend limit, crash).
+          if (throwAtEnd) throw throwAtEnd;
           yield { type: "result", subtype: "success", num_turns: calls.length, total_cost_usd: 0 };
         }
         return run();
@@ -124,6 +126,42 @@ test("blocked work: agent asks a question -> comment posted, label set to blocke
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /cursor- or offset-based/);
   mocked.restore();
+});
+
+test("SDK throws after the agent already called finish: the recorded outcome is still applied", async () => {
+  const mocked = mockAgentTurn(
+    [{ name: "finish", input: { summary: "Done.", mr_url: "https://example.test/repo/pull/2" } }],
+    new Error("Claude Code process exited with code 1"),
+  );
+  const { runTicket } = await importWorker();
+  const tracker = fakeTracker();
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    const outcome = await runTicket(ticket(), {
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+    });
+    assert.equal(outcome.kind, "ready_for_review");
+    assert.deepEqual(tracker.states, ["review"]);
+  } finally {
+    console.error = origError;
+    mocked.restore();
+  }
+});
+
+test("SDK throws before any outcome is recorded: runTicket rethrows for main() to handle, tracker untouched", async () => {
+  const mocked = mockAgentTurn([], new Error("400 credit balance is too low"));
+  const { runTicket } = await importWorker();
+  const tracker = fakeTracker();
+  try {
+    await assert.rejects(
+      runTicket(ticket(), { tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10 }),
+      /credit balance/,
+    );
+    assert.deepEqual(tracker.states, []);
+  } finally {
+    mocked.restore();
+  }
 });
 
 test("blocked work: an untrusted-authored issue with no trusted directive short-circuits before the agent runs, without touching the SDK", async () => {

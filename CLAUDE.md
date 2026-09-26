@@ -27,12 +27,21 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 
 ## Architecture
 
-- `bin/run-ticket.ts` is the container entry, run via `entrypoint.sh` (which only sets git identity and `safe.directory`, no credentials — see below). It:
+- `bin/run-ticket.ts` is the container entry, run via `entrypoint.sh` (which only sets git identity and `safe.directory`, no credentials — see below). It only blanks out empty env vars and exits with `main()`'s code. `src/run.ts`'s `main()` is the run itself, importable so `test/run.test.ts` drives it with a fake tracker and a fake `runTicket` (every dependency is an optional `RunDeps` seam). It:
+  - validates config first (model credential, `MAX_TURNS`, platform env) and returns 2 on a
+    `ConfigError` before touching the issue;
   - detects the platform from `AGENT_PLATFORM`, `GITLAB_CI` or `GITHUB_ACTIONS`;
   - builds a `Tracker`;
   - checks the ticket's repo against the allowlist (`src/allowlist.ts`, `AGENT_REPO_ALLOWLIST`,
     defaulting to just `GITHUB_REPOSITORY`/`CI_PROJECT_PATH`) and refuses (exit 2, no clone) if
     it isn't listed;
+  - sets `agent/working`, and from there on guarantees a terminal label: everything up to the
+    settled outcome runs in a `try/catch`, and if no `review`/`blocked` label landed (tracked by
+    `guardTracker`, which also skips a comment identical to one already posted, so retries don't
+    repeat it) it posts a `sanitizeError`-scrubbed comment and sets `blocked`, logging (never
+    throwing) any failure of those cleanup writes. A `SettlementError` from `applyOutcome` carries
+    the outcome the agent reached so a tracker failure never hides it. See README's "Stuck on
+    `agent/working`";
   - namespaces the work dir as `<WORK_DIR>/issue-<n>`, so a `WORK_DIR` shared across issues
     (e.g. a CI cache mount) can't let two issues' clones collide;
   - clones (or resumes) that one repo itself via `src/clone.ts`'s `prepareRepo`, before the
@@ -67,7 +76,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     (`Tracker#createSubIssue`, one per platform since GitHub and GitLab differ in what makes
     a newly-created issue's label actually fire the trigger); `report_failure` → blocked.
 
-  If the agent calls none of these tools, `applyOutcome` reports `incomplete`.
+  If the agent calls none of these tools, `applyOutcome` reports `incomplete`. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
 - `src/model-proxy.ts` is the loopback-only HTTP proxy `bin/run-ticket.ts` puts in front of
   the real model credential (`startModelProxy`, `credentialFromEnv`, `sandboxEnv`; see
   README's "Model credential exposure"). It enforces `maxRequests`/`maxLifetimeMs` (on top

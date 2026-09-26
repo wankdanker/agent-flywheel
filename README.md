@@ -18,7 +18,8 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
 - **Label `agent`:** a run starts.
 - **Status labels:** the agent sets `agent/working`, then either:
   - `agent/blocked`, when it asked a question, split the work into sub-issues, reported it
-    couldn't complete the task, or ran out of turns, or
+    couldn't complete the task, ran out of turns, or hit an error (see "Stuck on
+    `agent/working`" below), or
   - `agent/review`, when it opened an MR/PR.
 - **Reply on the issue:** a new run reads the whole thread and continues on branch `agent/issue-<n>`.
 - **Large issues:** if the agent judges the task too big to finish in one run, it can open
@@ -38,6 +39,25 @@ This matters because the agent runs with permissions bypassed and holds your sec
 
 Exit codes are 0 ready for review, 10 blocked (asked a question or split into sub-issues),
 1 incomplete or failed, 2 bad config. CI treats 10 as a success.
+
+### Stuck on `agent/working`
+
+A run never leaves `agent/working` behind on any failure it can catch (`src/run.ts`): a model
+API error (e.g. a spend limit), a crashed SDK, a failed clone, or a tracker call that failed
+while recording the outcome all end with `agent/blocked`, a short comment, and exit 1 (2 for
+config). That comment only carries the error's first line, capped and with secret-looking
+values (env secrets, tokens, auth headers, URL credentials) scrubbed; the full error is in the
+CI log. If even the label update fails, the log says so and what to fix by hand.
+
+Bad config (missing credential, invalid `MAX_TURNS`, repo outside the allowlist) is caught
+before the issue is touched at all.
+
+What a process can't do is clean up after being killed. On GitHub, a step in
+`.github/workflows/agent.yml` swaps a leftover `agent/working` for `agent/blocked` when the job
+times out or is cancelled. Nothing runs if the runner itself is lost, and GitLab has no
+equivalent yet, so an issue can still occasionally be stuck on `agent/working` with no job
+running. To recover, reply on the issue (the next run resets the label and settles it again),
+or swap the label for `agent/blocked` by hand.
 
 ## Trust model
 
