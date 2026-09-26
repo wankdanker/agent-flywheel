@@ -70,3 +70,33 @@ test("GitLab agent-stages.yml: the agent job's container gets no forge token; pr
   const shared = jobs.get(".stage")!;
   assert.doesNotMatch(shared, /--env-file|--env /);
 });
+
+test("GitHub chain workflows: the PR-code ones get no secret; the one holding the forge token runs from the default branch", () => {
+  for (const f of ["chain-test", "chain-merged"]) {
+    const text = readFileSync(`./.github/workflows/${f}.yml`, "utf8");
+    assert.doesNotMatch(text.replace(/^\s*#.*$/gm, ""), /secrets\./, `${f}.yml must not reference any secret`);
+    assert.match(text, /^\s+branches: \["agent\/issue-\*"\]/m);
+  }
+  assert.match(readFileSync("./.github/workflows/chain-test.yml", "utf8"), /persist-credentials: false/);
+  const chain = readFileSync("./.github/workflows/chain.yml", "utf8");
+  assert.deepEqual(mentions(chain, MODEL_CREDENTIAL_VARS), []);
+  // Only workflow_run (always the default branch's copy of this file) and manual runs: never a
+  // pull_request/pull_request_target trigger, which would run a PR-controlled workflow file.
+  assert.doesNotMatch(chain, /^\s+pull_request/m);
+  assert.match(chain, /workflows: \[chain-test, chain-merged\]/);
+  assert.match(chain, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+  assert.match(chain, /MERGE_SHA: \$\{\{ github\.event\.workflow_run\.name == 'chain-test'/);
+});
+
+test("GitLab chain-stages.yml: the MR's code runs in a container handed no variables; no job passes a model credential", () => {
+  const text = readFileSync("./.gitlab/chain-stages.yml", "utf8");
+  const jobs = blocks(text, 0);
+  const run = /docker run[^\n]*/.exec(jobs.get("chain-test")!)![0];
+  assert.doesNotMatch(run, /\s-e\s|--env/);
+  for (const name of ["chain-test", "chain-merge", "chain-advance"]) {
+    assert.ok(jobs.has(name), `no ${name} job`);
+    assert.deepEqual(mentions(jobs.get(name)!, MODEL_CREDENTIAL_VARS), [], `${name} mentions a model credential`);
+  }
+  assert.match(jobs.get("chain-merge")!, /MERGE_SHA="\$MR_SHA" node bin\/advance-chain\.ts/);
+  assert.doesNotMatch(jobs.get("chain-advance")!, /MERGE_SHA/);
+});

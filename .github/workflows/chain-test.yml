@@ -1,0 +1,33 @@
+# Tests a split's sub-issue PR into its integration branch (agent/issue-<parent>; see
+# src/chain.ts). No secrets and a read-only token: this runs the sub-issue's own code, and, since
+# it's a `pull_request` workflow, the PR's own copy of this file. Passing is what lets `chain.yml`
+# (which runs from the default branch, with the forge token) merge it and start the next sub-issue.
+# Only runs for PRs opened with AGENT_GH_TOKEN: GitHub starts no workflow for GITHUB_TOKEN's PRs.
+name: chain-test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: ["agent/issue-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'agent/issue-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

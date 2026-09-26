@@ -15,6 +15,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isAllowedRepo } from "./allowlist.ts";
+import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo } from "./clone.ts";
 import { clearOutcome, HandoffError, readOutcome, readPrepared, resetHandoff, writeOutcome, writePrepared } from "./handoff.ts";
 import { FORGE_TOKEN_VARS, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
@@ -100,7 +101,7 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
     // Same check runTicket makes in the combined run, before anything is cloned.
     if (needsDirective(ticket)) return EXIT_CODES[(await blockForDirective(ticket, guard.tracker)).kind];
 
-    const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: repo.defaultBranch };
+    const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: baseBranchFor(ticket, repo.defaultBranch) };
     prepareRepo({ ...target, credential: credentialFor(tracker.platform, env) });
     if (!isAllowedRepo(originUrl(workDir), allowlist)) {
       throw new ConfigError(`refusing to continue: ${workDir} is a clone of a repo outside the allowlist.`);
@@ -190,7 +191,7 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
 
   return guarded(guard, ticket, env, async () => {
     const workDir = workDirFor(env, ticket.number);
-    const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: repo.defaultBranch };
+    const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: baseBranchFor(ticket, repo.defaultBranch) };
     const cfg: WorkerConfig = {
       tracker: guard.tracker,
       repo,

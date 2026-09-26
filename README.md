@@ -21,17 +21,16 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
     couldn't complete the task, paused at a checkpoint before running out of turns, or hit an error (see "Stuck on
     `agent/working`" below), or
   - `agent/review`, when it opened an MR/PR.
+- **`agent/queued`:** a split's sub-issue waiting for the one before it to merge (see "Split issues").
 - **Reply on the issue:** a new run reads the whole thread and continues on branch `agent/issue-<n>`.
   "Whole" is literal: the tracker follows every page of comments (GitHub's `Link: rel="next"`,
   GitLab's `x-next-page`), oldest first, with GitLab system notes left out. There is no
   comment cap and no silent truncation; if any page fails to load, the run errors out (and
   ends `agent/blocked`) rather than acting on a partial thread. Comments from untrusted users
   are still dropped from the prompt, as described under "Trust model".
-- **Large issues:** if the agent judges the task too big to finish in one run, it can open
-  smaller sub-issues instead of attempting the whole thing (each gets the `agent` label, so
-  it starts its own run) and comment back on the parent with links to them. Nothing closes
-  the parent automatically; merge or close each sub-issue's PR/MR, then close the parent
-  once its sub-issues are done, or comment on it to resume broader work.
+- **Large issues:** splitting is a last resort, for work that clearly can't land as one
+  reviewable PR/MR; running low on turns is handled by checkpoints instead. A split makes at
+  most 4 sub-issues, and a sub-issue can't split again. See "Split issues" below.
 - **State:** there is none besides the issue and the git remote. Every run is a fresh container.
   CI does cache the work dir per issue, so a run that dies partway usually resumes from its
   existing clone instead of starting over, but that cache isn't guaranteed to survive. On
@@ -48,6 +47,48 @@ This matters because the agent runs with permissions bypassed and holds your sec
 Exit codes are 0 ready for review, 10 blocked (asked a question or split into sub-issues),
 20 checkpoint (paused at the turn limit with its work published), 1 incomplete or failed, 2 bad
 config. CI treats 10 and 20 as success.
+
+### Split issues
+
+When the agent calls `split_into_subtasks` on issue #P, the publish step (not the model):
+1. creates the integration branch `agent/issue-P` from the default branch, if it doesn't exist;
+2. opens the sub-issues in order. Only the first gets `agent`, so only it runs; the others get
+   `agent/queued`. Each body starts with a chain header, the platform-neutral record of the chain
+   (`src/chain.ts`):
+
+   ```text
+   Parent: #P
+   Base branch: agent/issue-P
+   Sub-issue: 2 of 3
+   Blocked by: #<previous sub-issue>
+   ```
+
+   The same relationships are also recorded natively where possible (GitHub sub-issues and
+   "blocked by" dependencies; GitLab linked issues, `blocks`), best effort. The header is only
+   believed on an issue whose author is trusted, and its base branch is always derived from the
+   parent number;
+3. comments on #P and leaves it `agent/blocked`.
+
+A sub-issue's run branches from `agent/issue-P` (as it is after the earlier sub-issues merged), is
+validated against it by the publisher, and opens its PR/MR into it, never the default branch.
+Once that PR/MR's `npm run typecheck` and `npm test` pass, CI merges exactly the tested commit,
+closes the sub-issue, and swaps the next sub-issue's `agent/queued` for `agent`, which starts its
+run. After the last sub-issue merges, CI opens one PR/MR from `agent/issue-P` into the default
+branch and moves #P to `agent/review`: the human review happens there, on the whole. A sub-issue
+PR/MR merged by hand advances the chain the same way.
+
+- **GitHub:** `chain-test.yml` runs the tests on the PR's head with no secrets; `chain.yml`
+  (`workflow_run`, so always the default branch's copy, with the forge token) runs
+  `bin/advance-chain.ts` to merge and advance. `chain-merged.yml` catches PRs merged some other
+  way. This needs `AGENT_GH_TOKEN`: GitHub starts no workflow for PRs opened, or labels added,
+  with `GITHUB_TOKEN`. Run `chain` by hand (with the PR number) to advance after a manual merge
+  it missed.
+- **GitLab:** the webhook needs **Merge request events** too. `bin/dispatch-gitlab.ts` turns a
+  sub-issue MR's new commits into `.gitlab/chain-stages.yml`'s test-then-merge jobs (the MR's
+  code runs in a container given no variables), and its merge into an advance.
+
+The auto-merge gate is the sub-issue's own tests, which the sub-issue's code (including its copy
+of `chain-test.yml`) could weaken; that's why the final integration PR/MR keeps the human gate.
 
 ### Stateless iteration, durable checkpoints
 
@@ -408,7 +449,8 @@ that way if you edit the workflow; `test/ci-config.test.ts` checks it.
 4. *Settings → CI/CD → Pipeline trigger tokens*: create a token.
 5. *Settings → Webhooks*: add
    `https://<host>/api/v4/projects/<id>/trigger/pipeline?token=<trigger token>&ref=<default branch>`,
-   with **Issues events** and **Comments** enabled.
+   with **Issues events**, **Comments** and **Merge request events** enabled (the last one
+   advances split sub-issues; see "Split issues").
 6. Push again (or *Run pipeline*) to sync labels from `labels.json`, including `agent`, now
    that `AGENT_GITLAB_TOKEN` is set. Then open an issue and apply the label.
 

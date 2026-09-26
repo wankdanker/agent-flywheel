@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handoffDirFor, MAX_TEXT } from "../src/handoff.ts";
+import { chainHeader } from "../src/chain.ts";
 import type { RunDeps } from "../src/run.ts";
 import { agentStage, forgeCredentialLeaks, prepareStage, publishStage } from "../src/stages.ts";
 import { STATE_LABELS, type Comment, type Ticket, type TicketState, type Tracker } from "../src/tracker.ts";
@@ -41,6 +42,9 @@ function fakeTracker(over: Partial<Ticket> = {}) {
     },
     async createSubIssue() {
       return { number: 8, url: "https://github.com/acme/widgets/issues/8" };
+    },
+    async ensureBranch() {
+      return true;
     },
     async openReview() {
       t.reviews++;
@@ -290,4 +294,19 @@ test("forgeCredentialLeaks: finds tokens in env, credential files and git config
   }
   assert.ok(leaks.every((l) => !/ghs_abc|glpat-abc|eDpnaHNfYWJj/.test(l)), "never reports the value");
   assert.ok(existsSync(repo));
+});
+
+test("split run on a sub-issue: prepare starts from, and publish validates against, the integration branch", async () => {
+  const tracker = fakeTracker({ body: `${chainHeader({ parent: 3, index: 1, total: 2 })}\n\nPart one.` });
+  const e = envs();
+  const calls: Calls = { prepared: 0, sessions: 0, pushes: 0 };
+  const d = deps(tracker, calls, { status: "ready_for_review", summary: "Done." });
+  const bases: string[] = [];
+  const codes = await quietly(async () => [
+    await prepareStage({ ...d, env: e.prepare, prepareRepo: (o) => (bases.push(o.defaultBranch), d.prepareRepo!(o)) }),
+    await agentStage({ ...d, env: e.agent }),
+    await publishStage({ ...d, env: e.publish, publisher: (o) => (bases.push(o.defaultBranch), d.publisher!(o)) }),
+  ]);
+  assert.deepEqual(codes.result, [0, 0, 0]);
+  assert.deepEqual(bases, ["agent/issue-3", "agent/issue-3"]);
 });

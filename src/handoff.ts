@@ -10,6 +10,7 @@
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
+import { MAX_SUBTASKS } from "./chain.ts";
 import type { Repo, Ticket, Tracker } from "./tracker.ts";
 import type { AgentOutcome } from "./worker.ts";
 
@@ -35,7 +36,6 @@ export type HandedOutcome = { version: number; issue: number; recorded: AgentOut
 // and our own wording around them.
 export const MAX_TEXT = 30_000;
 export const MAX_TITLE = 255;
-export const MAX_SUBTASKS = 20;
 const MAX_OUTCOME_BYTES = 256 * 1024;
 
 const text = (max: number) => z.string().max(max);

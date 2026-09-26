@@ -95,10 +95,12 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     only record a structured `AgentOutcome` in memory and return a short confirmation to the
     model. `runTicket` calls `applyOutcome` once the `query()` loop is fully over, which is
     the single place that actually calls `tracker.comment`/`setState`/`createSubIssue`:
-    `ask_question` → blocked; `finish` → review; `split_into_subtasks` → blocked, opening
-    sub-issues, each carrying the `agent` label so it starts its own run
-    (`Tracker#createSubIssue`, one per platform since GitHub and GitLab differ in what makes
-    a newly-created issue's label actually fire the trigger); `report_failure` → blocked; `checkpoint` → blocked, with a done/next comment, exit 20.
+    `ask_question` → blocked; `finish` → review; `split_into_subtasks` → blocked, creating the
+    integration branch `agent/issue-<parent>` (`Tracker#ensureBranch`) and a chain of at most
+    `MAX_SUBTASKS` (4) sub-issues, of which only the first carries `agent` (so it starts its own
+    run; `Tracker#createSubIssue` differs per platform in what makes a newly-created issue's
+    label actually fire the trigger) and the rest `agent/queued`; a sub-issue's split is refused
+    (`splitRefusal`, also checked by the tool); `report_failure` → blocked; `checkpoint` → blocked, with a done/next comment, exit 20.
     For `finish` and `checkpoint` (explicit or implicit), `applyOutcome` first calls
     `publisher.pushBranch()`, then for `finish` `Tracker#openReview` (opens the PR/MR, or reuses the
     open one for the branch). A `PublishRejected` turns the outcome into `failed` (blocked, reasons
@@ -109,6 +111,18 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     `CHECKPOINT_AT` (2) or fewer turns remain, telling the agent to commit and call `checkpoint`.
 
   If the agent calls none of these tools, `applyOutcome` reports `incomplete`, unless the session ended with `error_max_turns`, which is an implicit `checkpoint`, or the branch has commits over the base: then it still pushes them (same validation) and settles `failed` (blocked, exit 1) with `crashedComment`. A session that threw, or (split mode) a missing/invalid `outcome.json`, goes through `run.ts`'s `publishAfterCrash`, which does the same with the scrubbed error in the comment, and rethrows for `guarded`'s fallback when nothing was committed. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
+- `src/chain.ts` is a split's sub-issue chain (README's "Split issues"). Each sub-issue body
+  starts with a chain header (`chainHeader`/`parseChain`: parent, `Sub-issue: i of n`,
+  `Blocked by`), believed only from a trusted author (`chainOf`). `baseBranchFor` makes a
+  sub-issue's run start from, be validated against (`prepareRepo`/`gitPublisher`'s
+  `defaultBranch`) and open its PR/MR into `agent/issue-<parent>`. `advanceChain` (via
+  `bin/advance-chain.ts`, forge token only, dependency-free like the dispatcher) merges a tested
+  sub-issue PR/MR by exact sha, closes the sub-issue, releases the next `agent/queued` one, or
+  after the last opens the integration PR/MR into the default branch and sets the parent to
+  review. It uses `ChainForge` (`githubChain`/`gitlabChain`), the repo-level calls beyond one
+  issue's `Tracker`. CI: GitHub `chain-test.yml` (tests, no secrets) → `chain.yml`
+  (`workflow_run`, default-branch copy, forge token), plus `chain-merged.yml` for manual merges;
+  GitLab MR webhook events → `bin/dispatch-gitlab.ts` → `.gitlab/chain-stages.yml`.
 - `src/publish.ts` is the privileged publisher. `gitPublisher().pushBranch()` fetches the agent's
   `agent/issue-<n>` over `file://` into a fresh scratch repo (minimal env, no credential, fsck on,
   hooks off), fetches the base from the forge, runs `validateRange` over every commit in
@@ -128,7 +142,8 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - **Image builds** (`.github/workflows/build.yml`: `test` → `image` → `smoke` → `latest`; `.gitlab/ci/build.yml`: `build-image` → `smoke-image`): a default-branch build pushes `:sha-<short>` only, smoke-tests it with `docker run … --smoke`, and only then tags `:latest`. The smoke container gets the model secret and optional vars as `-e VAR` (so an unset one arrives as `""`, same as in `agent.yml`), and never a forge token. On GitLab that's why it's `docker run` on dind, not `image:`, since a job's env holds every project variable.
   - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline with one trigger job (holding the per-issue `resource_group`, `strategy: depend`) that runs `.gitlab/agent-stages.yml` (outside `.gitlab/ci/`, so not included by `.gitlab-ci.yml`): `agent-prepare` → `agent-agent` → `agent-publish`, each `docker run`ning the image on dind with only its stage's `-e VAR`s, the work dir tarred in on stdin and `docker cp`'d out, carried between jobs as artifacts, and saved to a native GitLab `cache:` (`when: always`) by the agent job.
 
-  Keep `bin/dispatch-gitlab.ts` and `src/tracker.ts` free of npm dependencies.
+  Keep `bin/dispatch-gitlab.ts`, `bin/advance-chain.ts` and what they import (`src/tracker.ts`,
+  `src/trust.ts`, `src/chain.ts`, `src/github.ts`, `src/gitlab.ts`) free of npm dependencies.
 - `.gitlab-ci.yml` only declares stages and includes `.gitlab/ci/*.yml`. Put new GitLab jobs in their own file there.
 - `labels.json` at the repo root is the platform-neutral source of truth for issue labels (name,
   color, description). `bin/sync-labels.ts` applies it via each platform's REST API: the `labels`

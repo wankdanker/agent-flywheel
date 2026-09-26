@@ -50,7 +50,7 @@ export function prepareRepo(o: {
   cloneUrl: string;
   workDir: string;
   branch: string;
-  defaultBranch: string;
+  defaultBranch: string; // where a new branch starts: the default branch, or a sub-issue's integration branch
   credential?: Credential;
 }) {
   const resuming = existsSync(o.workDir) && distrustGitDir(o.workDir, o.cloneUrl);

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gitlabTracker } from "../src/gitlab.ts";
+import { gitlabChain, gitlabTracker } from "../src/gitlab.ts";
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -78,22 +78,30 @@ test("gitlab getTicket: untrusted author (non-member)", async (t) => {
   assert.equal(ticket.author, "outside-reporter");
 });
 
-test("gitlab createSubIssue: creates the issue with the agent label in a single call", async (t) => {
+test("gitlab createSubIssue: one create call carrying the agent label (runnable) or agent/queued, plus issue links", async (t) => {
   const calls: { url: string; method: string; body: string }[] = [];
   t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
     calls.push({ url, method: init.method ?? "GET", body: (init.body as string) ?? "" });
-    if (url.includes("/issues") && init.method === "POST") {
-      return jsonResponse({ iid: 17, web_url: "https://gitlab.example/g/p/-/issues/17" });
+    if (url.endsWith("/issues") && init.method === "POST") {
+      const n = calls.filter((c) => c.url.endsWith("/issues")).length;
+      return jsonResponse({ iid: 16 + n, project_id: 3, web_url: `https://gitlab.example/g/p/-/issues/${16 + n}` });
     }
+    if (url.endsWith("/links") && init.method === "POST") return jsonResponse({});
     throw new Error(`unexpected fetch ${url}`);
   });
 
   const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 9 });
-  const created = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part." });
-
-  assert.deepEqual(created, { number: 17, url: "https://gitlab.example/g/p/-/issues/17" });
-  assert.equal(calls.length, 1, "one call is enough: GitLab actions on a newly-opened issue that already has the label");
+  const first = await tracker.createSubIssue({ title: "Sub-task 1", body: "Do the first part.", runnable: true, parent: 9 });
+  assert.deepEqual(first, { number: 17, url: "https://gitlab.example/g/p/-/issues/17" });
   assert.deepEqual(JSON.parse(calls[0]!.body), { title: "Sub-task 1", description: "Do the first part.", labels: "agent" });
+  assert.match(calls[1]!.url, /\/issues\/9\/links$/);
+  assert.deepEqual(JSON.parse(calls[1]!.body), { target_project_id: 3, target_issue_iid: 17, link_type: "relates_to" });
+
+  calls.length = 0;
+  await tracker.createSubIssue({ title: "Sub-task 2", body: "b", runnable: false, parent: 9, blockedBy: 17 });
+  assert.equal(JSON.parse(calls[0]!.body).labels, "agent/queued");
+  assert.match(calls[2]!.url, /\/issues\/17\/links$/);
+  assert.equal(JSON.parse(calls[2]!.body).link_type, "blocks");
 });
 
 function issueResponse(iid: number) {
@@ -198,4 +206,37 @@ test("gitlab openReview: reuses the MR already open for the branch, otherwise op
   assert.deepEqual(await tracker.openReview(req), { url: "https://gitlab.example/g/p/-/merge_requests/4", created: true });
   assert.deepEqual(await tracker.openReview(req), { url: "https://gitlab.example/g/p/-/merge_requests/4", created: false });
   assert.deepEqual(posts, [{ source_branch: "agent/issue-3", target_branch: "main", title: "Fix it", description: "Done.\n\nCloses #3" }]);
+});
+
+test("gitlab ensureBranch: creates the branch from `from` only when it's missing", async (t) => {
+  const calls: { url: string; method: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    calls.push({ url, method: init.method ?? "GET" });
+    if (url.endsWith("/repository/branches/agent%2Fissue-9")) return new Response("", { status: 404 });
+    if (url.includes("/repository/branches?branch=agent%2Fissue-9&ref=main") && init.method === "POST") return jsonResponse({});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 9 });
+  assert.equal(await tracker.ensureBranch("agent/issue-9", "main"), true);
+  assert.equal(calls.length, 2);
+});
+
+test("gitlab chain: release is one label update, getReview maps the MR, merge pins the sha", async (t) => {
+  const calls: { url: string; method: string; body: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    const method = init.method ?? "GET";
+    calls.push({ url, method, body: (init.body as string) ?? "" });
+    if (url.endsWith("/issues/22") && method === "PUT") return jsonResponse({});
+    if (url.endsWith("/merge_requests/5") && method === "GET") {
+      return jsonResponse({ state: "merged", source_branch: "agent/issue-21", target_branch: "agent/issue-12", sha: "aaa", source_project_id: 3, target_project_id: 3 });
+    }
+    if (url.endsWith("/merge_requests/5/merge") && method === "PUT") return jsonResponse({});
+    throw new Error(`unexpected fetch ${method} ${url}`);
+  });
+  const chain = gitlabChain({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p" });
+  await chain.release(22);
+  assert.deepEqual(JSON.parse(calls[0]!.body), { add_labels: "agent", remove_labels: "agent/queued" });
+  assert.deepEqual(await chain.getReview(5), { number: 5, open: false, merged: true, head: "agent/issue-21", base: "agent/issue-12", sha: "aaa", sameRepo: true });
+  await chain.mergeReview(5, "aaa");
+  assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa" });
 });

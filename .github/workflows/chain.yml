@@ -1,0 +1,63 @@
+# Moves a split's chain of sub-issues along (src/chain.ts, bin/advance-chain.ts):
+#   chain-test passed on a sub-issue PR → merge exactly the tested head into the integration
+#                                         branch, then label the next queued sub-issue `agent`
+#                                         (or, after the last, open the integration PR)
+#   chain-merged (merged some other way) → the same, without merging
+#   workflow_dispatch                    → the same for one PR by hand
+# workflow_run always runs this file from the default branch, never a PR's copy, which is why the
+# forge token lives here and not in chain-test/chain-merged (whose `pull_request` runs use the
+# PR's own workflow files). It only runs our own bin/advance-chain.ts from the default branch,
+# never the PR's code, and never gets the model credential.
+# Merging with GITHUB_TOKEN fires no further workflows, which is why the merge step advances the
+# chain itself; with AGENT_GH_TOKEN, chain-merged fires too, and advancing again is a no-op.
+# Releasing the next sub-issue needs AGENT_GH_TOKEN for agent.yml to start on its `agent` label.
+name: chain
+
+on:
+  workflow_run:
+    workflows: [chain-test, chain-merged]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      review:
+        description: Sub-issue PR number (already merged into its agent/issue-<parent> branch)
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# One advance at a time per sub-issue branch.
+concurrency:
+  group: chain-${{ github.event.workflow_run.head_branch || inputs.review }}
+  cancel-in-progress: false
+
+jobs:
+  advance:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        startsWith(github.event.workflow_run.head_branch, 'agent/issue-'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Stock node, no npm install: bin/advance-chain.ts is dependency-free.
+      - name: Merge (if tested) and advance the chain
+        env:
+          AGENT_PLATFORM: github
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          REVIEW: ${{ inputs.review }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          MERGE_SHA: ${{ github.event.workflow_run.name == 'chain-test' && github.event.workflow_run.head_sha || '' }}
+        run: node bin/advance-chain.ts

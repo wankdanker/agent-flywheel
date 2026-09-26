@@ -116,7 +116,7 @@ export function gitPublisher(o: {
   workDir: string;       // the agent's checkout: read as data only
   cloneUrl: string;      // where to push; the allowlisted origin
   branch: string;        // agent/issue-<n>, in the work dir and on the remote
-  defaultBranch: string; // what the branch is validated against
+  defaultBranch: string; // what the branch is validated against: the default branch, or a sub-issue's integration branch (src/chain.ts)
   credential?: Credential;
 }): Publisher {
   return {

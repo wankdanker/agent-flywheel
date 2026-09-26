@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyOutcome, buildPrompt, runTicket, trustedDirectives, type WorkerConfig } from "../src/worker.ts";
 import { PublishRejected, type Publisher, type PushResult } from "../src/publish.ts";
-import type { Comment, CreatedIssue, ReviewRequest, Ticket, Tracker } from "../src/tracker.ts";
+import type { Comment, CreatedIssue, ReviewRequest, SubIssueRequest, Ticket, Tracker } from "../src/tracker.ts";
+import { chainHeader, parseChain } from "../src/chain.ts";
 
 const comment = (over: Partial<Comment>): Comment => ({
   author: "someone",
@@ -25,7 +26,9 @@ const ticket = (over: Partial<Ticket>): Ticket => ({
   ...over,
 });
 
-type FakeTracker = Tracker & { comments: string[]; states: string[]; subIssues: CreatedIssue[]; reviews: ReviewRequest[]; openPr?: string };
+type FakeTracker = Tracker & {
+  comments: string[]; states: string[]; subIssues: CreatedIssue[]; subRequests: SubIssueRequest[]; branches: string[][]; reviews: ReviewRequest[]; openPr?: string;
+};
 
 function fakeTracker(platform: "github" | "gitlab"): FakeTracker {
   const t: any = {
@@ -33,6 +36,8 @@ function fakeTracker(platform: "github" | "gitlab"): FakeTracker {
     comments: [],
     states: [],
     subIssues: [],
+    subRequests: [],
+    branches: [],
     reviews: [],
     openPr: undefined,
     async repo() {
@@ -47,10 +52,15 @@ function fakeTracker(platform: "github" | "gitlab"): FakeTracker {
     async setState(state: string) {
       t.states.push(state);
     },
-    async createSubIssue() {
+    async createSubIssue(req: SubIssueRequest) {
       const created = { number: 100 + t.subIssues.length, url: `https://example.test/issues/${100 + t.subIssues.length}` };
       t.subIssues.push(created);
+      t.subRequests.push(req);
       return created;
+    },
+    async ensureBranch(branch: string, from: string) {
+      t.branches.push([branch, from]);
+      return true;
     },
     // Like the real adapters: the first call opens one, later calls find it already open.
     async openReview(req: ReviewRequest) {
@@ -305,7 +315,7 @@ test("applyOutcome: blocked (question) comments the question and sets state to b
   assert.deepEqual(tracker.reviews, []);
 });
 
-test("applyOutcome: split creates a sub-issue per subtask and sets state to blocked", async () => {
+test("applyOutcome: split creates the integration branch and a chain of sub-issues, only the first runnable", async () => {
   const t = ticket({ number: 42, url: "https://example.test/issues/42" });
   const tracker = fakeTracker("github");
   const outcome = await applyOutcome(t, cfgFor(tracker), {
@@ -314,17 +324,62 @@ test("applyOutcome: split creates a sub-issue per subtask and sets state to bloc
     subtasks: [
       { title: "Part one", body: "Do the first part." },
       { title: "Part two", body: "Do the second part." },
+      { title: "Part three", body: "Do the third part." },
     ],
   });
 
   assert.equal(outcome.kind, "split");
   assert.deepEqual(tracker.states, ["blocked"]);
-  assert.equal(tracker.subIssues.length, 2);
+  assert.deepEqual(tracker.branches, [["agent/issue-42", "main"]]);
+  assert.deepEqual(tracker.subRequests.map((r) => [r.runnable, r.parent, r.blockedBy]), [[true, 42, undefined], [false, 42, 100], [false, 42, 101]]);
+  assert.deepEqual(tracker.subRequests.map((r) => parseChain(r.body)), [
+    { parent: 42, index: 1, total: 3 },
+    { parent: 42, index: 2, total: 3, blockedBy: 100 },
+    { parent: 42, index: 3, total: 3, blockedBy: 101 },
+  ]);
+  assert.match(tracker.subRequests[1]!.body, /^Parent: #42\nBase branch: agent\/issue-42\nSub-issue: 2 of 3\nBlocked by: #100\n\nDo the second part\./);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /Too big for one run/);
   assert.match(tracker.comments[0]!, /Part one/);
-  assert.match(tracker.comments[0]!, /Part two/);
+  assert.match(tracker.comments[0]!, /agent\/issue-42/);
   assert.match(tracker.comments[0]!, new RegExp(tracker.subIssues[0]!.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("applyOutcome: a sub-issue can't split again, and a split is capped at 4 sub-issues", async () => {
+  const subtasks = (n: number) => Array.from({ length: n }, (_, i) => ({ title: `p${i}`, body: "b" }));
+  const sub = ticket({ number: 101, trust: "trusted", body: `${chainHeader({ parent: 42, index: 2, total: 3, blockedBy: 100 })}\n\nDo it.` });
+  const tracker = fakeTracker("github");
+  const nested = await applyOutcome(sub, cfgFor(tracker), { status: "split", summary: "again", subtasks: subtasks(2) });
+  assert.equal(nested.kind, "failed");
+  assert.match(tracker.comments[0]!, /can't be split again/);
+
+  const tooMany = await applyOutcome(ticket({ number: 43 }), cfgFor(tracker), { status: "split", summary: "big", subtasks: subtasks(5) });
+  assert.equal(tooMany.kind, "failed");
+  assert.match(tracker.comments[1]!, /over the limit of 4/);
+  assert.deepEqual(tracker.subIssues, []);
+  assert.deepEqual(tracker.branches, []);
+  assert.deepEqual(tracker.states, ["blocked", "blocked"]);
+});
+
+test("applyOutcome: a sub-issue's PR targets its parent's integration branch; an untrusted header is ignored", async () => {
+  const body = `${chainHeader({ parent: 42, index: 1, total: 2 })}\n\nDo it.`;
+  const tracker = fakeTracker("github");
+  await applyOutcome(ticket({ number: 100, trust: "trusted", body }), cfgFor(tracker), { status: "ready_for_review", summary: "Done." });
+  assert.equal(tracker.reviews[0]!.base, "agent/issue-42");
+  assert.match(tracker.reviews[0]!.body, /Part of #42 \(sub-issue 1 of 2\)/);
+
+  const other = fakeTracker("github");
+  await applyOutcome(ticket({ number: 100, trust: "untrusted", body }), cfgFor(other), { status: "ready_for_review", summary: "Done." });
+  assert.equal(other.reviews[0]!.base, "main");
+});
+
+test("buildPrompt: a sub-issue is told its base branch and that it can't split again", () => {
+  const t = ticket({ trust: "trusted", body: `${chainHeader({ parent: 42, index: 2, total: 3, blockedBy: 100 })}\n\nDo it.` });
+  const prompt = buildPrompt(t, promptCfg(fakeTracker("gitlab")));
+  assert.match(prompt, /sub-issue 2 of 3 split from #42/);
+  assert.match(prompt, /MR` targets agent\/issue-42|MR targets agent\/issue-42/);
+  assert.match(prompt, /can't be split again/);
+  assert.doesNotMatch(buildPrompt(ticket({ trust: "trusted", body: "plain" }), promptCfg(fakeTracker("gitlab"))), /sub-issue/);
 });
 
 test("applyOutcome: failed comments the explanation and sets state to blocked", async () => {
