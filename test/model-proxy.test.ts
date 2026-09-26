@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
-import { credentialFromEnv, sandboxEnv, startModelProxy, PLACEHOLDER_API_KEY } from "../src/model-proxy.ts";
+import { credentialFromEnv, sandboxEnv, startModelProxy, OAUTH_BETA, PLACEHOLDER_API_KEY } from "../src/model-proxy.ts";
 
 // A stand-in for api.anthropic.com: records the headers/body it received and replies
 // with a fixed body, optionally after a delay (to exercise the request timeout).
@@ -59,6 +59,36 @@ test("proxy swaps whatever auth header the sandboxed client sent for the real cr
   assert.equal(res.status, 200);
   assert.equal(seen?.headers["x-api-key"], "REAL-SECRET");
   assert.equal(proxy.requestCount(), 1);
+
+  await proxy.close();
+  upstream.server.close();
+});
+
+test("proxy falls back to default limits when run-ticket passes undefined for unset env vars", async () => {
+  // Regression: `{ ...DEFAULT_LIMITS, ...limits }` let these undefineds win, and the first
+  // request then crashed the whole run in upstreamReq.setTimeout(undefined).
+  const upstream = await fakeUpstream(() => {});
+  const proxy = await startModelProxy(
+    { header: "x-api-key", value: "REAL-SECRET" },
+    { maxRequests: undefined, maxLifetimeMs: undefined, requestTimeoutMs: undefined },
+    { upstream: upstream.url },
+  );
+
+  assert.equal((await fetch(proxy.url, { method: "POST" })).status, 200);
+
+  await proxy.close();
+  upstream.server.close();
+});
+
+test("proxy adds the OAuth beta flag when the real credential is an OAuth bearer token", async () => {
+  let seen: IncomingMessage | undefined;
+  const upstream = await fakeUpstream((req) => { seen = req; });
+  const proxy = await startModelProxy({ header: "authorization", value: "Bearer REAL" }, {}, { upstream: upstream.url });
+
+  await fetch(proxy.url, { method: "POST", headers: { "anthropic-beta": "some-other-beta" } });
+
+  assert.equal(seen?.headers.authorization, "Bearer REAL");
+  assert.equal(seen?.headers["anthropic-beta"], `some-other-beta,${OAUTH_BETA}`);
 
   await proxy.close();
   upstream.server.close();
