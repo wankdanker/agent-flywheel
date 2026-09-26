@@ -1,5 +1,6 @@
 import { query, tool, createSdkMcpServer, type HookCallbackMatcher, type HookEvent, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { PublishRejected, type Publisher } from "./publish.ts";
 import type { Comment, NewSubIssue, Repo, Ticket, Tracker } from "./tracker.ts";
 
 export type WorkerConfig = {
@@ -12,7 +13,12 @@ export type WorkerConfig = {
   // Env for the SDK's own subprocess. bin/run-ticket.ts sets this to sandboxEnv(...) so
   // the real model credential never reaches it (see src/model-proxy.ts); defaults to
   // process.env (real credential included) so tests and other callers don't need to care.
+  // sandboxEnv also strips the forge tokens: the agent can't push, open a PR/MR or edit
+  // the issue, only commit locally.
   env?: NodeJS.ProcessEnv;
+  // The trusted step that validates and pushes the agent's branch once its session is over
+  // (src/publish.ts). Holds the forge credential; never reachable from a tool the model calls.
+  publisher: Publisher;
 };
 
 // What an MCP tool handler records in memory during the agent's turn — no forge writes
@@ -20,7 +26,7 @@ export type WorkerConfig = {
 // tracker.comment/setState/createSubIssue calls once the agent's turn is fully over.
 export type AgentOutcome =
   | { status: "blocked"; question: string }
-  | { status: "ready_for_review"; summary: string; mrUrl: string }
+  | { status: "ready_for_review"; summary: string }
   | { status: "split"; summary: string; subtasks: NewSubIssue[] }
   | { status: "failed"; summary: string }
   | { status: "checkpoint"; summary: string; nextSteps: string };
@@ -58,6 +64,7 @@ export const blockedNoDirectiveMessage = (t: Ticket) =>
 // thread, and even if a trusted user later replied to it.
 export function buildPrompt(t: Ticket, cfg: WorkerConfig) {
   const skill = cfg.tracker.platform === "github" ? "github-pr" : "gitlab-mr";
+  const review = cfg.tracker.platform === "github" ? "PR" : "MR";
 
   const renderComment = (c: Comment) =>
     c.trust === "untrusted"
@@ -82,38 +89,32 @@ ${thread}
 
 Repository: ${cfg.repo.cloneUrl} (default branch ${cfg.repo.defaultBranch}), already cloned into your
 working directory on branch ${branchFor(t)}. This is the project the issue was filed on, and also the
-source of your own worker image. It's the only repo you have credentials for — work here even if the
-issue asks about another repo.
-Open the ${cfg.tracker.platform === "github" ? "PR" : "MR"} with the \`${skill}\` skill.`;
+source of your own worker image. Work here even if the issue asks about another repo.
+You have no forge credentials: you can't push, open the ${review}, or edit the issue yourself. Commit your
+work on ${branchFor(t)} and call an outcome tool; a trusted publisher pushes the branch and opens the
+${review} after your session ends. See the \`${skill}\` skill.`;
 }
 
 // ---- Turn gauge and checkpoint interceptor ----
 //
 // The container and the model's context are ephemeral; the git remote and the issue thread
 // are the only durable state. So the model gets told how much runway it has left on every
-// tool result, and once it's down to CHECKPOINT_AT turns, everything except committing,
-// pushing, and recording an outcome is denied, so the run ends with its work on the branch
+// tool result, and once it's down to CHECKPOINT_AT turns, everything except committing and
+// recording an outcome is denied, so the run ends with its work on the branch
 // instead of being cut off mid-edit by the SDK.
 
 export const CHECKPOINT_AT = 2;
 
 export const gaugeText = (turn: number, max: number) => `[Turn ${turn}/${max} | ${Math.max(0, max - turn)} turns remaining]`;
 
-// The same one-shot credential helper the github-pr/gitlab-mr skills push with: nothing
-// token-bearing is written to git config.
-export const pushCommand = (platform: Tracker["platform"]) =>
-  platform === "github"
-    ? `git -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push -u origin HEAD`
-    : `git -c credential.helper='!f() { echo username=oauth2; echo "password=$AGENT_GITLAB_TOKEN"; }; f' push -u origin HEAD`;
-
-export const checkpointInstructions = (t: Ticket, platform: Tracker["platform"]) =>
+export const checkpointInstructions = (t: Ticket) =>
   `You are out of turns (${CHECKPOINT_AT} or fewer left), so this tool call was denied. Stop editing now. ` +
-  `Stage and commit your work (\`git add -A && git commit -m "<what's done; what's next>"\`), push branch ` +
-  `${branchFor(t)} with \`${pushCommand(platform)}\`, then call the \`checkpoint\` tool with a summary of ` +
+  `Stage and commit your work on branch ${branchFor(t)} (\`git add -A && git commit -m "<what's done; what's next>"\`; ` +
+  `don't push, the publisher does that), then call the \`checkpoint\` tool with a summary of ` +
   `what's done and the next steps. Only git commands and the ticket outcome tools are allowed from here on.`;
 
 // A runway guard for a cooperative agent, not a sandbox: a Bash call is let through when it
-// is a git command (optionally after a `cd`), so `git add && git commit && git push` chains work.
+// is a git command (optionally after a `cd`), so `git add && git commit` chains work.
 export function allowedWhenOutOfTurns(toolName: string, input: unknown): boolean {
   if (toolName.startsWith("mcp__ticket__") || toolName === "ToolSearch") return true;
   if (toolName !== "Bash") return false;
@@ -150,7 +151,7 @@ export class TurnGauge {
   }
 }
 
-export function turnHooks(gauge: TurnGauge, t: Ticket, platform: Tracker["platform"]): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+export function turnHooks(gauge: TurnGauge, t: Ticket): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
   return {
     PreToolUse: [{
       hooks: [async (input, toolUseId) => {
@@ -161,7 +162,7 @@ export function turnHooks(gauge: TurnGauge, t: Ticket, platform: Tracker["platfo
           hookSpecificOutput: {
             hookEventName: "PreToolUse",
             permissionDecision: "deny",
-            permissionDecisionReason: `${checkpointInstructions(t, platform)} ${gaugeText(turn, gauge.max)}`,
+            permissionDecisionReason: `${checkpointInstructions(t)} ${gaugeText(turn, gauge.max)}`,
           },
         };
       }],
@@ -177,14 +178,20 @@ export function turnHooks(gauge: TurnGauge, t: Ticket, platform: Tracker["platfo
 }
 
 export const checkpointComment = (t: Ticket, summary: string, nextSteps: string) =>
-  `I'm pausing at a checkpoint before running out of turns. My work so far is committed and pushed to ` +
+  `I'm pausing at a checkpoint before running out of turns. My work so far is committed and published to ` +
   `branch \`${branchFor(t)}\`.\n\n**Done:**\n${summary}\n\n**Next:**\n${nextSteps}\n\n` +
   `Reply here (e.g. \`/agent continue\`) to have me pick it up from that branch.`;
 
 export const implicitCheckpointComment = (t: Ticket, maxTurns: number) =>
-  `I used all ${maxTurns} turns before recording a checkpoint. Whatever I committed and pushed is on branch ` +
+  `I used all ${maxTurns} turns before recording a checkpoint. Whatever I committed is published to branch ` +
   `\`${branchFor(t)}\`; its \`git log\` says what's done. Reply here (e.g. \`/agent continue\`) to have me ` +
   `pick it up from that branch.`;
+
+export const rejectedComment = (t: Ticket, reached: AgentOutcome["status"], problems: string[]) =>
+  `I reached \`${reached}\`, but the publisher refused to push branch \`${branchFor(t)}\`, so nothing was ` +
+  `pushed and no PR/MR was opened or updated:\n\n${problems.map((p) => `- ${p.replace(/`/g, "'")}`).join("\n")}\n\n` +
+  `A maintainer should look at what the branch was trying to change. Reply here (e.g. \`/agent continue\`) ` +
+  `to have me redo the work without those changes.`;
 
 // Thrown by applyOutcome when some of its forge writes failed. Carries the outcome the
 // agent actually reached, so a tracker failure never hides the worker's result: the caller
@@ -215,17 +222,40 @@ export async function settle(outcome: Outcome, writes: (() => Promise<unknown>)[
   return outcome;
 }
 
+// Validates and pushes the agent's branch through the trusted publisher. Returns the reasons
+// it was rejected (nothing pushed), or undefined once it's pushed. Any other failure (network,
+// a non-fast-forward push) throws a SettlementError carrying what the agent had reached.
+function publish(cfg: WorkerConfig, reached: Outcome, requireCommits: boolean): string[] | undefined {
+  try {
+    const res = cfg.publisher.pushBranch({ requireCommits });
+    console.log(`[publish] ${res.pushed ? "pushed" : "nothing new to push at"} ${res.head} (${res.commits} commit(s) over the base)`);
+    return undefined;
+  } catch (err) {
+    if (err instanceof PublishRejected) return err.problems;
+    throw new SettlementError(reached, [err]);
+  }
+}
+
 // The single trusted post-agent step: turns whatever the agent's tool calls recorded in
-// memory into the actual forge writes. Runs once, after the agent's turn is fully over —
-// never from inside a tool handler the model can invoke mid-session.
+// memory into the actual forge writes, including publishing its branch (pushed only for
+// ready_for_review and checkpoints, never for blocked/split/failed). Runs once, after the
+// agent's turn is fully over — never from inside a tool handler the model can invoke mid-session.
 export async function applyOutcome(
   t: Ticket, cfg: WorkerConfig, recorded: AgentOutcome | undefined, end: SessionEnd = { maxTurnsHit: false },
 ): Promise<Outcome> {
   const { tracker } = cfg;
+  const rejected = (reached: AgentOutcome["status"], problems: string[]) =>
+    settle({ kind: "failed", detail: `publisher rejected the branch: ${problems.join("; ")}` }, [
+      () => tracker.comment(rejectedComment(t, reached, problems)),
+      () => tracker.setState("blocked"),
+    ]);
   if (!recorded) {
     if (end.maxTurnsHit) {
+      const reached: Outcome = { kind: "checkpoint", detail: `used all ${cfg.maxTurns} turns without recording an outcome` };
+      const problems = publish(cfg, reached, false);
+      if (problems) return rejected("checkpoint", problems);
       const text = implicitCheckpointComment(t, cfg.maxTurns);
-      return settle({ kind: "checkpoint", detail: `used all ${cfg.maxTurns} turns without recording an outcome` }, [
+      return settle(reached, [
         () => tracker.comment(text),
         () => tracker.setState("blocked"),
       ]);
@@ -238,11 +268,27 @@ export async function applyOutcome(
         () => tracker.comment(recorded.question),
         () => tracker.setState("blocked"),
       ]);
-    case "ready_for_review":
-      return settle({ kind: "ready_for_review", detail: recorded.mrUrl }, [
-        () => tracker.comment(`${recorded.summary}\n\nReview: ${recorded.mrUrl}`),
+    case "ready_for_review": {
+      const reached: Outcome = { kind: "ready_for_review", detail: recorded.summary };
+      const problems = publish(cfg, reached, true);
+      if (problems) return rejected("ready_for_review", problems);
+      let review;
+      try {
+        review = await tracker.openReview({
+          branch: branchFor(t),
+          base: cfg.repo.defaultBranch,
+          title: t.title,
+          body: `${recorded.summary}\n\nCloses #${t.number}`,
+        });
+      } catch (err) {
+        throw new SettlementError(reached, [err]);
+      }
+      console.log(`[publish] ${review.created ? "opened" : "reusing open"} ${review.url}`);
+      return settle({ kind: "ready_for_review", detail: review.url }, [
+        () => tracker.comment(`${recorded.summary}\n\nReview: ${review.url}`),
         () => tracker.setState("review"),
       ]);
+    }
     case "split": {
       let created;
       try {
@@ -265,11 +311,15 @@ export async function applyOutcome(
         () => tracker.comment(recorded.summary),
         () => tracker.setState("blocked"),
       ]);
-    case "checkpoint":
-      return settle({ kind: "checkpoint", detail: recorded.summary }, [
+    case "checkpoint": {
+      const reached: Outcome = { kind: "checkpoint", detail: recorded.summary };
+      const problems = publish(cfg, reached, false);
+      if (problems) return rejected("checkpoint", problems);
+      return settle(reached, [
         () => tracker.comment(checkpointComment(t, recorded.summary, recorded.nextSteps)),
         () => tracker.setState("blocked"),
       ]);
+    }
   }
 }
 
@@ -300,10 +350,13 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
           recorded = { status: "blocked", question };
           return { content: [{ type: "text", text: "Question recorded. End your turn now." }] };
         }),
-      tool("finish", "Report completed work on the issue and mark it for review.",
-        { summary: z.string(), mr_url: z.string() },
-        async ({ summary, mr_url }) => {
-          recorded = { status: "ready_for_review", summary, mrUrl: mr_url };
+      tool("finish",
+        "Report completed work, committed on your branch, as ready for review. After your session ends the " +
+          "publisher validates and pushes the branch, opens (or updates) the PR/MR with this summary, and " +
+          "marks the issue for review.",
+        { summary: z.string().describe("What changed and how it was tested; becomes the PR/MR description and the issue comment.") },
+        async ({ summary }) => {
+          recorded = { status: "ready_for_review", summary };
           return { content: [{ type: "text", text: "Outcome recorded. You're done." }] };
         }),
       tool("split_into_subtasks",
@@ -333,10 +386,10 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
         }),
       tool("checkpoint",
         "Pause at a durable checkpoint when you're about to run out of turns: after committing your work " +
-          "and pushing your branch, record what's done and what's next so the next run can continue from " +
-          "the branch. Stop working after calling this.",
+          "on your branch, record what's done and what's next so the next run can continue from the branch " +
+          "(the publisher pushes it after your session ends). Stop working after calling this.",
         {
-          summary: z.string().describe("What's done so far and is committed and pushed."),
+          summary: z.string().describe("What's done so far and is committed."),
           next_steps: z.string().describe("What remains, specific enough for a fresh run to pick up from the branch."),
         },
         async ({ summary, next_steps }) => {
@@ -368,11 +421,11 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         systemPrompt: { type: "preset", preset: "claude_code" },
-        hooks: turnHooks(gauge, t, cfg.tracker.platform),
+        hooks: turnHooks(gauge, t),
       },
     }), gauge, end);
   } catch (err) {
-    // The agent already decided (and e.g. already pushed a PR) before the SDK or model API
+    // The agent already decided (and e.g. already committed its work) before the SDK or model API
     // blew up on the way out: honor that decision rather than discard it. Likewise the SDK
     // may throw after an error_max_turns result; that's an implicit checkpoint, not a crash.
     if (!recorded && !end.maxTurnsHit) throw err;

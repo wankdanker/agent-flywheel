@@ -9,6 +9,7 @@ import { isAllowedRepo, parseAllowlist } from "./allowlist.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
 import { githubTracker } from "./github.ts";
 import { gitlabTracker } from "./gitlab.ts";
+import { gitPublisher } from "./publish.ts";
 import { credentialFromEnv, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import type { Ticket, TicketState, Tracker } from "./tracker.ts";
 import { branchFor, runTicket as realRunTicket, settle, SettlementError, type Outcome } from "./worker.ts";
@@ -36,6 +37,7 @@ export type RunDeps = {
   originUrl?: typeof realOriginUrl;
   startModelProxy?: (...a: Parameters<typeof realStartModelProxy>) => Promise<{ url: string; requestCount(): number; close(): Promise<void> }>;
   runTicket?: typeof realRunTicket;
+  publisher?: typeof gitPublisher;
 };
 
 export const DEFAULT_PLUGIN_DIR = "/opt/agent/agent/plugin";
@@ -145,6 +147,7 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
     repo: () => tracker.repo(),
     getTicket: () => tracker.getTicket(),
     createSubIssue: (input) => tracker.createSubIssue(input),
+    openReview: (input) => tracker.openReview(input),
     async comment(text) {
       const key = text.trim();
       if (posted.has(key)) {
@@ -170,6 +173,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
   const originUrl = deps.originUrl ?? realOriginUrl;
   const startModelProxy = deps.startModelProxy ?? realStartModelProxy;
   const runTicket = deps.runTicket ?? realRunTicket;
+  const createPublisher = deps.publisher ?? gitPublisher;
 
   // Everything that can be wrong with our config is checked before we touch the issue.
   let tracker: Tracker, maxTurns: number;
@@ -235,13 +239,9 @@ export async function main(deps: RunDeps = {}): Promise<number> {
 
     // Cloning happens here, before the agent's own (permission-bypassed) shell ever starts, so
     // it never needs or sees forge credentials to get the repo it's meant to work on.
-    prepareRepo({
-      cloneUrl: repo.cloneUrl,
-      workDir,
-      branch: branchFor(ticket),
-      defaultBranch: repo.defaultBranch,
-      credential: credentialFor(tracker.platform, env),
-    });
+    const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: repo.defaultBranch };
+    const credential = credentialFor(tracker.platform, env);
+    prepareRepo({ ...target, credential });
 
     // A cached work dir from a previous run could in principle predate today's allowlist;
     // re-check what's actually on disk, not just what we asked to clone.
@@ -262,6 +262,8 @@ export async function main(deps: RunDeps = {}): Promise<number> {
         model: env.CLAUDE_MODEL,
         maxTurns,
         env: sandboxEnv(env, proxy.url),
+        // Pushing is the publisher's, after the session: the agent's env has no forge token.
+        publisher: createPublisher({ ...target, credential }),
       });
     } finally {
       console.log(`[model-proxy] forwarded ${proxy.requestCount()} request(s)`);

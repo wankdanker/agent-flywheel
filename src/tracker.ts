@@ -29,6 +29,7 @@ export type Repo = { cloneUrl: string; webUrl: string; defaultBranch: string };
 
 export type NewSubIssue = { title: string; body: string };
 export type CreatedIssue = { number: number; url: string };
+export type ReviewRequest = { branch: string; base: string; title: string; body: string };
 
 export interface Tracker {
   platform: "github" | "gitlab";
@@ -40,6 +41,10 @@ export interface Tracker {
   // (see worker.ts's split_into_subtasks). Implementations must ensure the opt-in label
   // actually fires that platform's trigger — see github.ts/gitlab.ts for why they differ.
   createSubIssue(input: NewSubIssue): Promise<CreatedIssue>;
+  // Opens a PR/MR from `branch` into `base`, or returns the one already open for that branch
+  // (`created: false`), so a retried or resumed publication never opens a duplicate. Only
+  // the trusted publisher calls this (see worker.ts's applyOutcome), after pushing the branch.
+  openReview(input: ReviewRequest): Promise<{ url: string; created: boolean }>;
 }
 
 export const need = (k: string): string => process.env[k] || (console.error(`missing env ${k}`), process.exit(2));

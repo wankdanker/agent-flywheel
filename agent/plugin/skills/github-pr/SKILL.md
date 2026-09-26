@@ -1,29 +1,35 @@
 ---
 name: github-pr
-description: Push a branch and open a GitHub pull request with the gh CLI. Use when work on an issue is ready for review on GitHub.
+description: Get a branch ready for a GitHub pull request. You commit; a trusted publisher pushes and opens the PR after your session. Use when work on an issue is ready for review on GitHub.
 ---
 
-# Opening a pull request
+# Getting a pull request ready
 
-`gh` is installed and already authenticated through `GH_TOKEN`. Run it from inside the clone.
+You don't push or open the PR yourself, and can't: your session has no forge token, and
+`gh`/`git push` aren't authenticated. Once your session ends, a trusted publisher step
+validates your branch, pushes it, and opens the PR (or reuses the one already open for the
+branch), then comments on the issue and labels it for review.
 
-Git itself isn't pre-authenticated (nothing token-bearing is left in git config for your
-shell to read), so pass the credential inline, only for this one push, rather than adding
-it to config:
+1. Commit everything on the issue branch (`agent/issue-<n>`, the one you're on). Only
+   committed work is published; uncommitted changes and other branches are dropped.
 
-```bash
-git -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
-  push -u origin HEAD
-gh pr view --json url -q .url 2>/dev/null || gh pr create \
-  --base "$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)" \
-  --title "<issue title>" \
-  --body "<what changed, how it was tested>
+   ```bash
+   git add -A && git commit -m "<what changed; what's next, if anything>"
+   ```
 
-Closes #<issue number>"
-```
+2. Call `finish` with a summary: what changed and how it was tested. It becomes the PR
+   description (the publisher appends `Closes #<n>`) and the issue comment. The PR title is
+   the issue title.
 
-- `gh pr create` prints the PR URL. Pass that URL to `finish`.
-- If the branch already has an open PR, `gh pr view` prints its URL and the push has updated it. Reuse that URL.
-- Title: the issue title, unchanged. Body: short summary, test evidence, `Closes #<n>`.
-- If the push is rejected because you touched `.github/workflows/`, the token lacks the
-  `workflows` permission. Drop those changes, and say in your summary what a human needs to apply by hand.
+The publisher refuses the whole branch, pushing nothing, if any commit on it:
+
+- adds or changes a submodule (a gitlink or `.gitmodules`),
+- touches a `.git` path, or a path outside the repo, including via a symlink,
+- adds a credential-looking file (`.env`, `.git-credentials`, `.netrc`, private keys, `*.pem`, ...),
+  even if a later commit deletes it again.
+
+If you need any of that, say so in your summary instead of committing it.
+
+A change under `.github/workflows/` may still be rejected at push time if the publisher's
+token lacks the `workflows` permission. If so, leave those changes out and say in your
+summary what a human needs to apply by hand.

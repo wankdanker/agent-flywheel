@@ -1,23 +1,31 @@
 ---
 name: gitlab-mr
-description: Push a branch and open a GitLab merge request without the API or glab. Use when work on an issue is ready for review on GitLab.
+description: Get a branch ready for a GitLab merge request. You commit; a trusted publisher pushes and opens the MR after your session. Use when work on an issue is ready for review on GitLab.
 ---
 
-# Opening a merge request
+# Getting a merge request ready
 
-We create MRs with GitLab push options, in the same command as the push. Git itself isn't
-pre-authenticated (nothing token-bearing is left in git config for your shell to read), so
-pass the credential inline, only for this one push, rather than adding it to config:
+You don't push or open the MR yourself, and can't: your session has no forge token, and
+`git push` isn't authenticated. Once your session ends, a trusted publisher step validates
+your branch, pushes it, and opens the MR (or reuses the one already open for the branch),
+then comments on the issue and labels it for review.
 
-```bash
-git -c credential.helper='!f() { echo username=oauth2; echo "password=$AGENT_GITLAB_TOKEN"; }; f' \
-  push -u origin HEAD \
-  -o merge_request.create \
-  -o merge_request.target="$(git remote show origin | sed -n 's/.*HEAD branch: //p')" \
-  -o merge_request.title="<issue title>" \
-  -o merge_request.description="<what changed, how it was tested> Closes #<issue iid>"
-```
+1. Commit everything on the issue branch (`agent/issue-<iid>`, the one you're on). Only
+   committed work is published; uncommitted changes and other branches are dropped.
 
-- GitLab prints the MR URL in the push output (`remote:` lines). Pass that URL to `finish`.
-- If the branch already has an open MR, a plain `git push` updates it; reuse its URL.
-- Title: the issue title, unchanged. Description: short summary, test evidence, `Closes #<iid>`.
+   ```bash
+   git add -A && git commit -m "<what changed; what's next, if anything>"
+   ```
+
+2. Call `finish` with a summary: what changed and how it was tested. It becomes the MR
+   description (the publisher appends `Closes #<iid>`) and the issue comment. The MR title is
+   the issue title.
+
+The publisher refuses the whole branch, pushing nothing, if any commit on it:
+
+- adds or changes a submodule (a gitlink or `.gitmodules`),
+- touches a `.git` path, or a path outside the repo, including via a symlink,
+- adds a credential-looking file (`.env`, `.git-credentials`, `.netrc`, private keys, `*.pem`, ...),
+  even if a later commit deletes it again.
+
+If you need any of that, say so in your summary instead of committing it.

@@ -50,6 +50,9 @@ function fakeTracker(fail: Fail = {}, comments: Comment[] = []) {
       if (fail.createSubIssue) throw new Error("GitHub POST /issues: 403");
       return { number: 8, url: "https://github.com/acme/widgets/issues/8" };
     },
+    async openReview() {
+      return { url: "https://x/pull/1", created: true };
+    },
   };
   return t satisfies Tracker;
 }
@@ -77,6 +80,7 @@ function deps(tracker: Tracker, runTicket: RunDeps["runTicket"], over: Partial<R
     prepareRepo: () => {},
     originUrl: () => CLONE_URL,
     startModelProxy: async () => ({ url: "http://127.0.0.1:1", requestCount: () => 0, close: async () => void proxyClosed++ }),
+    publisher: () => ({ pushBranch: () => ({ pushed: true, head: "abc123", commits: 1 }) }),
     ...over,
   };
 }
@@ -97,7 +101,7 @@ async function quietly<T>(fn: () => Promise<T>): Promise<{ result: T; logs: stri
 
 test("success: one summary comment, review label, exit 0", async () => {
   const tracker = fakeTracker();
-  const { result } = await quietly(() => main(deps(tracker, engine({ status: "ready_for_review", summary: "Done.", mrUrl: "https://x/pull/1" }))));
+  const { result } = await quietly(() => main(deps(tracker, engine({ status: "ready_for_review", summary: "Done." }))));
   assert.equal(result, 0);
   assert.deepEqual(tracker.states, ["working", "review"]);
   assert.equal(tracker.comments.length, 1);
@@ -197,7 +201,7 @@ test("cached work dir outside the allowlist after `working`: blocked, exit 2", a
 test("summary comment fails: label still goes to review, worker result logged, exit 1", async () => {
   const tracker = fakeTracker({ comment: 1 });
   const { result, logs } = await quietly(() =>
-    main(deps(tracker, engine({ status: "ready_for_review", summary: "Done.", mrUrl: "https://x/pull/1" }))),
+    main(deps(tracker, engine({ status: "ready_for_review", summary: "Done." }))),
   );
   assert.equal(result, 1);
   assert.equal(tracker.label, "review");
@@ -216,7 +220,7 @@ test("question comment fails: still blocked, exit 1, the question survives in th
 test("review label update fails: falls back to blocked with an explanation, exit 1", async () => {
   const tracker = fakeTracker({ setState: { review: 1 } });
   const { result, logs } = await quietly(() =>
-    main(deps(tracker, engine({ status: "ready_for_review", summary: "Done.", mrUrl: "https://x/pull/1" }))),
+    main(deps(tracker, engine({ status: "ready_for_review", summary: "Done." }))),
   );
   assert.equal(result, 1);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
@@ -228,7 +232,7 @@ test("review label update fails: falls back to blocked with an explanation, exit
 test("every label update fails: nonzero exit, actionable log, original error preserved", async () => {
   const tracker = fakeTracker({ setState: { review: 1, blocked: 5 } });
   const { result, logs } = await quietly(() =>
-    main(deps(tracker, engine({ status: "ready_for_review", summary: "Done.", mrUrl: "https://x/pull/1" }))),
+    main(deps(tracker, engine({ status: "ready_for_review", summary: "Done." }))),
   );
   assert.equal(result, 1);
   assert.equal(tracker.label, "working");
@@ -257,7 +261,7 @@ test("setting working itself fails: still tries blocked, exit 1", async () => {
 test("a retry doesn't repeat a completion comment already at the end of the thread", async () => {
   const prior: Comment = { author: "bot", trust: "trusted", fromBot: true, text: "Done.\n\nReview: https://x/pull/1", at: "2026-01-01T00:00:00Z" };
   const tracker = fakeTracker({}, [prior]);
-  const { result } = await quietly(() => main(deps(tracker, engine({ status: "ready_for_review", summary: "Done.", mrUrl: "https://x/pull/1" }))));
+  const { result } = await quietly(() => main(deps(tracker, engine({ status: "ready_for_review", summary: "Done." }))));
   assert.equal(result, 0);
   assert.deepEqual(tracker.comments, []);
   assert.equal(tracker.label, "review");

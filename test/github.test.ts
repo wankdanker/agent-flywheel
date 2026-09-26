@@ -152,6 +152,7 @@ test("github getTicket: follows Link rel=next across 250 comments in chronologic
     workDir: "/tmp",
     pluginDir: "/tmp",
     maxTurns: 1,
+    publisher: { pushBranch: () => { throw new Error("not used"); } },
   });
   assert.match(prompt, /comment 249\b/, "the triggering (newest) comment must reach the prompt");
   assert.ok(prompt.indexOf("comment 0\n") < prompt.indexOf("comment 249"), "thread stays oldest-first");
@@ -185,4 +186,27 @@ test("github getTicket: refuses to send the token to a next link off the API hos
   const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
   await assert.rejects(tracker.getTicket(), /outside https:\/\/api\.github\.com/);
   assert.ok(!calls.some((u) => u.startsWith("https://evil.example")));
+});
+
+test("github openReview: reuses the PR already open for the branch, otherwise opens one", async (t) => {
+  const posts: any[] = [];
+  let open: any[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    if (url.startsWith("https://api.github.com/repos/o/r/pulls?")) {
+      assert.match(url, /state=open&head=o%3Aagent%2Fissue-3$/);
+      return jsonResponse(open);
+    }
+    if (url === "https://api.github.com/repos/o/r/pulls" && init.method === "POST") {
+      posts.push(JSON.parse(String(init.body)));
+      open = [{ html_url: "https://github.com/o/r/pull/9" }];
+      return jsonResponse(open[0]);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
+  const req = { branch: "agent/issue-3", base: "main", title: "Fix it", body: "Done.\n\nCloses #3" };
+  assert.deepEqual(await tracker.openReview(req), { url: "https://github.com/o/r/pull/9", created: true });
+  assert.deepEqual(await tracker.openReview(req), { url: "https://github.com/o/r/pull/9", created: false });
+  assert.deepEqual(posts, [{ title: "Fix it", head: "agent/issue-3", base: "main", body: "Done.\n\nCloses #3" }]);
 });

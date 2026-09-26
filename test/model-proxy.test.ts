@@ -35,12 +35,17 @@ test("credentialFromEnv throws when no credential is present", () => {
 });
 
 test("sandboxEnv strips real credentials and points the sandbox at the proxy", () => {
-  const real = { ANTHROPIC_API_KEY: "real-key", CLAUDE_CODE_OAUTH_TOKEN: "real-token", PATH: "/usr/bin" };
+  const real = {
+    ANTHROPIC_API_KEY: "real-key", CLAUDE_CODE_OAUTH_TOKEN: "real-token", PATH: "/usr/bin",
+    GH_TOKEN: "ghs_x", GITHUB_TOKEN: "ghs_y", AGENT_GH_TOKEN: "ghp_z", AGENT_GITLAB_TOKEN: "glpat-x", CI_JOB_TOKEN: "job",
+  };
   const out = sandboxEnv(real, "http://127.0.0.1:4141");
 
   assert.equal(out.ANTHROPIC_API_KEY, PLACEHOLDER_API_KEY);
   assert.equal(out.CLAUDE_CODE_OAUTH_TOKEN, undefined);
   assert.equal(out.ANTHROPIC_BASE_URL, "http://127.0.0.1:4141");
+  // No forge token either: the agent can't push, open a PR/MR or edit the issue.
+  for (const k of ["GH_TOKEN", "GITHUB_TOKEN", "AGENT_GH_TOKEN", "AGENT_GITLAB_TOKEN", "CI_JOB_TOKEN"]) assert.equal(out[k], undefined, k);
   assert.equal(out.PATH, "/usr/bin"); // unrelated env still passed through
   assert.equal(real.ANTHROPIC_API_KEY, "real-key"); // original untouched
 });

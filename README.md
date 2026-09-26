@@ -43,36 +43,34 @@ Only trusted people can start a run:
 This matters because the agent runs with permissions bypassed and holds your secrets.
 
 Exit codes are 0 ready for review, 10 blocked (asked a question or split into sub-issues),
-20 checkpoint (paused at the turn limit with its work pushed), 1 incomplete or failed, 2 bad
+20 checkpoint (paused at the turn limit with its work published), 1 incomplete or failed, 2 bad
 config. CI treats 10 and 20 as success.
 
 ### Stateless iteration, durable checkpoints
 
 The container and the model's context are ephemeral. The git remote and the issue thread are
 the single source of truth. Each run starts fresh, reads the task and the branch's commit log,
-completes a bounded milestone, pushes its state, and yields. The work-dir cache is only an
+completes a bounded milestone, commits its state (which the publisher pushes), and yields. The work-dir cache is only an
 optimization on top of that.
 
 How that's enforced (`src/worker.ts`):
 
 - **Turn gauge.** Every tool result the model sees ends with `[Turn X/Y | Z turns remaining]`,
   so it can plan a clean stopping point against `MAX_TURNS`.
-- **Commit-and-push cadence.** `agent/CLAUDE.md` tells the agent to commit and push its
-  `agent/issue-<n>` branch after every passing test run or finished sub-task, with commit
-  messages that say what's done and what's next, so git is a continuous save state.
+- **Commit cadence.** `agent/CLAUDE.md` tells the agent to commit on its `agent/issue-<n>`
+  branch after every passing test run or finished sub-task, with commit messages that say
+  what's done and what's next, so git is a continuous save state. It can't push; see
+  "Publication" below.
 - **Interceptor.** With 2 or fewer turns left, every tool call except git commands and the
-  outcome tools is denied, with instructions to commit, push the branch, and call `checkpoint`
+  outcome tools is denied, with instructions to commit and call `checkpoint`
   (what's done, what's next).
-- **Checkpoint outcome.** A checkpoint comments what's done and what's next, sets
+- **Checkpoint outcome.** The publisher pushes the branch, then a checkpoint comments what's done and what's next, sets
   `agent/blocked`, and exits 20. Reply on the issue (e.g. `/agent continue`) to resume from the
   branch. If the SDK still hits `MAX_TURNS` with nothing recorded, that's treated as an implicit
   checkpoint rather than a crash.
 
 Not yet: CI re-dispatching a run on exit 20 by itself (auto-relay). That waits on a cap on
 chained autonomous runs, so for now a human reply continues a checkpointed issue.
-Once the privileged publisher (#26) takes pushing away from the agent, "commit and push" in
-this cadence becomes "commit locally", and the publisher (or a post-step for a checkpoint
-outcome) pushes the branch.
 
 ### Stuck on `agent/working`
 
@@ -192,6 +190,36 @@ so a run that goes off the rails can only spend so much of it, on top of the exi
   runs before any of this, outside the container; it isn't something this proxy needs to
   cover.
 
+## Publication
+
+The agent can't push, open a PR/MR, or edit the issue: `sandboxEnv` strips the forge tokens
+(`GH_TOKEN`, `GITHUB_TOKEN`, `AGENT_GH_TOKEN`, `AGENT_GITLAB_TOKEN`, `GITLAB_TOKEN`,
+`CI_JOB_TOKEN`) from its env along with the model credential, so it only commits on
+`agent/issue-<n>` and records an outcome. Once `query()` has returned, `applyOutcome`
+(`src/worker.ts`) hands the branch to the publisher (`src/publish.ts`), trusted code in the
+parent process:
+
+- It treats the work dir as data. It fetches that one branch over `file://` into a fresh,
+  empty scratch repo with no credential in the env, and fsck-checks every object. It never
+  runs `git` with the checkout's own config, hooks or working tree. The base comes from the
+  forge, not from the work dir's refs.
+- It validates every commit on the branch against the base, not just the tip. It rejects
+  gitlinks (submodules), `.gitmodules`, anything under a `.git` path, paths escaping the
+  repo, symlinks pointing outside it or into `.git`, and credential-looking files (`.env`,
+  `.git-credentials`, `.netrc`, private keys, `*.pem`, ...). One problem anywhere means
+  nothing is pushed: the outcome becomes `failed` (exit 1), with the reasons in an issue
+  comment.
+- `finish` (ready for review) pushes the branch and opens the PR/MR, or reuses the one
+  already open for it (`Tracker#openReview`), so retries and resumed runs don't duplicate
+  it. `checkpoint`, including the implicit one at `MAX_TURNS`, pushes the branch only.
+  `ask_question`, `split_into_subtasks` and `report_failure` push nothing.
+
+The push itself uses the same `GIT_ASKPASS`-scoped credential as the clone (`src/clone.ts`).
+This is a separate step, not a separate process: the parent still holds the forge token
+while the agent runs, as the same user in the same container, so something that can read
+another process's `/proc/<pid>/environ` could still reach it. Running the publisher as its
+own CI job is #22.
+
 ## Threat model
 
 The Trust model above answers *whose words the agent treats as instructions*. This
@@ -260,9 +288,10 @@ Current (this repo, today):
       |                     same process, which also holds the model credential
       |                     (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)
       v
-  the SAME agent (bypassPermissions, full shell) clones, edits, tests, AND
-  pushes the branch + opens the PR/MR + comments/relabels the issue itself,
-  using the forge token, per agent/plugin/skills/github-pr and gitlab-mr
+  the agent (bypassPermissions, full shell) edits, tests and commits, with
+  no forge token in its env (sandboxEnv); then, after query() returns, the
+  publisher step in that same parent process validates the branch, pushes
+  it, opens the PR/MR and comments/relabels the issue (src/publish.ts)
 ```
 
 Concretely, none of #12's acceptance criteria are met yet:
@@ -275,16 +304,13 @@ Concretely, none of #12's acceptance criteria are met yet:
   forge credentials are in the same execution environment, not just the same run. (The
   agent subprocess itself now only sees a placeholder key behind `src/model-proxy.ts` —
   see "Model credential exposure" above — but the real one is still in this container.)
-- There is no separate publisher. `agent/plugin/skills/github-pr/SKILL.md` and
-  `gitlab-mr/SKILL.md` are instructions the agent follows with its own shell access — it
-  runs `git push` / `gh pr create` itself, with the same token, from the same process
-  that just built and tested the (possibly untrusted) repository code.
+- The publisher (see "Publication" above) is a separate *step*, not a separate process:
+  the agent no longer gets the forge token in its env or pushes itself, but the parent
+  process that runs it still holds that token in the same container.
 - There is no repository allowlist. The prompt built by `buildPrompt` (`src/worker.ts`)
   tells the agent "Work here unless the issue names another repo" with no enforcement
   behind it — a trusted directive (or a compromised trusted account) can currently point
   the agent at any repository the same broad token reaches.
-- There is no patch validation. Nothing rejects an unexpected submodule, a path outside
-  the workspace, or a diff touching credential files before it's pushed.
 - The agent's outcome isn't structured and validated separately from the side effect:
   the `ask_question`/`finish`/`split_into_subtasks` tools (`src/worker.ts`) post the
   comment and flip the issue's status label directly, in the same call that reports what

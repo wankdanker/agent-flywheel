@@ -98,5 +98,16 @@ export function gitlabTracker(o: { token: string; apiUrl: string; project: strin
       const created = await gl("/issues", { method: "POST", body: JSON.stringify({ title, description: body, labels: OPT_IN_LABEL }) });
       return { number: created.iid, url: created.web_url };
     },
+
+    // Pushing the branch already updated an open MR; only open one if there isn't one yet.
+    async openReview({ branch, base, title, body }) {
+      const open = await gl(`/merge_requests?state=opened&source_branch=${encodeURIComponent(branch)}`);
+      if (Array.isArray(open) && open.length) return { url: open[0].web_url, created: false };
+      const mr = await gl("/merge_requests", {
+        method: "POST",
+        body: JSON.stringify({ source_branch: branch, target_branch: base, title, description: body }),
+      });
+      return { url: mr.web_url, created: true };
+    },
   };
 }

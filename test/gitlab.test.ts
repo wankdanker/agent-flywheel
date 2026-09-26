@@ -176,3 +176,26 @@ test("gitlab getTicket: a notes response without pagination headers is an error,
   const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 });
   await assert.rejects(tracker.getTicket(), /no x-next-page header/);
 });
+
+test("gitlab openReview: reuses the MR already open for the branch, otherwise opens one", async (t) => {
+  const posts: any[] = [];
+  let open: any[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    if (url.includes("/merge_requests?")) {
+      assert.match(url, /state=opened&source_branch=agent%2Fissue-3$/);
+      return jsonResponse(open);
+    }
+    if (url.endsWith("/merge_requests") && init.method === "POST") {
+      posts.push(JSON.parse(String(init.body)));
+      open = [{ web_url: "https://gitlab.example/g/p/-/merge_requests/4" }];
+      return jsonResponse(open[0]);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 });
+  const req = { branch: "agent/issue-3", base: "main", title: "Fix it", body: "Done.\n\nCloses #3" };
+  assert.deepEqual(await tracker.openReview(req), { url: "https://gitlab.example/g/p/-/merge_requests/4", created: true });
+  assert.deepEqual(await tracker.openReview(req), { url: "https://gitlab.example/g/p/-/merge_requests/4", created: false });
+  assert.deepEqual(posts, [{ source_branch: "agent/issue-3", target_branch: "main", title: "Fix it", description: "Done.\n\nCloses #3" }]);
+});
