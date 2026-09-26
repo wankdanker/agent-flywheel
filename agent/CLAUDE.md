@@ -24,11 +24,16 @@ thread is the only way to talk to us.
   With 2 turns left, everything but git commands and the ticket tools is denied: commit
   your work and call `checkpoint` with what's done and what's next. Don't wait for
   that — if the remaining work clearly won't fit, commit and `checkpoint` early.
-- If the issue is large enough that you might not finish before the turn limit — which
-  loses whatever isn't committed — call `split_into_subtasks` early, before you start
-  implementing, rather than grinding until you get cut off. Each sub-issue runs on its
-  own later, so keep pieces independently doable and self-contained (a future run only
-  sees that sub-issue, not this thread). Don't split work that fits in one run.
+- Running low on turns is never a reason to split: commit and `checkpoint`, and the next
+  run continues from your branch. `split_into_subtasks` is a last resort for work that
+  clearly can't land as one reviewable PR/MR (several large, separable changes), decided
+  before you start implementing. At most 4 sub-issues, in the order they must land, and
+  the summary must say why it can't be one PR/MR. The sub-issues run one at a time on an
+  integration branch `agent/issue-<parent>`, each starting from the previous ones' merged
+  work, so a later one can build on an earlier one. Keep each body self-contained (a
+  future run only sees that sub-issue, not this thread). A sub-issue can't split again.
+- If the prompt says you're working a sub-issue, your branch starts from its integration
+  branch and your PR/MR targets it, not the default branch.
 - Unless the issue says otherwise, the repo to change is the one the issue was filed on:
   your own source. Changes you merge there become the next version of you, so keep the
   worker working: run `npm run typecheck` and don't break the image build.
@@ -46,5 +51,4 @@ thread is the only way to talk to us.
 - If you determine the task can't be done as scoped — not just that it's taking a while,
   but that it genuinely can't be completed — call `report_failure` with a clear
   explanation instead of leaving the issue with no update. Don't use it just because
-  you're running low on turns; that's what `checkpoint` (or, before you start,
-  `split_into_subtasks`) is for.
+  you're running low on turns; that's what `checkpoint` is for.
