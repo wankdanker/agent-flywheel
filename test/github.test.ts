@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { githubTracker, nextLink } from "../src/github.ts";
+import { githubChain, githubTracker, nextLink } from "../src/github.ts";
 import { buildPrompt } from "../src/worker.ts";
 
 function jsonResponse(body: unknown, headers: Record<string, string> = {}) {
@@ -223,4 +223,56 @@ test("github openReview: reuses the PR already open for the branch, otherwise op
   assert.deepEqual(await tracker.openReview(req), { url: "https://github.com/o/r/pull/9", created: true });
   assert.deepEqual(await tracker.openReview(req), { url: "https://github.com/o/r/pull/9", created: false });
   assert.deepEqual(posts, [{ title: "Fix it", head: "agent/issue-3", base: "main", body: "Done.\n\nCloses #3" }]);
+});
+
+test("github ensureBranch: creates the branch from the base's tip only when it's missing", async (t) => {
+  const calls: { url: string; method: string; body: string }[] = [];
+  let exists = false;
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    calls.push({ url, method: init.method ?? "GET", body: (init.body as string) ?? "" });
+    if (url.endsWith("/git/ref/heads/agent/issue-42")) return exists ? jsonResponse({ object: { sha: "f00" } }) : new Response("", { status: 404 });
+    if (url.endsWith("/git/ref/heads/main")) return jsonResponse({ object: { sha: "abc" } });
+    if (url.endsWith("/git/refs") && init.method === "POST") return jsonResponse({});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 42 });
+  assert.equal(await tracker.ensureBranch("agent/issue-42", "main"), true);
+  assert.deepEqual(JSON.parse(calls.at(-1)!.body), { ref: "refs/heads/agent/issue-42", sha: "abc" });
+  exists = true;
+  calls.length = 0;
+  assert.equal(await tracker.ensureBranch("agent/issue-42", "main"), false);
+  assert.equal(calls.length, 1);
+});
+
+test("github chain: listQueued skips PRs, release swaps queued for agent (removal first), getReview/findReview/merge", async (t) => {
+  const calls: { url: string; method: string; body: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    const method = init.method ?? "GET";
+    calls.push({ url, method, body: (init.body as string) ?? "" });
+    if (url.includes("/issues?state=open&labels=agent%2Fqueued")) {
+      return jsonResponse([
+        { number: 22, html_url: "u22", body: "b", author_association: "OWNER" },
+        { number: 30, html_url: "u30", body: "b", author_association: "NONE", pull_request: {} },
+      ]);
+    }
+    if (url.endsWith("/issues/22/labels/agent%2Fqueued") && method === "DELETE") return new Response("", { status: 404 });
+    if (url.endsWith("/issues/22/labels") && method === "POST") return jsonResponse([]);
+    if (url.endsWith("/pulls/5")) {
+      return jsonResponse({ state: "open", merged: false, head: { ref: "agent/issue-21", sha: "aaa", repo: { full_name: "o/r" } }, base: { ref: "agent/issue-12" } });
+    }
+    if (url.includes("/pulls?state=all&head=o%3Aagent%2Fissue-21")) return jsonResponse([{ number: 4, head: { sha: "old" } }, { number: 5, head: { sha: "aaa" } }]);
+    if (url.endsWith("/pulls/5/merge") && method === "PUT") return jsonResponse({ merged: true });
+    throw new Error(`unexpected fetch ${method} ${url}`);
+  });
+  const chain = githubChain({ token: "x", repo: "o/r" });
+  assert.deepEqual(await chain.listQueued(), [{ number: 22, url: "u22", body: "b", trust: "trusted" }]);
+  calls.length = 0;
+  await chain.release(22);
+  assert.deepEqual(calls.map((c) => c.method), ["DELETE", "POST"]);
+  assert.deepEqual(JSON.parse(calls[1]!.body), { labels: ["agent"] });
+  assert.deepEqual(await chain.getReview(5), { number: 5, open: true, merged: false, head: "agent/issue-21", base: "agent/issue-12", sha: "aaa", sameRepo: true });
+  assert.equal(await chain.findReview("agent/issue-21", "aaa"), 5);
+  assert.equal(await chain.findReview("agent/issue-21", "zzz"), undefined);
+  await chain.mergeReview(5, "aaa");
+  assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa", merge_method: "merge" });
 });
