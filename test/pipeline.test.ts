@@ -137,6 +137,28 @@ test("successful publication: agent reports ready_for_review -> branch pushed, P
   mocked.restore();
 });
 
+test("sub-issue: the split tool refuses a nested split, and the PR targets the integration branch", async () => {
+  const mocked = mockAgentTurn([
+    { name: "finish", input: { summary: "Did part two." } },
+    { name: "split_into_subtasks", input: { summary: "again", subtasks: [{ title: "a", body: "a" }, { title: "b", body: "b" }] } },
+  ]);
+  const { runTicket } = await importWorker();
+  const { chainHeader } = await import("../src/chain.ts");
+  const tracker = fakeTracker();
+  const reviews: { base: string }[] = [];
+  const openReview = tracker.openReview;
+  tracker.openReview = async (r) => (reviews.push(r), openReview(r));
+
+  const body = `${chainHeader({ parent: 12, index: 2, total: 3, blockedBy: 21 })}\n\nPart two.`;
+  const outcome = await runTicket(ticket({ number: 22, body }), {
+    tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 10,
+  });
+
+  assert.equal(outcome.kind, "ready_for_review");
+  assert.deepEqual(reviews.map((r) => r.base), ["agent/issue-12"]);
+  mocked.restore();
+});
+
 test("blocked work: agent asks a question -> comment posted, label set to blocked", async () => {
   const mocked = mockAgentTurn([{ name: "ask_question", input: { question: "Should pagination be cursor- or offset-based?" } }]);
   const { runTicket } = await importWorker();
