@@ -31,12 +31,17 @@ export function credentialFromEnv(env: NodeJS.ProcessEnv = process.env): Credent
   throw new Error("model-proxy: no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in env");
 }
 
+export const FORGE_TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "AGENT_GH_TOKEN", "AGENT_GITLAB_TOKEN", "GITLAB_TOKEN", "CI_JOB_TOKEN"];
+
 // The env the sandboxed agent subprocess actually gets: real credentials stripped, a
 // placeholder key standing in for them, and requests routed through the proxy.
 export function sandboxEnv(env: NodeJS.ProcessEnv, proxyUrl: string): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env };
   delete out.CLAUDE_CODE_OAUTH_TOKEN;
   delete out.ANTHROPIC_AUTH_TOKEN;
+  // Forge tokens too: only the trusted publisher (src/publish.ts) pushes, opens the PR/MR
+  // or edits the issue, after the agent's session is over.
+  for (const k of FORGE_TOKEN_VARS) delete out[k];
   out.ANTHROPIC_API_KEY = PLACEHOLDER_API_KEY;
   out.ANTHROPIC_BASE_URL = proxyUrl;
   return out;

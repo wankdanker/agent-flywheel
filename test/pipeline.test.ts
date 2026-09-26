@@ -1,9 +1,8 @@
 // End-to-end coverage of the prepare/agent/publish pipeline #12 describes, through
-// however much of it actually exists in this repo today. There is currently one
-// pipeline function (`runTicket` in src/worker.ts) and no separate allowlist,
-// structured-outcome layer, or privileged publisher to test against -- see the
-// README's "Threat model" section for the honest current-vs-target picture. The two
-// scenarios below that need those pieces are left as `test.todo`s rather than faked.
+// however much of it actually exists in this repo today: `runTicket` in src/worker.ts,
+// with a stand-in for the privileged publisher (the real one, src/publish.ts, is
+// exercised against real git in test/publish.test.ts). Scenarios that still need
+// missing pieces are left as `test.todo`s rather than faked.
 //
 // Mocks the SDK the same way test/worker.test.ts mocks the Tracker: we stand in for
 // the model by intercepting `createSdkMcpServer` (to capture the real tool handlers
@@ -17,6 +16,7 @@ import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import type { Comment, Ticket, Tracker } from "../src/tracker.ts";
 import { branchFor } from "../src/worker.ts";
+import type { Publisher } from "../src/publish.ts";
 
 const sdk = await import("@anthropic-ai/claude-agent-sdk");
 
@@ -57,7 +57,10 @@ function mockAgentTurn(calls: ToolCall[], throwAtEnd?: Error) {
 
 const importWorker = () => import(`../src/worker.ts?${Math.random()}`);
 
-function fakeTracker(): Tracker & { comments: string[]; states: string[] } {
+// `forge` is the PR state on the (fake) remote; share one between trackers to model
+// repeated runs against the same repo.
+type Forge = { openPrs: string[] };
+function fakeTracker(forge: Forge = { openPrs: [] }): Tracker & { comments: string[]; states: string[] } {
   const t: any = {
     platform: "github",
     comments: [] as string[],
@@ -77,8 +80,25 @@ function fakeTracker(): Tracker & { comments: string[]; states: string[] } {
     async createSubIssue() {
       throw new Error("not used in these tests");
     },
+    async openReview() {
+      if (forge.openPrs.length) return { url: forge.openPrs[0]!, created: false };
+      forge.openPrs.push(`https://example.test/repo/pull/${forge.openPrs.length + 1}`);
+      return { url: forge.openPrs[0]!, created: true };
+    },
   };
   return t;
+}
+
+// Counts pushes; see test/publish.test.ts for the real, git-backed publisher.
+function fakePublisher(): Publisher & { pushes: number } {
+  const p = {
+    pushes: 0,
+    pushBranch() {
+      p.pushes++;
+      return { pushed: true, head: "abc123", commits: 1 };
+    },
+  };
+  return p;
 }
 
 const ticket = (over: Partial<Ticket> = {}): Ticket => ({
@@ -93,18 +113,20 @@ const ticket = (over: Partial<Ticket> = {}): Ticket => ({
   ...over,
 });
 
-test("successful publication: agent reports ready_for_review -> issue commented with the PR URL and set to review", async () => {
+test("successful publication: agent reports ready_for_review -> branch pushed, PR opened, issue commented with its URL, set to review", async () => {
   const mocked = mockAgentTurn([
-    { name: "finish", input: { summary: "Implemented pagination and added tests.", mr_url: "https://example.test/repo/pull/1" } },
+    { name: "finish", input: { summary: "Implemented pagination and added tests." } },
   ]);
   const { runTicket } = await importWorker();
   const tracker = fakeTracker();
+  const publisher = fakePublisher();
 
   const outcome = await runTicket(ticket(), {
-    tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+    tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher, maxTurns: 10,
   });
 
   assert.equal(outcome.kind, "ready_for_review");
+  assert.equal(publisher.pushes, 1);
   assert.deepEqual(tracker.states, ["review"]);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /Implemented pagination/);
@@ -116,12 +138,14 @@ test("blocked work: agent asks a question -> comment posted, label set to blocke
   const mocked = mockAgentTurn([{ name: "ask_question", input: { question: "Should pagination be cursor- or offset-based?" } }]);
   const { runTicket } = await importWorker();
   const tracker = fakeTracker();
+  const publisher = fakePublisher();
 
   const outcome = await runTicket(ticket(), {
-    tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+    tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher, maxTurns: 10,
   });
 
   assert.equal(outcome.kind, "blocked");
+  assert.equal(publisher.pushes, 0); // blocked: comment only, the branch isn't pushed
   assert.deepEqual(tracker.states, ["blocked"]);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /cursor- or offset-based/);
@@ -130,7 +154,7 @@ test("blocked work: agent asks a question -> comment posted, label set to blocke
 
 test("SDK throws after the agent already called finish: the recorded outcome is still applied", async () => {
   const mocked = mockAgentTurn(
-    [{ name: "finish", input: { summary: "Done.", mr_url: "https://example.test/repo/pull/2" } }],
+    [{ name: "finish", input: { summary: "Done." } }],
     new Error("Claude Code process exited with code 1"),
   );
   const { runTicket } = await importWorker();
@@ -139,7 +163,7 @@ test("SDK throws after the agent already called finish: the recorded outcome is 
   console.error = () => {};
   try {
     const outcome = await runTicket(ticket(), {
-      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 10,
     });
     assert.equal(outcome.kind, "ready_for_review");
     assert.deepEqual(tracker.states, ["review"]);
@@ -155,7 +179,7 @@ test("SDK throws before any outcome is recorded: runTicket rethrows for main() t
   const tracker = fakeTracker();
   try {
     await assert.rejects(
-      runTicket(ticket(), { tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10 }),
+      runTicket(ticket(), { tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 10 }),
       /credit balance/,
     );
     assert.deepEqual(tracker.states, []);
@@ -175,7 +199,7 @@ test("blocked work: an untrusted-authored issue with no trusted directive short-
   });
 
   const outcome = await runTicket(t, {
-    tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+    tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 10,
   });
 
   assert.equal(outcome.kind, "blocked");
@@ -183,29 +207,29 @@ test("blocked work: an untrusted-authored issue with no trusted directive short-
 });
 
 test("repeated runs target the same branch and each republication updates (not duplicates) the review state", async () => {
-  // What "idempotent" means in this repo's actual code today: runTicket doesn't mint a
-  // new branch name per run (branchFor is a pure function of the issue number), and
-  // running it twice doesn't error or diverge state. The PR/MR-level dedup itself (`gh
-  // pr view ... || gh pr create`, plain `git push` reusing an existing MR) happens
-  // inside agent/plugin/skills/github-pr and gitlab-mr -- prose the agent's own shell
-  // commands follow, not code in this repo we can assert against here.
+  // branchFor is a pure function of the issue number, so every run pushes the same branch,
+  // and the publisher reuses the PR already open for it (Tracker#openReview) rather than
+  // opening a second one. See test/publish.test.ts for the push side against real git.
   const t = ticket();
   assert.equal(branchFor(t), `agent/issue-${t.number}`);
+  const forge: Forge = { openPrs: [] };
 
   for (const run of [1, 2]) {
     const mocked = mockAgentTurn([
-      { name: "finish", input: { summary: `run ${run}`, mr_url: "https://example.test/repo/pull/1" } },
+      { name: "finish", input: { summary: `run ${run}` } },
     ]);
     const { runTicket, branchFor: branchForRun } = await importWorker();
-    const tracker = fakeTracker();
+    const tracker = fakeTracker(forge);
 
     const outcome = await runTicket(t, {
-      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 10,
     });
 
     assert.equal(outcome.kind, "ready_for_review");
     assert.deepEqual(tracker.states, ["review"]);
     assert.equal(branchForRun(t), "agent/issue-77");
+    assert.deepEqual(forge.openPrs, ["https://example.test/repo/pull/1"]);
+    assert.match(tracker.comments[0]!, /pull\/1\b/);
     mocked.restore();
   }
 });
@@ -269,13 +293,13 @@ test("turn gauge: every tool result carries [Turn X/Y | Z turns remaining]", asy
   const { mocked, seen } = mockHookedTurns([
     [{ name: "Read", input: { file_path: "/tmp/work/README.md" } }, { name: "Bash", input: { command: "npm test" } }],
     [{ name: "Edit", input: { file_path: "/tmp/work/a.ts" } }],
-    [{ name: "mcp__ticket__finish", input: { summary: "Done.", mr_url: "https://example.test/repo/pull/3" } }],
+    [{ name: "mcp__ticket__finish", input: { summary: "Done." } }],
   ]);
   const { runTicket } = await importWorker();
   const tracker = fakeTracker();
   try {
     const outcome = await runTicket(ticket(), {
-      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 10,
     });
     assert.equal(outcome.kind, "ready_for_review");
     assert.deepEqual(seen.map((s) => s.context), [
@@ -293,21 +317,22 @@ test("interceptor: at 2 turns remaining, edits are denied with checkpoint instru
   const { mocked, seen } = mockHookedTurns([
     [{ name: "Edit", input: { file_path: "/tmp/work/a.ts" } }],
     [{ name: "Edit", input: { file_path: "/tmp/work/b.ts" } }, { name: "Bash", input: { command: "npm test" } }],
-    [{ name: "Bash", input: { command: "git add -A && git commit -m 'gauge done; tests next' && git push -u origin HEAD" } }],
+    [{ name: "Bash", input: { command: "git add -A && git commit -m 'gauge done; tests next'" } }],
     [{ name: "mcp__ticket__checkpoint", input: { summary: "Gauge done.", next_steps: "Write tests." } }],
   ]);
   const { runTicket } = await importWorker();
   const tracker = fakeTracker();
   try {
     const outcome = await runTicket(ticket(), {
-      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 4,
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 4,
     });
     assert.equal(outcome.kind, "checkpoint");
     assert.equal(seen[0]!.denied, undefined); // turn 1 of 4: 3 remaining
     for (const s of seen.slice(1, 3)) {
       assert.match(s.denied ?? "", /Stop editing now/);
       assert.match(s.denied ?? "", /agent\/issue-77/);
-      assert.match(s.denied ?? "", /credential\.helper=.*GH_TOKEN/);
+      assert.match(s.denied ?? "", /don't push, the publisher does that/);
+      assert.doesNotMatch(s.denied ?? "", /GH_TOKEN|credential\.helper/);
       assert.match(s.denied ?? "", /`checkpoint` tool/);
     }
     assert.equal(seen[3]!.denied, undefined);
@@ -326,7 +351,7 @@ test("running out of turns without a checkpoint is an implicit checkpoint, not i
   const tracker = fakeTracker();
   try {
     const outcome = await runTicket(ticket(), {
-      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 1,
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 1,
     });
     assert.equal(outcome.kind, "checkpoint");
     assert.deepEqual(tracker.states, ["blocked"]);
@@ -354,13 +379,6 @@ test("allowedWhenOutOfTurns: only git commands and the ticket tools", async () =
   assert.equal(allowedWhenOutOfTurns("Edit", { file_path: "a.ts" }), false);
   assert.equal(allowedWhenOutOfTurns("Write", {}), false);
 });
-
-test.todo(
-  "invalid patch (submodule / path-escape / credential-file change) is rejected by the publisher, nothing pushed -- " +
-  "there is no privileged publisher or patch-validation step in this repo yet; the agent sandbox pushes and opens " +
-  "the PR/MR itself via plain `git`/`gh` commands (agent/plugin/skills/github-pr, gitlab-mr SKILL.md), with nothing " +
-  "in between checking the diff. See agent-flywheel#26.",
-);
 
 test.todo(
   "attempted cross-repository access is rejected by the allowlist -- there is no repository allowlist in this repo " +

@@ -10,7 +10,7 @@ import { join } from "node:path";
 
 export type Credential = { username: string; token: string };
 
-function git(args: string[], opts: { cwd?: string; env: NodeJS.ProcessEnv }): string {
+export function git(args: string[], opts: { cwd?: string; env: NodeJS.ProcessEnv }): string {
   const res = spawnSync("git", args, { cwd: opts.cwd, env: opts.env, encoding: "utf8" });
   if (res.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${res.stderr || res.stdout || res.error}`);
   return res.stdout.trim();
@@ -18,7 +18,7 @@ function git(args: string[], opts: { cwd?: string; env: NodeJS.ProcessEnv }): st
 
 // A GIT_ASKPASS script answers git's username/password prompts for exactly the subprocess
 // it's set on; it's never written to git config, so it doesn't outlive that one call.
-function withCredential<T>(cred: Credential | undefined, run: (env: NodeJS.ProcessEnv) => T): T {
+export function withCredential<T>(cred: Credential | undefined, run: (env: NodeJS.ProcessEnv) => T): T {
   if (!cred) return run(process.env);
   const dir = mkdtempSync(join(tmpdir(), "agent-askpass-"));
   const script = join(dir, "askpass.sh");

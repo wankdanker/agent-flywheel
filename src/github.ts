@@ -98,5 +98,14 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
       await gh(`/issues/${created.number}/labels`, { method: "POST", body: JSON.stringify({ labels: [OPT_IN_LABEL] }) });
       return { number: created.number, url: created.html_url };
     },
+
+    // Pushing the branch already updated an open PR; only open one if there isn't one yet.
+    async openReview({ branch, base, title, body }) {
+      const owner = o.repo.split("/")[0]!;
+      const open = await gh(`/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`);
+      if (Array.isArray(open) && open.length) return { url: open[0].html_url, created: false };
+      const pr = await gh("/pulls", { method: "POST", body: JSON.stringify({ title, head: branch, base, body }) });
+      return { url: pr.html_url, created: true };
+    },
   };
 }

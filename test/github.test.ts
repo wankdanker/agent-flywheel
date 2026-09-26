@@ -152,6 +152,7 @@ test("github getTicket: follows Link rel=next across 250 comments in chronologic
     workDir: "/tmp",
     pluginDir: "/tmp",
     maxTurns: 1,
+    publisher: { pushBranch: () => { throw new Error("not used"); } },
   });
   assert.match(prompt, /comment 249\b/, "the triggering (newest) comment must reach the prompt");
   assert.ok(prompt.indexOf("comment 0\n") < prompt.indexOf("comment 249"), "thread stays oldest-first");

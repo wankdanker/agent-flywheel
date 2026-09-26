@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyOutcome, buildPrompt, runTicket, trustedDirectives, type WorkerConfig } from "../src/worker.ts";
-import type { Comment, CreatedIssue, Ticket, Tracker } from "../src/tracker.ts";
+import { PublishRejected, type Publisher, type PushResult } from "../src/publish.ts";
+import type { Comment, CreatedIssue, ReviewRequest, Ticket, Tracker } from "../src/tracker.ts";
 
 const comment = (over: Partial<Comment>): Comment => ({
   author: "someone",
@@ -24,12 +25,16 @@ const ticket = (over: Partial<Ticket>): Ticket => ({
   ...over,
 });
 
-function fakeTracker(platform: "github" | "gitlab"): Tracker & { comments: string[]; states: string[]; subIssues: CreatedIssue[] } {
+type FakeTracker = Tracker & { comments: string[]; states: string[]; subIssues: CreatedIssue[]; reviews: ReviewRequest[]; openPr?: string };
+
+function fakeTracker(platform: "github" | "gitlab"): FakeTracker {
   const t: any = {
     platform,
     comments: [],
     states: [],
     subIssues: [],
+    reviews: [],
+    openPr: undefined,
     async repo() {
       return { cloneUrl: "https://example.test/repo.git", webUrl: "https://example.test/repo", defaultBranch: "main" };
     },
@@ -47,11 +52,33 @@ function fakeTracker(platform: "github" | "gitlab"): Tracker & { comments: strin
       t.subIssues.push(created);
       return created;
     },
+    // Like the real adapters: the first call opens one, later calls find it already open.
+    async openReview(req: ReviewRequest) {
+      t.reviews.push(req);
+      if (t.openPr) return { url: t.openPr, created: false };
+      t.openPr = "https://example.test/repo/pull/7";
+      return { url: t.openPr, created: true };
+    },
   };
   return t;
 }
 
-const cfgFor = (tracker: Tracker): WorkerConfig => ({
+// Stands in for src/publish.ts's gitPublisher (exercised against real git in publish.test.ts):
+// records each push, or rejects with `problems`.
+function fakePublisher(problems?: string[]): Publisher & { pushes: number } {
+  const p = {
+    pushes: 0,
+    pushBranch(): PushResult {
+      if (problems) throw new PublishRejected(problems);
+      p.pushes++;
+      return { pushed: true, head: "abc123", commits: 1 };
+    },
+  };
+  return p;
+}
+
+const cfgFor = (tracker: Tracker, publisher: Publisher = fakePublisher()): WorkerConfig => ({
+  publisher,
   tracker,
   repo: { cloneUrl: "https://example.test/repo.git", webUrl: "https://example.test/repo", defaultBranch: "main" },
   workDir: "/work/issue-42",
@@ -170,26 +197,94 @@ test("runTicket short-circuits to blocked when an untrusted author has no truste
 // recorded in memory (no tracker calls of its own — see worker.ts) into the actual forge
 // writes. These exercise it directly, the same way runTicket calls it after query() ends.
 
-test("applyOutcome: ready_for_review comments the summary + review link and sets state to review", async () => {
-  const t = ticket({ number: 42, url: "https://example.test/issues/42" });
+test("applyOutcome: ready_for_review pushes, opens the PR, comments the summary + review link, sets review", async () => {
+  const t = ticket({ number: 42, url: "https://example.test/issues/42", title: "Add pagination" });
   const tracker = fakeTracker("github");
-  const outcome = await applyOutcome(t, cfgFor(tracker), {
+  const publisher = fakePublisher();
+  const outcome = await applyOutcome(t, cfgFor(tracker, publisher), {
     status: "ready_for_review",
     summary: "Implemented pagination and added tests.",
-    mrUrl: "https://example.test/repo/pull/7",
   });
 
   assert.equal(outcome.kind, "ready_for_review");
+  assert.equal(outcome.detail, "https://example.test/repo/pull/7");
+  assert.equal(publisher.pushes, 1);
+  assert.deepEqual(tracker.reviews, [{
+    branch: "agent/issue-42", base: "main", title: "Add pagination", body: "Implemented pagination and added tests.\n\nCloses #42",
+  }]);
   assert.deepEqual(tracker.states, ["review"]);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /Implemented pagination/);
   assert.match(tracker.comments[0]!, /https:\/\/example\.test\/repo\/pull\/7/);
 });
 
-test("applyOutcome: blocked (question) comments the question and sets state to blocked", async () => {
+test("applyOutcome: ready_for_review again (retry/resume) reuses the open PR instead of opening another", async () => {
+  const t = ticket({ number: 42 });
+  const tracker = fakeTracker("github");
+  const publisher = fakePublisher();
+  await applyOutcome(t, cfgFor(tracker, publisher), { status: "ready_for_review", summary: "First pass." });
+  const again = await applyOutcome(t, cfgFor(tracker, publisher), { status: "ready_for_review", summary: "Addressed review." });
+
+  assert.equal(publisher.pushes, 2);
+  assert.equal(again.detail, "https://example.test/repo/pull/7");
+  assert.equal(tracker.reviews.length, 2);
+  assert.deepEqual(tracker.states, ["review", "review"]);
+});
+
+test("applyOutcome: a branch the publisher rejects is reported failed, with no PR and no review label", async () => {
+  const t = ticket({ number: 42 });
+  const tracker = fakeTracker("github");
+  const outcome = await applyOutcome(t, cfgFor(tracker, fakePublisher(["vendor/lib: adds or changes a submodule (gitlink)"])), {
+    status: "ready_for_review",
+    summary: "Done.",
+  });
+
+  assert.equal(outcome.kind, "failed");
+  assert.deepEqual(tracker.reviews, []);
+  assert.deepEqual(tracker.states, ["blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /refused to push branch `agent\/issue-42`/);
+  assert.match(tracker.comments[0]!, /vendor\/lib: adds or changes a submodule/);
+});
+
+test("applyOutcome: a checkpoint pushes the branch but opens no PR", async () => {
+  const t = ticket({ number: 42 });
+  const tracker = fakeTracker("github");
+  const publisher = fakePublisher();
+  const outcome = await applyOutcome(t, cfgFor(tracker, publisher), { status: "checkpoint", summary: "Half done.", nextSteps: "Tests." });
+
+  assert.equal(outcome.kind, "checkpoint");
+  assert.equal(publisher.pushes, 1);
+  assert.deepEqual(tracker.reviews, []);
+  assert.deepEqual(tracker.states, ["blocked"]);
+});
+
+test("applyOutcome: running out of turns (implicit checkpoint) also publishes the branch", async () => {
+  const t = ticket({ number: 42 });
+  const tracker = fakeTracker("github");
+  const publisher = fakePublisher();
+  const outcome = await applyOutcome(t, cfgFor(tracker, publisher), undefined, { maxTurnsHit: true });
+
+  assert.equal(outcome.kind, "checkpoint");
+  assert.equal(publisher.pushes, 1);
+  assert.deepEqual(tracker.states, ["blocked"]);
+});
+
+test("applyOutcome: a push that fails outright (not a rejection) throws a SettlementError, labels nothing", async () => {
+  const t = ticket({ number: 42 });
+  const tracker = fakeTracker("github");
+  const publisher: Publisher = { pushBranch: () => { throw new Error("git push failed: non-fast-forward"); } };
+  await assert.rejects(applyOutcome(t, cfgFor(tracker, publisher), { status: "ready_for_review", summary: "Done." }), (err: Error) =>
+    err.name === "SettlementError" && /non-fast-forward/.test(err.message));
+  assert.deepEqual(tracker.states, []);
+  assert.deepEqual(tracker.reviews, []);
+});
+
+test("applyOutcome: blocked (question) comments the question and sets state to blocked, pushing nothing", async () => {
   const t = ticket({ number: 42, url: "https://example.test/issues/42" });
   const tracker = fakeTracker("github");
-  const outcome = await applyOutcome(t, cfgFor(tracker), {
+  const publisher = fakePublisher();
+  const outcome = await applyOutcome(t, cfgFor(tracker, publisher), {
     status: "blocked",
     question: "Which repo should this change land in?",
   });
@@ -197,6 +292,8 @@ test("applyOutcome: blocked (question) comments the question and sets state to b
   assert.equal(outcome.kind, "blocked");
   assert.deepEqual(tracker.states, ["blocked"]);
   assert.deepEqual(tracker.comments, ["Which repo should this change land in?"]);
+  assert.equal(publisher.pushes, 0);
+  assert.deepEqual(tracker.reviews, []);
 });
 
 test("applyOutcome: split creates a sub-issue per subtask and sets state to blocked", async () => {
