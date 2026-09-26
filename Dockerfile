@@ -20,8 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /opt/agent
 COPY package.json package-lock.json ./
-# Optional deps must stay on: that's where the SDK's native claude binary lives.
-RUN npm ci --omit=dev
+# Optional deps must stay on: that's where the SDK's native claude binary lives. npm installs
+# both the glibc and musl builds (~220 MB each); we're on Debian (glibc), so drop the musl one.
+RUN npm ci --omit=dev && rm -rf node_modules/@anthropic-ai/claude-agent-sdk-linux-*-musl
 COPY src ./src
 COPY bin ./bin
 COPY --chmod=755 entrypoint.sh ./

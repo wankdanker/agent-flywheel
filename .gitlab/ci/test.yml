@@ -1,0 +1,13 @@
+# Typecheck + tests before build-image (build.yml `needs` this): the image we publish is what
+# the next issue runs on, so a red suite must never reach it. Same rules as build-image.
+
+test:
+  stage: build
+  image: node:24   # not -slim: test/clone.test.ts needs git
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "web" && $ISSUE == null
+  script:
+    - npm ci
+    - npm run typecheck
+    - npm test

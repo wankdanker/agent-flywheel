@@ -6,6 +6,7 @@
 
 build-image:
   stage: build
+  needs: [test]   # see test.yml: a red suite must never reach the image issues run on
   image: docker:27
   services: [docker:27-dind]
   rules:

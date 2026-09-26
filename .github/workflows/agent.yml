@@ -28,11 +28,6 @@ permissions:
   pull-requests: write
   packages: read
 
-concurrency:
-  # Never two runs on one issue; a newer event queues behind the running one.
-  group: agent-issue-${{ github.event.issue.number || inputs.issue }}
-  cancel-in-progress: false
-
 jobs:
   work:
     # The author_association allowlist below must stay in sync with
@@ -47,6 +42,13 @@ jobs:
         contains(github.event.issue.labels.*.name, 'agent') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
         !contains(github.event.comment.body, '<!-- agent-flywheel -->'))
+    # Job-level, not workflow-level: only runs that pass the `if` above take a slot, so our
+    # own label changes and comments (skipped runs) can't displace a pending human-triggered
+    # run. GitHub keeps one pending run per group; that's fine, since each run reads the
+    # whole thread, so the latest pending run covers every comment made in the meantime.
+    concurrency:
+      group: agent-issue-${{ github.event.issue.number || inputs.issue }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -55,9 +57,11 @@ jobs:
       # Work dir is cached per issue so a run that dies partway (turn limit, crash) doesn't
       # lose its clone; the next run on that issue resumes from it instead of recloning.
       # A fresh cache key per run, with the issue's latest entry as a restore-key fallback,
-      # keeps it updated even though actions/cache only saves on a key miss.
+      # keeps it updated even though actions/cache only saves on a key miss. Restore and save
+      # are separate steps so the save runs `if: always()`: a failed run is exactly the one
+      # whose work we need to keep.
       - name: Restore work directory cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: agent-work
           key: agent-work-issue-${{ github.event.issue.number || inputs.issue }}-${{ github.run_id }}
@@ -95,3 +99,9 @@ jobs:
           # 10 = asked a question on the issue; not a failure for us.
           if [ "$code" = 10 ]; then echo "::notice::Asked a question on #$ISSUE"; exit 0; fi
           exit "$code"
+      - name: Save work directory cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: agent-work
+          key: agent-work-issue-${{ github.event.issue.number || inputs.issue }}-${{ github.run_id }}

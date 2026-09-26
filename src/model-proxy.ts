@@ -19,6 +19,9 @@ export const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 // CLI's own startup checks require *something* present to pick the x-api-key auth path.
 export const PLACEHOLDER_API_KEY = "sk-ant-agent-flywheel-placeholder-not-a-real-key";
 
+// Required on /v1/messages when authenticating with a Claude Code OAuth token.
+export const OAUTH_BETA = "oauth-2025-04-20";
+
 export type Credential = { header: "x-api-key"; value: string } | { header: "authorization"; value: string };
 
 // Whichever real credential the trusted process was handed, read once at startup.
@@ -75,7 +78,11 @@ export function startModelProxy(
   limits: ModelProxyLimits = {},
   opts: ModelProxyOptions = {},
 ): Promise<ModelProxy> {
-  const { maxRequests, maxLifetimeMs, requestTimeoutMs } = { ...DEFAULT_LIMITS, ...limits };
+  // Per field, not a spread: bin/run-ticket.ts passes `undefined` for unset env vars, and a
+  // spread would let that undefined overwrite the default (setTimeout(undefined) then throws).
+  const maxRequests = limits.maxRequests ?? DEFAULT_LIMITS.maxRequests;
+  const maxLifetimeMs = limits.maxLifetimeMs ?? DEFAULT_LIMITS.maxLifetimeMs;
+  const requestTimeoutMs = limits.requestTimeoutMs ?? DEFAULT_LIMITS.requestTimeoutMs;
   const upstream = new URL(opts.upstream ?? DEFAULT_UPSTREAM);
   const forward = upstream.protocol === "https:" ? httpsRequest : httpRequest;
   const deadline = Date.now() + maxLifetimeMs;
@@ -93,6 +100,12 @@ export function startModelProxy(
     count++;
 
     const headers = { ...stripAuthHeaders(req.headers), [credential.header]: credential.value, host: upstream.host };
+    // The sandboxed CLI only ever sees a placeholder API key, so it never adds the beta flag
+    // the API requires for OAuth bearer tokens; we add it when the real credential is one.
+    if (credential.header === "authorization") {
+      const beta = [headers["anthropic-beta"]].flat().filter(Boolean).join(",");
+      if (!beta.includes(OAUTH_BETA)) headers["anthropic-beta"] = beta ? `${beta},${OAUTH_BETA}` : OAUTH_BETA;
+    }
     const upstreamReq = forward(
       {
         protocol: upstream.protocol,
