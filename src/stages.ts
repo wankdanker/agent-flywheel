@@ -17,12 +17,14 @@ import { join } from "node:path";
 import { isAllowedRepo } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo } from "./clone.ts";
+import type { Trigger } from "./dispatch.ts";
 import { clearOutcome, HandoffError, readOutcome, readPrepared, resetHandoff, writeOutcome, writePrepared } from "./handoff.ts";
 import { FORGE_TOKEN_VARS, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import { gitPublisher } from "./publish.ts";
 import {
-  ConfigError, configExit, credentialFor, DEFAULT_PLUGIN_DIR, detectTracker, EXIT_CODES, fetchAllowedTicket, guarded,
-  guardTracker, parseMaxTurns, publishAfterCrash, requireModelCredential, settleIncomplete, startProxyFromEnv, workDirFor, type RunDeps,
+  ConfigError, configExit, credentialFor, DEFAULT_PLUGIN_DIR, detectTracker, EXIT_CODES, EXIT_SKIPPED, fetchAllowedTicket, guarded,
+  guardTracker, parseMaxTurns, parseTrigger, publishAfterCrash, requireModelCredential, settleIncomplete, startProxyFromEnv, triggerStillApplies,
+  workDirFor, type RunDeps,
 } from "./run.ts";
 import { STATE_LABELS, type Tracker } from "./tracker.ts";
 import {
@@ -78,9 +80,10 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
   const prepareRepo = deps.prepareRepo ?? realPrepareRepo;
   const originUrl = deps.originUrl ?? realOriginUrl;
 
-  let tracker: Tracker;
+  let tracker: Tracker, trigger: Trigger | undefined;
   try {
     refuseModelCredential(env, "prepare");
+    trigger = parseTrigger(env);
     tracker = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
@@ -88,6 +91,8 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
   const allowed = await fetchAllowedTicket(tracker, env);
   if (!allowed) return 2;
   const { ticket, repo, allowlist } = allowed;
+  // Before `working`: a skipped run leaves the issue exactly as it was.
+  if (!triggerStillApplies(ticket, trigger, env)) return EXIT_SKIPPED;
   const guard = guardTracker(tracker, ticket);
 
   // Success leaves the issue on `working` for the publish stage to settle; a failure here
