@@ -46,7 +46,7 @@ const CREDENTIAL_FILE = [
   /^\.pgpass$/i,
   /^id_(rsa|dsa|ecdsa|ed25519)$/i,
   /\.(pem|key|p12|pfx|keystore|jks)$/i,
-  /^\.env(\.(?!example$|sample$|template$|dist$)[^.]+)?$/i,
+  /^\.env(\.(?!(example|sample|template|dist)$).+)?$/i,
   /^credentials(\.json)?$/i,
 ];
 

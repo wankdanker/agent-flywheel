@@ -182,6 +182,7 @@ test("checkChange: path escapes and .git entries, even ones git itself wouldn't 
   assert.equal(checkChange(c(".gitignore"), none), undefined);
   assert.equal(checkChange(c("src/keys.ts"), none), undefined);
   assert.equal(checkChange(c(".env.example"), none), undefined);
+  assert.match(checkChange(c("config/.env.production.local"), none)!, /credential/);
   // Deleting a credential file is fine; touching a submodule is not, in either direction.
   assert.equal(checkChange(c(".env", { status: "D", newMode: "000000" }), none), undefined);
   assert.match(checkChange(c("vendor/lib", { status: "D", oldMode: "160000", newMode: "000000" }), none)!, /submodule/);
