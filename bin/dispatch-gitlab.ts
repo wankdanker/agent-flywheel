@@ -1,5 +1,6 @@
 // CLI: turn a GitLab webhook (TRIGGER_PAYLOAD) or a manual run (ISSUE) into a
-// child-pipeline YAML with at most one job, which works that issue.
+// child-pipeline YAML with at most one job, which works that issue (by triggering
+// .gitlab/agent-stages.yml's three stage jobs).
 // Runs on stock node with no npm install, so it (and what it imports) stays dependency-free.
 import { readFileSync } from "node:fs";
 import { BOT_MARKER, OPT_IN_LABEL, need } from "../src/tracker.ts";
@@ -45,22 +46,18 @@ const iid = process.env.ISSUE
 const image = process.env.AGENT_IMAGE || `${need("CI_REGISTRY_IMAGE")}:latest`;
 console.error(iid ? `[dispatch] issue #${iid} on ${image}` : "[dispatch] event not actionable");
 
-// GitLab rejects an empty child pipeline, so we always emit exactly one job.
+// GitLab rejects an empty child pipeline, so we always emit exactly one job. For an actionable
+// issue that job triggers .gitlab/agent-stages.yml: the prepare/agent/publish jobs that keep the
+// forge token and the model credential in separate containers (see src/stages.ts). It holds the
+// per-issue resource_group until that whole pipeline is done (`strategy: depend`), so two runs
+// on one issue never overlap, and its status is that pipeline's.
 console.log(iid ? `
 agent-issue-${iid}:
-  image: { name: ${JSON.stringify(image)}, entrypoint: [""] }
-  variables: { ISSUE: "${iid}", GIT_STRATEGY: none, WORK_DIR: "$CI_PROJECT_DIR/work" }
+  variables: { ISSUE: "${iid}", AGENT_IMAGE: ${JSON.stringify(image)} }
   resource_group: agent-issue-${iid}   # never two runs on one issue
-  timeout: 2h
-  # Cached per issue so a run that dies partway (turn limit, crash) doesn't lose its
-  # clone; the next run on that issue resumes from it. "when: always" saves it even
-  # when the job fails, which is the case that most needs resuming.
-  cache:
-    key: agent-work-issue-${iid}
-    paths: [work]
-    when: always
-  script: [/opt/agent/entrypoint.sh]
-  allow_failure: { exit_codes: [10, 20] }   # 10 = asked a question, 20 = checkpointed; not failures for us
+  trigger:
+    include: [{ local: .gitlab/agent-stages.yml }]
+    strategy: depend
 ` : `
 nothing-to-do:
   image: alpine

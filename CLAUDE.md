@@ -58,8 +58,29 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - The agent never pushes: `sandboxEnv` strips the forge tokens (`FORGE_TOKEN_VARS`) as well as
     the model credential, and the `github-pr`/`gitlab-mr` skills only tell it to commit. `main()`
     builds a `gitPublisher` (`src/publish.ts`, a `RunDeps` seam) with the scoped credential and
-    passes it in `WorkerConfig.publisher`; see `applyOutcome` below. Full process isolation of
-    the publisher is the CI-split work (#22).
+    passes it in `WorkerConfig.publisher`; see `applyOutcome` below.
+  - `main()` is the combined single-container mode (local `docker run`). CI instead runs
+    `--stage prepare|agent|publish` as three jobs; see `src/stages.ts` below.
+- `src/stages.ts` splits `main()` into three stage entrypoints (`bin/run-ticket.ts --stage …`,
+  `entrypoint.sh` passes the args through) that reuse `run.ts`'s helpers (`fetchAllowedTicket`,
+  `guardTracker`, `guarded`, `settleIncomplete`, …), so no CI job holds both the forge token and
+  the model credential (README's "Credential separation"):
+  - `prepareStage` (forge token; exits 2 on a model credential): fetch + allowlist, set
+    `working`, `prepareRepo`, write `prepared.json`. Success leaves the issue on `working`.
+  - `agentStage` (model credential; exits 2 if `forgeCredentialLeaks` finds a forge token in
+    env, credential files or any git config scope): `runSession` (`src/worker.ts`, the session
+    half of `runTicket` without the tracker writes) and write `outcome.json`. No tracker at all.
+  - `publishStage` (forge token; exits 2 on a model credential): re-fetch the issue, no-op
+    unless it's still `working`, `readOutcome`, then `applyOutcome` with the publisher.
+  `src/handoff.ts` reads/writes those files in `<workDir>.handoff/`. `outcome.json` is
+  agent-writable, so it's read with `O_NOFOLLOW`, size-capped, and parsed with a strict zod schema
+  with length caps; nothing in it picks a URL, branch or repo. `test/stages.test.ts` drives the
+  three stages end to end; `test/ci-config.test.ts` checks the CI files hand each job's container
+  only its own credential.
+- `src/clone.ts`'s `prepareRepo` runs git with the token in a work dir the agent may have
+  written, so on resume `distrustGitDir` first replaces `.git/config` and removes hooks,
+  alternates and similar (or reclones if `.git` isn't a plain dir). Don't run credentialed git
+  in the work dir before that.
 - `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent. `toComment` only honors `BOT_MARKER` when the poster is independently trusted (or a GitHub `Bot`-type account) — the marker text alone, e.g. pasted by an attacker, is not enough.
 - `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`. Both attach a `Trust` to the issue (from its author) and to every comment (from that comment's author) when building a `Ticket`.
@@ -101,9 +122,9 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   `upstream ?? DEFAULT_UPSTREAM` so tests can point it at a fake server instead of the real
   API.
 - CI on each platform:
-  - **GitHub:** `.github/workflows/agent.yml` gates on the label and the commenter's association, then `docker run`s the image on a plain runner. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work` (separate `restore`/`save` steps, the save `if: always()` so a failed run still keeps its work; the job sets `cache-mode: write`, since GitHub otherwise makes the cache read-only for issue/comment-triggered runs); its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid. The per-issue `concurrency` group is on the job, not the workflow, so skipped runs (our own label/comment events) never displace a pending real one.
+  - **GitHub:** `.github/workflows/agent.yml` gates the `prepare` job on the label and the commenter's association, then runs `prepare` → `agent` → `publish` (plus `unstick` on failure/cancel), each `docker run`ning the image (pinned by digest in `prepare`) with `--stage` on a plain runner and only its own secret. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work`, handed from job to job under a per-run/attempt/stage key (the agent job's save is `if: always()` so a failed run still keeps its work; the jobs set `cache-mode: write`, since GitHub otherwise makes the cache read-only for issue/comment-triggered runs); its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid. The per-issue `concurrency` group is workflow-level (so it spans all three jobs), but its expression repeats the `prepare` job's `if`, and events that fail it get a per-run group, so skipped runs (our own label/comment events) never displace a pending real one.
   - **Image builds** (`.github/workflows/build.yml`: `test` → `image` → `smoke` → `latest`; `.gitlab/ci/build.yml`: `build-image` → `smoke-image`): a default-branch build pushes `:sha-<short>` only, smoke-tests it with `docker run … --smoke`, and only then tags `:latest`. The smoke container gets the model secret and optional vars as `-e VAR` (so an unset one arrives as `""`, same as in `agent.yml`), and never a forge token. On GitLab that's why it's `docker run` on dind, not `image:`, since a job's env holds every project variable.
-  - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline that runs the image, with a native GitLab `cache:` (`when: always`, so a failed run still saves) on `WORK_DIR`.
+  - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline with one trigger job (holding the per-issue `resource_group`, `strategy: depend`) that runs `.gitlab/agent-stages.yml` (outside `.gitlab/ci/`, so not included by `.gitlab-ci.yml`): `agent-prepare` → `agent-agent` → `agent-publish`, each `docker run`ning the image on dind with only its stage's `-e VAR`s, the work dir tarred in on stdin and `docker cp`'d out, carried between jobs as artifacts, and saved to a native GitLab `cache:` (`when: always`) by the agent job.
 
   Keep `bin/dispatch-gitlab.ts` and `src/tracker.ts` free of npm dependencies.
 - `.gitlab-ci.yml` only declares stages and includes `.gitlab/ci/*.yml`. Put new GitLab jobs in their own file there.

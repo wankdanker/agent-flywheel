@@ -1,0 +1,114 @@
+# One issue run, as three jobs that never give the same container both the forge token and the
+# model credential (see src/stages.ts and README "Credential separation"):
+#   prepare  AGENT_GITLAB_TOKEN only: fetch the issue, set agent/working, clone/check out the branch
+#   agent    model key only:          run the agent on that work dir, record its outcome in a file
+#   publish  AGENT_GITLAB_TOKEN only: validate the outcome and the branch as data, push, open the MR, label
+# Triggered by the one job bin/dispatch-gitlab.ts emits, with ISSUE and AGENT_IMAGE set; that
+# trigger job holds the per-issue resource_group until this whole pipeline is done.
+#
+# Every job runs the image with `docker run` on dind rather than as its `image:`: a job's own env
+# holds every project CI/CD variable (both secrets included), so the container gets only the
+# `-e VAR`s listed for its stage. The work dir goes in as a tar on stdin (extracted by the image's
+# own user) and comes back out with `docker cp`; between jobs it travels as an artifact.
+# This file isn't under .gitlab/ci/, so .gitlab-ci.yml's include doesn't pick it up.
+
+stages: [prepare, agent, publish]
+
+variables:
+  GIT_STRATEGY: none
+
+.stage:
+  image: docker:27
+  services: [docker:27-dind]
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    # Pinned by digest in the prepare job and handed on (dotenv), so all three jobs run the
+    # same image even if :latest moves mid-run.
+    - export AGENT_IMAGE="${AGENT_IMAGE_PINNED:-$AGENT_IMAGE}"
+    - docker pull "$AGENT_IMAGE"
+    - mkdir -p work
+    # run_stage <stage> <docker run options...>: the work dir in on stdin, the stage's exit
+    # code in $code, the container left behind as agent-<stage> for `docker cp`.
+    - |
+      run_stage() {
+        stage="$1"; shift
+        set +e
+        tar -C work -cf - . | docker run -i --name "agent-$stage" -e ISSUE "$@" --entrypoint sh "$AGENT_IMAGE" \
+          -c 'tar -xf - -C /work && exec /opt/agent/entrypoint.sh "$@"' sh --stage "$stage"
+        code=$?
+        set -e
+      }
+      copy_out() {
+        rm -rf work && mkdir work && docker cp "agent-$1:/work/." work/
+      }
+
+agent-prepare:
+  extends: .stage
+  stage: prepare
+  timeout: 20m
+  # Resume a work dir the last run on this issue left behind (the agent job saves it).
+  cache:
+    key: agent-work-issue-$ISSUE
+    paths: [work]
+    policy: pull
+  script:
+    - echo "AGENT_IMAGE_PINNED=$(docker inspect --format '{{index .RepoDigests 0}}' "$AGENT_IMAGE" 2>/dev/null || echo "$AGENT_IMAGE")" > image.env
+    - |
+      run_stage prepare -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST \
+        -e CI_API_V4_URL -e CI_SERVER_HOST -e CI_PROJECT_ID -e CI_PROJECT_PATH
+      copy_out prepare || [ "$code" != 0 ]
+      exit "$code"
+  # 10 = blocked before the agent started (an untrusted issue awaiting a maintainer's go-ahead).
+  # The stage cleared the handoff before exiting, so the agent and publish jobs that still run
+  # after an allowed failure find nothing prepared and do nothing.
+  allow_failure: { exit_codes: [10] }
+  artifacts:
+    when: always
+    paths: [work]
+    reports: { dotenv: image.env }
+    expire_in: 1 day
+
+agent-agent:
+  extends: .stage
+  stage: agent
+  timeout: 2h
+  dependencies: [agent-prepare]
+  # Saved even when the job fails, which is the case that most needs resuming. Push only: the
+  # prepared work dir comes from the artifact.
+  cache:
+    key: agent-work-issue-$ISSUE
+    paths: [work]
+    policy: push
+    when: always
+  script:
+    - echo "AGENT_IMAGE_PINNED=$AGENT_IMAGE" > image.env
+    # No AGENT_GITLAB_TOKEN, no CI_JOB_TOKEN: the agent runs Bash with permissions bypassed.
+    # `--stage agent` also refuses to start if a forge credential reaches it.
+    - |
+      run_stage agent -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS \
+        -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS
+      copy_out agent || [ "$code" != 0 ]
+      exit "$code"
+  artifacts:
+    when: always
+    paths: [work]
+    reports: { dotenv: image.env }
+    expire_in: 1 day
+
+agent-publish:
+  extends: .stage
+  stage: publish
+  timeout: 20m
+  # Also after a failed agent job: with no recorded outcome to apply, the publish stage still
+  # takes the issue off agent/working (blocked, with a comment pointing at the logs). And a
+  # no-op when the issue isn't agent/working (prepare already settled it).
+  when: always
+  dependencies: [agent-agent]
+  script:
+    # The work dir (the agent's commits and its outcome.json) is only read as data: see
+    # src/handoff.ts and src/publish.ts.
+    - |
+      run_stage publish -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e MAX_TURNS \
+        -e CI_API_V4_URL -e CI_SERVER_HOST -e CI_PROJECT_ID -e CI_PROJECT_PATH
+      exit "$code"
+  allow_failure: { exit_codes: [10, 20] }   # 10 = asked a question, 20 = checkpointed; not failures for us

@@ -4,7 +4,7 @@
 // once this returns — see allowlist.ts for what "allowed" means, enforced by the caller
 // before this runs at all.
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -53,7 +53,7 @@ export function prepareRepo(o: {
   defaultBranch: string;
   credential?: Credential;
 }) {
-  const resuming = existsSync(join(o.workDir, ".git"));
+  const resuming = existsSync(o.workDir) && distrustGitDir(o.workDir, o.cloneUrl);
   withCredential(o.credential, (env) => {
     if (!resuming) {
       git(["clone", o.cloneUrl, o.workDir], { env });
@@ -66,4 +66,29 @@ export function prepareRepo(o: {
     git(["update-ref", `refs/remotes/origin/${baseBranch}`, "FETCH_HEAD"], { cwd: o.workDir, env });
     git(["checkout", "-B", o.branch, "FETCH_HEAD"], { cwd: o.workDir, env });
   });
+}
+
+// A cached work dir was last written by the agent (Bash, permissions bypassed), and the git
+// calls above run in it with the forge token in their env. So before any of them, everything in
+// `.git` that can run a command or redirect where git connects (config: credential helpers,
+// fsmonitor, proxies, the remote's URL, includes; hooks; a gitdir/commondir pointer; object
+// alternates) is replaced with a config of our own. The objects, refs and working tree stay:
+// they're data to git. False (having removed the work dir, to be recloned) if there's no `.git`
+// or it isn't a plain directory.
+export function distrustGitDir(workDir: string, cloneUrl: string): boolean {
+  const dotGit = join(workDir, ".git");
+  if (!lstatSync(dotGit, { throwIfNoEntry: false })?.isDirectory()) {
+    rmSync(workDir, { recursive: true, force: true });
+    return false;
+  }
+  for (const f of ["config", "config.worktree", "hooks", "commondir", "info/attributes", "objects/info/alternates", "objects/info/http-alternates"]) {
+    rmSync(join(dotGit, f), { recursive: true, force: true });
+  }
+  writeFileSync(
+    join(dotGit, "config"),
+    `[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n` +
+      `[remote "origin"]\n\turl = ${JSON.stringify(cloneUrl)}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n`,
+    { flag: "wx" },
+  );
+  return true;
 }

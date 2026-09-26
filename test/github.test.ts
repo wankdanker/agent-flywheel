@@ -146,14 +146,7 @@ test("github getTicket: follows Link rel=next across 250 comments in chronologic
   assert.deepEqual(ticket.comments.map((c) => c.text), all.map((c) => c.body));
   assert.equal(ticket.comments.at(-1)!.text, "comment 249", "the newest comment must be present");
 
-  const prompt = buildPrompt(ticket, {
-    tracker,
-    repo: { cloneUrl: "", webUrl: "", defaultBranch: "main" },
-    workDir: "/tmp",
-    pluginDir: "/tmp",
-    maxTurns: 1,
-    publisher: { pushBranch: () => { throw new Error("not used"); } },
-  });
+  const prompt = buildPrompt(ticket, { platform: tracker.platform, repo: { cloneUrl: "", webUrl: "", defaultBranch: "main" } });
   assert.match(prompt, /comment 249\b/, "the triggering (newest) comment must reach the prompt");
   assert.ok(prompt.indexOf("comment 0\n") < prompt.indexOf("comment 249"), "thread stays oldest-first");
 });

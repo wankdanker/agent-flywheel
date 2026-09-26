@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { originUrl, prepareRepo } from "../src/clone.ts";
@@ -68,6 +68,55 @@ test("prepareRepo resumes a cached work dir on the branch a previous run already
 
     prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
 
+    assert.equal(git(["branch", "--show-current"], workDir), "agent/issue-1");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The cached work dir was last written by the agent, and resuming it runs git with the token in
+// its env: nothing the agent left in .git may get to run, or to redirect where git connects.
+test("prepareRepo resumes a hostile cached work dir without running its config or hooks", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-flywheel-clone-test-"));
+  try {
+    const cloneUrl = makeOrigin(root);
+    const workDir = join(root, "work");
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
+
+    const pwned = join(root, "pwned");
+    const evil = join(root, "evil.sh");
+    writeFileSync(evil, `#!/bin/sh\nenv > ${pwned}\n`);
+    chmodSync(evil, 0o755);
+    git(["config", "credential.helper", `!${evil}`], workDir);
+    git(["config", "core.fsmonitor", evil], workDir);
+    git(["config", "remote.origin.url", join(root, "elsewhere.git")], workDir);
+    writeFileSync(join(workDir, ".git", "hooks", "post-checkout"), `#!/bin/sh\n${evil}\n`);
+    chmodSync(join(workDir, ".git", "hooks", "post-checkout"), 0o755);
+    writeFileSync(join(workDir, "notes.txt"), "uncommitted work\n");
+
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main", credential: { username: "x", token: TOKEN } });
+
+    assert.ok(!existsSync(pwned), "something the agent planted in .git ran");
+    assert.equal(originUrl(workDir), cloneUrl);
+    assert.equal(git(["branch", "--show-current"], workDir), "agent/issue-1");
+    assert.ok(existsSync(join(workDir, "notes.txt")), "the working tree should survive");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prepareRepo reclones when the cached .git isn't a plain directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-flywheel-clone-test-"));
+  try {
+    const cloneUrl = makeOrigin(root);
+    const workDir = join(root, "work");
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
+    rmSync(join(workDir, ".git"), { recursive: true });
+    symlinkSync(join(root, "origin.git"), join(workDir, ".git"));
+
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
+
+    assert.equal(git(["rev-parse", "--is-bare-repository"], workDir), "false");
     assert.equal(git(["branch", "--show-current"], workDir), "agent/issue-1");
   } finally {
     rmSync(root, { recursive: true, force: true });
