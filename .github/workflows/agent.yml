@@ -103,6 +103,8 @@ jobs:
           code=$?
           # 10 = asked a question on the issue; not a failure for us.
           if [ "$code" = 10 ]; then echo "::notice::Asked a question on #$ISSUE"; exit 0; fi
+          # 20 = paused at a checkpoint before the turn limit, work pushed; also not a failure.
+          if [ "$code" = 20 ]; then echo "::notice::Checkpointed #$ISSUE; reply on the issue to continue"; exit 0; fi
           exit "$code"
       # src/run.ts already leaves a terminal label on every failure it can catch. This covers
       # what it can't: the container killed by the job timeout or a cancel before it could

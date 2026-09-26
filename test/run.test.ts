@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { main, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
 import type { Comment, Ticket, TicketState, Tracker } from "../src/tracker.ts";
-import { applyOutcome, type AgentOutcome, type Outcome, type WorkerConfig } from "../src/worker.ts";
+import { applyOutcome, type AgentOutcome, type Outcome, type SessionEnd, type WorkerConfig } from "../src/worker.ts";
 
 const CLONE_URL = "https://github.com/acme/widgets.git";
 
@@ -55,9 +55,9 @@ function fakeTracker(fail: Fail = {}, comments: Comment[] = []) {
 }
 
 // A fake agent engine: records `recorded` (as if the model called that tool), or throws.
-const engine = (behavior: AgentOutcome | undefined | Error) => async (t: Ticket, cfg: WorkerConfig): Promise<Outcome> => {
+const engine = (behavior: AgentOutcome | undefined | Error, end?: SessionEnd) => async (t: Ticket, cfg: WorkerConfig): Promise<Outcome> => {
   if (behavior instanceof Error) throw behavior;
-  return applyOutcome(t, cfg, behavior);
+  return applyOutcome(t, cfg, behavior, end);
 };
 
 const env = {
@@ -129,13 +129,33 @@ test("report_failure: one explanation, blocked, exit 1", async () => {
   assert.deepEqual(tracker.comments, ["Can't be done."]);
 });
 
-test("turn limit (no outcome recorded): one blocked message, exit 1", async () => {
+test("agent stopped with no outcome recorded (not the turn limit): one blocked message, exit 1", async () => {
   const tracker = fakeTracker();
   const { result } = await quietly(() => main(deps(tracker, engine(undefined))));
   assert.equal(result, 1);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
   assert.equal(tracker.comments.length, 1);
-  assert.match(tracker.comments[0]!, /turn limit/);
+  assert.match(tracker.comments[0]!, /stopped before finishing/);
+});
+
+test("checkpoint recorded: done/next comment, blocked, exit 20", async () => {
+  const tracker = fakeTracker();
+  const { result } = await quietly(() =>
+    main(deps(tracker, engine({ status: "checkpoint", summary: "Added the gauge.", nextSteps: "Write the tests." }))));
+  assert.equal(result, 20);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /Added the gauge\.[\s\S]*Write the tests\./);
+  assert.match(tracker.comments[0]!, /agent\/issue-7/);
+});
+
+test("ran out of turns with no outcome recorded: implicit checkpoint, exit 20 rather than a crash", async () => {
+  const tracker = fakeTracker();
+  const { result } = await quietly(() => main(deps(tracker, engine(undefined, { maxTurnsHit: true }))));
+  assert.equal(result, 20);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /used all \d+ turns/);
 });
 
 test("model API exception: working -> blocked, one sanitized comment, exit 1, full error in the log", async () => {

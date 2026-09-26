@@ -60,7 +60,7 @@ agent-issue-${iid}:
     paths: [work]
     when: always
   script: [/opt/agent/entrypoint.sh]
-  allow_failure: { exit_codes: [10] }   # 10 = asked a question; not a failure for us
+  allow_failure: { exit_codes: [10, 20] }   # 10 = asked a question, 20 = checkpointed; not failures for us
 ` : `
 nothing-to-do:
   image: alpine
