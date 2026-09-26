@@ -52,10 +52,13 @@ export function forgeCredentialLeaks(env: NodeJS.ProcessEnv, workDir: string, ho
     encoding: "utf8",
   });
   for (const line of (res.stdout ?? "").split("\n").filter(Boolean)) {
-    const [scope, key = "", ...rest] = line.split(" ");
+    const [scope, entry = ""] = line.split("\t");
+    const [key = "", ...rest] = entry.split(" ");
     const value = rest.join(" ");
     const userinfo = /\/\/[^/@\s]*:[^/@\s]+@/.test(value) || /\/\/[^/@\s]*:[^/@\s]+@/.test(key);
-    if (/^credential\./i.test(key) || /extraheader$/i.test(key) || userinfo) leaks.push(`git config (${scope}) ${key}`);
+    if (/^credential\./i.test(key) || /extraheader$/i.test(key) || userinfo) {
+      leaks.push(`git config (${scope}) ${key.replace(/\/\/[^/@\s]*@/g, "//[redacted]@")}`);
+    }
   }
   return leaks;
 }
