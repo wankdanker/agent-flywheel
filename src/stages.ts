@@ -16,15 +16,18 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isAllowedRepo } from "./allowlist.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo } from "./clone.ts";
-import { clearOutcome, readOutcome, readPrepared, resetHandoff, writeOutcome, writePrepared } from "./handoff.ts";
+import { clearOutcome, HandoffError, readOutcome, readPrepared, resetHandoff, writeOutcome, writePrepared } from "./handoff.ts";
 import { FORGE_TOKEN_VARS, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import { gitPublisher } from "./publish.ts";
 import {
   ConfigError, configExit, credentialFor, DEFAULT_PLUGIN_DIR, detectTracker, EXIT_CODES, fetchAllowedTicket, guarded,
-  guardTracker, parseMaxTurns, requireModelCredential, settleIncomplete, startProxyFromEnv, workDirFor, type RunDeps,
+  guardTracker, parseMaxTurns, publishAfterCrash, requireModelCredential, settleIncomplete, startProxyFromEnv, workDirFor, type RunDeps,
 } from "./run.ts";
 import { STATE_LABELS, type Tracker } from "./tracker.ts";
-import { applyOutcome, blockForDirective, branchFor, needsDirective, runSession as realRunSession, type AgentOutcome, type SessionEnd } from "./worker.ts";
+import {
+  applyOutcome, blockForDirective, branchFor, needsDirective, runSession as realRunSession, type AgentOutcome, type Outcome, type SessionEnd,
+  type WorkerConfig,
+} from "./worker.ts";
 
 export const STAGES = ["prepare", "agent", "publish"] as const;
 export type Stage = (typeof STAGES)[number];
@@ -187,16 +190,25 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
 
   return guarded(guard, ticket, env, async () => {
     const workDir = workDirFor(env, ticket.number);
-    const handed = readOutcome(workDir, ticket.number);
     const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: repo.defaultBranch };
-    let outcome = await applyOutcome(ticket, {
+    const cfg: WorkerConfig = {
       tracker: guard.tracker,
       repo,
       workDir,
       pluginDir: env.PLUGIN_DIR ?? DEFAULT_PLUGIN_DIR,
       maxTurns,
       publisher: createPublisher({ ...target, credential: credentialFor(tracker.platform, env) }),
-    }, handed.recorded ?? undefined, { maxTurnsHit: handed.maxTurnsHit });
+    };
+    let outcome: Outcome;
+    try {
+      const handed = readOutcome(workDir, ticket.number);
+      outcome = await applyOutcome(ticket, cfg, handed.recorded ?? undefined, { maxTurnsHit: handed.maxTurnsHit });
+    } catch (err) {
+      // No (usable) outcome.json: the agent stage crashed, or was killed. If the work dir made it
+      // here, publish what the agent committed anyway, same as the combined run does.
+      if (!(err instanceof HandoffError) || !existsSync(join(workDir, ".git"))) throw err;
+      outcome = await publishAfterCrash(ticket, cfg, err, env);
+    }
     outcome = await settleIncomplete(outcome, guard.tracker, ticket);
     console.log(`[outcome] ${outcome.kind}: ${outcome.detail}`);
     return EXIT_CODES[outcome.kind];

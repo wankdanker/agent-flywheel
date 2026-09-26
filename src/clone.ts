@@ -59,13 +59,38 @@ export function prepareRepo(o: {
       git(["clone", o.cloneUrl, o.workDir], { env });
     }
     // Continue the issue's branch if an earlier run already pushed it; otherwise start it
-    // fresh off the default branch rather than whatever HEAD the cache happened to leave.
+    // fresh off the default branch rather than whatever HEAD the cache happened to leave,
+    // unless the cached branch is ahead of that (see resumePoint).
     const remoteBranch = git(["ls-remote", "--heads", "origin", o.branch], { cwd: o.workDir, env });
     const baseBranch = remoteBranch ? o.branch : o.defaultBranch;
     git(["fetch", "origin", `refs/heads/${baseBranch}`], { cwd: o.workDir, env });
     git(["update-ref", `refs/remotes/origin/${baseBranch}`, "FETCH_HEAD"], { cwd: o.workDir, env });
-    git(["checkout", "-B", o.branch, "FETCH_HEAD"], { cwd: o.workDir, env });
+    const base = git(["rev-parse", "FETCH_HEAD"], { cwd: o.workDir, env });
+    const start = resuming ? resumePoint(o.workDir, o.branch, `origin/${baseBranch}`, base, env) : base;
+    git(["checkout", "-B", o.branch, start], { cwd: o.workDir, env });
   });
+}
+
+// A cached local branch that's ahead of `base` holds commits a crashed run never got to push:
+// keep them (the publisher still validates every one before anything is pushed). One that's
+// behind or has diverged is reset to `base`, as is a cache with no such branch at all.
+function resumePoint(workDir: string, branch: string, baseName: string, base: string, env: NodeJS.ProcessEnv): string {
+  let local: string;
+  try {
+    local = git(["rev-parse", "-q", "--verify", `refs/heads/${branch}^{commit}`], { cwd: workDir, env });
+  } catch {
+    return base;
+  }
+  if (local === base) return base;
+  const ahead = spawnSync("git", ["merge-base", "--is-ancestor", base, local], { cwd: workDir, env }).status === 0;
+  if (ahead) {
+    const count = git(["rev-list", "--count", `${base}..${local}`], { cwd: workDir, env });
+    console.log(`[clone] keeping ${count} unpushed commit(s) on the cached ${branch} (ahead of ${baseName})`);
+    return local;
+  }
+  const behind = spawnSync("git", ["merge-base", "--is-ancestor", local, base], { cwd: workDir, env }).status === 0;
+  console.log(`[clone] resetting the cached ${branch} (${local.slice(0, 12)}) to ${baseName}: it ${behind ? "is behind" : "has diverged from"} it`);
+  return base;
 }
 
 // A cached work dir was last written by the agent (Bash, permissions bypassed), and the git

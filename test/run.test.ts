@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
+import { PublishRejected } from "../src/publish.ts";
 import { main, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
 import type { Comment, Ticket, TicketState, Tracker } from "../src/tracker.ts";
 import { applyOutcome, type AgentOutcome, type Outcome, type SessionEnd, type WorkerConfig } from "../src/worker.ts";
@@ -71,6 +72,9 @@ const env = {
   MAX_TURNS: "10",
 };
 
+// A publisher for a branch with nothing committed over the base: a crash there has nothing to save.
+const nothingCommitted: Partial<RunDeps> = { publisher: () => ({ pushBranch: () => ({ pushed: false, head: "base000", commits: 0 }) }) };
+
 let proxyClosed = 0;
 function deps(tracker: Tracker, runTicket: RunDeps["runTicket"], over: Partial<RunDeps> = {}): RunDeps {
   return {
@@ -135,7 +139,7 @@ test("report_failure: one explanation, blocked, exit 1", async () => {
 
 test("agent stopped with no outcome recorded (not the turn limit): one blocked message, exit 1", async () => {
   const tracker = fakeTracker();
-  const { result } = await quietly(() => main(deps(tracker, engine(undefined))));
+  const { result } = await quietly(() => main(deps(tracker, engine(undefined), nothingCommitted)));
   assert.equal(result, 1);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
   assert.equal(tracker.comments.length, 1);
@@ -168,7 +172,7 @@ test("model API exception: working -> blocked, one sanitized comment, exit 1, fu
     `400 {"type":"error","error":{"message":"Your credit balance is too low"}} x-api-key: ${env.ANTHROPIC_API_KEY} via https://u:${env.GH_TOKEN}@github.com\nstack line with more detail`,
   );
   proxyClosed = 0;
-  const { result, logs } = await quietly(() => main(deps(tracker, engine(err))));
+  const { result, logs } = await quietly(() => main(deps(tracker, engine(err), nothingCommitted)));
   assert.equal(result, 1);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
   assert.equal(proxyClosed, 1);
@@ -177,6 +181,41 @@ test("model API exception: working -> blocked, one sanitized comment, exit 1, fu
   assert.match(c, /credit balance is too low/);
   assert.doesNotMatch(c, /supersecretvalue|realforgetoken|stack line/);
   assert.match(logs, /stack line with more detail/); // the CI log keeps everything
+});
+
+// #48: a run that committed work and then died on the model API still gets that work pushed.
+test("model API exception after commits: branch published, blocked with a comment saying so, exit 1", async () => {
+  const tracker = fakeTracker();
+  let pushes = 0;
+  const publisher: RunDeps["publisher"] = () => ({ pushBranch: () => (pushes++, { pushed: true, head: "abc123", commits: 2 }) });
+  const err = new Error(`429 rate_limit_error x-api-key: ${env.ANTHROPIC_API_KEY}`);
+  const { result, logs } = await quietly(() => main(deps(tracker, engine(err), { publisher })));
+  assert.equal(result, 1);
+  assert.equal(pushes, 1);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /stopped by an error[\s\S]*429 rate_limit_error[\s\S]*committed work is on branch `agent\/issue-7`/);
+  assert.doesNotMatch(tracker.comments[0]!, /supersecretvalue/);
+  assert.match(logs, /publishing what it committed/);
+});
+
+test("stopped without an outcome after commits: branch published, blocked, exit 1", async () => {
+  const tracker = fakeTracker();
+  const { result } = await quietly(() => main(deps(tracker, engine(undefined))));
+  assert.equal(result, 1);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /stopped without recording an outcome[\s\S]*committed work is on branch `agent\/issue-7`/);
+});
+
+test("crash with commits the publisher rejects: nothing pushed, blocked with the reasons, exit 1", async () => {
+  const tracker = fakeTracker();
+  const publisher: RunDeps["publisher"] = () => ({ pushBranch: () => { throw new PublishRejected(["adds .gitmodules"]); } });
+  const { result } = await quietly(() => main(deps(tracker, engine(new Error("429")), { publisher })));
+  assert.equal(result, 1);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /refused to push[\s\S]*adds \.gitmodules/);
 });
 
 test("exception before the agent even starts (clone fails) still ends blocked", async () => {
@@ -242,7 +281,7 @@ test("every label update fails: nonzero exit, actionable log, original error pre
 
 test("fallback comment also fails: label still moves to blocked, original error still logged", async () => {
   const tracker = fakeTracker({ comment: 5 });
-  const { result, logs } = await quietly(() => main(deps(tracker, engine(new Error("model API: 529 overloaded")))));
+  const { result, logs } = await quietly(() => main(deps(tracker, engine(new Error("model API: 529 overloaded")), nothingCommitted)));
   assert.equal(result, 1);
   assert.equal(tracker.label, "blocked");
   assert.match(logs, /529 overloaded/);
