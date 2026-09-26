@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { githubTracker } from "../src/github.ts";
+import { githubTracker, nextLink } from "../src/github.ts";
+import { buildPrompt } from "../src/worker.ts";
 
-function jsonResponse(body: unknown) {
-  return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+function jsonResponse(body: unknown, headers: Record<string, string> = {}) {
+  return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
 }
 
 test("github getTicket: trusted author, mixed-trust comment thread, bot history", async (t) => {
@@ -92,4 +93,96 @@ test("github createSubIssue: creates the issue, then adds the agent label as a s
   assert.deepEqual(JSON.parse(calls[0]!.body), { title: "Sub-task 1", body: "Do the first part." });
   assert.ok(!calls[0]!.body.includes('"labels"'), "the create call must not include labels");
   assert.deepEqual(JSON.parse(calls[1]!.body), { labels: ["agent"] });
+});
+
+function issueResponse(n: number) {
+  return jsonResponse({
+    number: n,
+    html_url: `https://github.com/o/r/issues/${n}`,
+    title: "Long thread",
+    body: "",
+    author_association: "OWNER",
+    user: { login: "maintainer", type: "User" },
+    labels: [{ name: "agent" }],
+  });
+}
+
+test("nextLink: picks rel=next out of a GitHub Link header", () => {
+  const api = "https://api.github.com/repositories/1/issues/3/comments";
+  assert.equal(
+    nextLink(`<${api}?per_page=100&page=2>; rel="next", <${api}?per_page=100&page=3>; rel="last"`),
+    `${api}?per_page=100&page=2`,
+  );
+  assert.equal(nextLink(`<${api}?page=1>; rel="prev", <${api}?page=1>; rel="first"`), undefined);
+  assert.equal(nextLink(null), undefined);
+});
+
+test("github getTicket: follows Link rel=next across 250 comments in chronological order", async (t) => {
+  const all = Array.from({ length: 250 }, (_, k) => ({
+    user: { login: "maintainer", type: "User" },
+    author_association: "OWNER",
+    body: `comment ${k}`,
+    created_at: `t${String(k).padStart(3, "0")}`,
+  }));
+  const commentUrls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    if (url.includes("/issues/3/comments")) {
+      commentUrls.push(url);
+      const page = Number(new URL(url).searchParams.get("page") ?? "1");
+      const base = "https://api.github.com/repos/o/r/issues/3/comments?per_page=100";
+      // Page 3 still advertises a next page, which turns out empty.
+      const link = page <= 3 ? `<${base}&page=${page + 1}>; rel="next", <${base}&page=4>; rel="last"` : "";
+      return jsonResponse(all.slice((page - 1) * 100, page * 100), link ? { link } : {});
+    }
+    if (url.endsWith("/issues/3")) return issueResponse(3);
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
+  const ticket = await tracker.getTicket();
+
+  assert.equal(commentUrls.length, 4, "three pages of comments plus an empty final page");
+  assert.equal(commentUrls[0], "https://api.github.com/repos/o/r/issues/3/comments?per_page=100");
+  assert.deepEqual(ticket.comments.map((c) => c.text), all.map((c) => c.body));
+  assert.equal(ticket.comments.at(-1)!.text, "comment 249", "the newest comment must be present");
+
+  const prompt = buildPrompt(ticket, {
+    tracker,
+    repo: { cloneUrl: "", webUrl: "", defaultBranch: "main" },
+    workDir: "/tmp",
+    pluginDir: "/tmp",
+    maxTurns: 1,
+  });
+  assert.match(prompt, /comment 249\b/, "the triggering (newest) comment must reach the prompt");
+  assert.ok(prompt.indexOf("comment 0\n") < prompt.indexOf("comment 249"), "thread stays oldest-first");
+});
+
+test("github getTicket: a failing later page throws instead of returning a partial thread", async (t) => {
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    if (url.includes("/issues/3/comments")) {
+      if (url.includes("page=2")) return new Response("secondary rate limit", { status: 403 });
+      return jsonResponse([{ user: { login: "m", type: "User" }, author_association: "OWNER", body: "a", created_at: "t1" }], {
+        link: `<https://api.github.com/repos/o/r/issues/3/comments?per_page=100&page=2>; rel="next"`,
+      });
+    }
+    if (url.endsWith("/issues/3")) return issueResponse(3);
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
+  await assert.rejects(tracker.getTicket(), /GitHub GET .*comments.*page 2.*: 403 secondary rate limit/);
+});
+
+test("github getTicket: refuses to send the token to a next link off the API host", async (t) => {
+  const calls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    calls.push(url);
+    if (url.includes("/issues/3/comments")) return jsonResponse([], { link: `<https://evil.example/steal?page=2>; rel="next"` });
+    if (url.endsWith("/issues/3")) return issueResponse(3);
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
+  await assert.rejects(tracker.getTicket(), /outside https:\/\/api\.github\.com/);
+  assert.ok(!calls.some((u) => u.startsWith("https://evil.example")));
 });

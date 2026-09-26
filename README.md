@@ -22,6 +22,11 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
     `agent/working`" below), or
   - `agent/review`, when it opened an MR/PR.
 - **Reply on the issue:** a new run reads the whole thread and continues on branch `agent/issue-<n>`.
+  "Whole" is literal: the tracker follows every page of comments (GitHub's `Link: rel="next"`,
+  GitLab's `x-next-page`), oldest first, with GitLab system notes left out. There is no
+  comment cap and no silent truncation; if any page fails to load, the run errors out (and
+  ends `agent/blocked`) rather than acting on a partial thread. Comments from untrusted users
+  are still dropped from the prompt, as described under "Trust model".
 - **Large issues:** if the agent judges the task too big to finish in one run, it can open
   smaller sub-issues instead of attempting the whole thing (each gets the `agent` label, so
   it starts its own run) and comment back on the parent with links to them. Nothing closes
