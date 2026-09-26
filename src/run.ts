@@ -12,7 +12,10 @@ import { gitlabTracker } from "./gitlab.ts";
 import { gitPublisher } from "./publish.ts";
 import { credentialFromEnv, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import type { Ticket, TicketState, Tracker } from "./tracker.ts";
-import { branchFor, runSession as realRunSession, runTicket as realRunTicket, settle, SettlementError, type Outcome } from "./worker.ts";
+import {
+  applyOutcome, branchFor, needsDirective, runSession as realRunSession, runTicket as realRunTicket, settle, SettlementError,
+  type Outcome, type WorkerConfig,
+} from "./worker.ts";
 
 // split behaves like blocked for CI's purposes: not a failure, nothing merged yet, the
 // issue is left `blocked` for a human or a sub-issue's own run to pick back up.
@@ -239,6 +242,19 @@ export async function settleIncomplete(outcome: Outcome, tracker: Tracker, ticke
   ]);
 }
 
+// The agent's session died (a model API error, say) before it recorded an outcome. Whatever it
+// committed is still validated and published as an implicit checkpoint, and the issue blocked
+// with a comment saying so; the run still fails (exit 1). With nothing committed, `crash` is
+// rethrown for guarded()'s usual fallback.
+export async function publishAfterCrash(ticket: Ticket, cfg: WorkerConfig, crash: unknown, env: NodeJS.ProcessEnv): Promise<Outcome> {
+  // An untrusted issue with no directive never got a session at all: nothing of its to publish.
+  if (needsDirective(ticket)) throw crash;
+  console.error(`[error] the agent session on #${ticket.number} failed before recording an outcome; publishing what it committed:`, crash);
+  const outcome = await applyOutcome(ticket, cfg, undefined, { maxTurnsHit: false, error: sanitizeError(crash, env) });
+  if (outcome.kind === "incomplete") throw crash;
+  return outcome;
+}
+
 // The combined, single-process run: prepare, agent and publish in one container, holding
 // both the forge token and the model credential (the model's behind src/model-proxy.ts).
 // The default for a local `docker run`; CI runs the three as separate jobs instead (see
@@ -291,24 +307,32 @@ export async function main(deps: RunDeps = {}): Promise<number> {
     // The real model credential goes only to a loopback proxy; see startProxyFromEnv.
     const proxy = await startProxyFromEnv(env, startModelProxy);
 
-    let outcome: Outcome;
+    const cfg: WorkerConfig = {
+      tracker: guard.tracker,
+      repo,
+      workDir,
+      pluginDir: env.PLUGIN_DIR ?? DEFAULT_PLUGIN_DIR,
+      model: env.CLAUDE_MODEL,
+      maxTurns,
+      env: sandboxEnv(env, proxy.url),
+      // Pushing is the publisher's, after the session: the agent's env has no forge token.
+      publisher: createPublisher({ ...target, credential }),
+    };
+    let outcome: Outcome | undefined;
+    let crash: unknown;
     try {
-      outcome = await runTicket(ticket, {
-        tracker: guard.tracker,
-        repo,
-        workDir,
-        pluginDir: env.PLUGIN_DIR ?? DEFAULT_PLUGIN_DIR,
-        model: env.CLAUDE_MODEL,
-        maxTurns,
-        env: sandboxEnv(env, proxy.url),
-        // Pushing is the publisher's, after the session: the agent's env has no forge token.
-        publisher: createPublisher({ ...target, credential }),
-      });
+      outcome = await runTicket(ticket, cfg);
+    } catch (err) {
+      // A SettlementError already carries an outcome the agent reached; only a crash before one
+      // leaves committed work unpublished.
+      if (err instanceof SettlementError) throw err;
+      crash = err;
     } finally {
       console.log(`[model-proxy] forwarded ${proxy.requestCount()} request(s)`);
       // Logged, not thrown: a failed close must not mask the run's own result or error.
       await proxy.close().catch((err) => console.error("[cleanup] model proxy close failed:", err));
     }
+    outcome ??= await publishAfterCrash(ticket, cfg, crash, env);
 
     outcome = await settleIncomplete(outcome, guard.tracker, ticket);
     console.log(`[outcome] ${outcome.kind}: ${outcome.detail}`);

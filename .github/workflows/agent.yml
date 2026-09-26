@@ -200,7 +200,8 @@ jobs:
   publish:
     needs: [prepare, agent]
     # Also after a failed agent job: with no recorded outcome to apply, the publish stage still
-    # takes the issue off agent/working (blocked, with a comment pointing at the logs).
+    # pushes whatever the agent committed and takes the issue off agent/working (blocked, with a
+    # comment pointing at the logs).
     if: always() && needs.prepare.outputs.proceed == 'true'
     permissions:
       contents: write

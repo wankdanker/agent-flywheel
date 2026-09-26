@@ -1,6 +1,6 @@
 import { query, tool, createSdkMcpServer, type HookCallbackMatcher, type HookEvent, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { PublishRejected, type Publisher } from "./publish.ts";
+import { PublishRejected, type Publisher, type PushResult } from "./publish.ts";
 import type { Comment, NewSubIssue, Repo, Ticket, Tracker } from "./tracker.ts";
 
 export type WorkerConfig = {
@@ -38,8 +38,10 @@ export type AgentOutcome =
 export type Outcome = { kind: "blocked" | "ready_for_review" | "split" | "failed" | "checkpoint" | "incomplete"; detail: string };
 
 // How the agent's session ended, as far as applyOutcome needs to know: running out of
-// MAX_TURNS without recording anything is an implicit checkpoint, not a crash.
-export type SessionEnd = { maxTurnsHit: boolean };
+// MAX_TURNS without recording anything is an implicit checkpoint, not a crash. `error` is a
+// crash (already scrubbed for the issue thread, see run.ts's sanitizeError) that ended it
+// before the agent recorded anything.
+export type SessionEnd = { maxTurnsHit: boolean; error?: string };
 
 export const branchFor = (t: Ticket) => `agent/issue-${t.number}`;
 
@@ -191,7 +193,13 @@ export const implicitCheckpointComment = (t: Ticket, maxTurns: number) =>
   `\`${branchFor(t)}\`; its \`git log\` says what's done. Reply here (e.g. \`/agent continue\`) to have me ` +
   `pick it up from that branch.`;
 
-export const rejectedComment = (t: Ticket, reached: AgentOutcome["status"], problems: string[]) =>
+// No outcome recorded, but the branch had commits, so they were published anyway (#48).
+export const crashedComment = (t: Ticket, error: string | undefined) =>
+  (error ? `I was stopped by an error before recording an outcome:\n\n> ${error}\n\n` : `I stopped without recording an outcome. `) +
+  `My committed work is on branch \`${branchFor(t)}\`; its \`git log\` says what's done. Full diagnostics are in ` +
+  `the CI job log. Reply here (e.g. \`/agent continue\`) to have me pick it up from that branch.`;
+
+export const rejectedComment = (t: Ticket, reached: AgentOutcome["status"] | "incomplete", problems: string[]) =>
   `I reached \`${reached}\`, but the publisher refused to push branch \`${branchFor(t)}\`, so nothing was ` +
   `pushed and no PR/MR was opened or updated:\n\n${problems.map((p) => `- ${p.replace(/`/g, "'")}`).join("\n")}\n\n` +
   `A maintainer should look at what the branch was trying to change. Reply here (e.g. \`/agent continue\`) ` +
@@ -227,28 +235,29 @@ export async function settle(outcome: Outcome, writes: (() => Promise<unknown>)[
 }
 
 // Validates and pushes the agent's branch through the trusted publisher. Returns the reasons
-// it was rejected (nothing pushed), or undefined once it's pushed. Any other failure (network,
-// a non-fast-forward push) throws a SettlementError carrying what the agent had reached.
-function publish(cfg: WorkerConfig, reached: Outcome, requireCommits: boolean): string[] | undefined {
+// it was rejected (nothing pushed), or what it published. Any other failure (network, a
+// non-fast-forward push) throws a SettlementError carrying what the agent had reached.
+function publish(cfg: WorkerConfig, reached: Outcome, requireCommits: boolean): { problems: string[] } | PushResult {
   try {
     const res = cfg.publisher.pushBranch({ requireCommits });
     console.log(`[publish] ${res.pushed ? "pushed" : "nothing new to push at"} ${res.head} (${res.commits} commit(s) over the base)`);
-    return undefined;
+    return res;
   } catch (err) {
-    if (err instanceof PublishRejected) return err.problems;
+    if (err instanceof PublishRejected) return { problems: err.problems };
     throw new SettlementError(reached, [err]);
   }
 }
 
 // The single trusted post-agent step: turns whatever the agent's tool calls recorded in
 // memory into the actual forge writes, including publishing its branch (pushed only for
-// ready_for_review and checkpoints, never for blocked/split/failed). Runs once, after the
+// ready_for_review and checkpoints, and for a run that stopped without any outcome but had
+// committed something; never for blocked/split/failed). Runs once, after the
 // agent's turn is fully over — never from inside a tool handler the model can invoke mid-session.
 export async function applyOutcome(
   t: Ticket, cfg: WorkerConfig, recorded: AgentOutcome | undefined, end: SessionEnd = { maxTurnsHit: false },
 ): Promise<Outcome> {
   const { tracker } = cfg;
-  const rejected = (reached: AgentOutcome["status"], problems: string[]) =>
+  const rejected = (reached: AgentOutcome["status"] | "incomplete", problems: string[]) =>
     settle({ kind: "failed", detail: `publisher rejected the branch: ${problems.join("; ")}` }, [
       () => tracker.comment(rejectedComment(t, reached, problems)),
       () => tracker.setState("blocked"),
@@ -256,15 +265,25 @@ export async function applyOutcome(
   if (!recorded) {
     if (end.maxTurnsHit) {
       const reached: Outcome = { kind: "checkpoint", detail: `used all ${cfg.maxTurns} turns without recording an outcome` };
-      const problems = publish(cfg, reached, false);
-      if (problems) return rejected("checkpoint", problems);
+      const res = publish(cfg, reached, false);
+      if ("problems" in res) return rejected("checkpoint", res.problems);
       const text = implicitCheckpointComment(t, cfg.maxTurns);
       return settle(reached, [
         () => tracker.comment(text),
         () => tracker.setState("blocked"),
       ]);
     }
-    return { kind: "incomplete", detail: "Agent stopped without asking, splitting, or finishing." };
+    // Stopped (or crashed) without an outcome: still publish whatever it committed, validated
+    // the same way, as an implicit checkpoint. That's still a failed run (exit 1), not a pause.
+    // With nothing committed, it's `incomplete`, and the tracker is left to the caller.
+    const reached: Outcome = { kind: "incomplete", detail: end.error ?? "Agent stopped without asking, splitting, or finishing." };
+    const res = publish(cfg, reached, false);
+    if ("problems" in res) return rejected("incomplete", res.problems);
+    if (res.commits === 0) return reached;
+    return settle({ kind: "failed", detail: `stopped without an outcome; ${res.commits} commit(s) published to ${branchFor(t)}: ${reached.detail}` }, [
+      () => tracker.comment(crashedComment(t, end.error)),
+      () => tracker.setState("blocked"),
+    ]);
   }
   switch (recorded.status) {
     case "blocked":
@@ -274,8 +293,8 @@ export async function applyOutcome(
       ]);
     case "ready_for_review": {
       const reached: Outcome = { kind: "ready_for_review", detail: recorded.summary };
-      const problems = publish(cfg, reached, true);
-      if (problems) return rejected("ready_for_review", problems);
+      const res = publish(cfg, reached, true);
+      if ("problems" in res) return rejected("ready_for_review", res.problems);
       let review;
       try {
         review = await tracker.openReview({
@@ -317,8 +336,8 @@ export async function applyOutcome(
       ]);
     case "checkpoint": {
       const reached: Outcome = { kind: "checkpoint", detail: recorded.summary };
-      const problems = publish(cfg, reached, false);
-      if (problems) return rejected("checkpoint", problems);
+      const res = publish(cfg, reached, false);
+      if ("problems" in res) return rejected("checkpoint", res.problems);
       return settle(reached, [
         () => tracker.comment(checkpointComment(t, recorded.summary, recorded.nextSteps)),
         () => tracker.setState("blocked"),

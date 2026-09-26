@@ -66,12 +66,12 @@ function envs() {
 
 type Calls = { prepared: number; sessions: number; pushes: number };
 
-function deps(tracker: Tracker, calls: Calls, recorded: AgentOutcome | undefined | Error, maxTurnsHit = false): RunDeps {
+function deps(tracker: Tracker, calls: Calls, recorded: AgentOutcome | undefined | Error, maxTurnsHit = false, commits = 1): RunDeps {
   return {
     tracker,
     prepareRepo: (o) => {
       calls.prepared++;
-      mkdirSync(o.workDir, { recursive: true });
+      mkdirSync(join(o.workDir, ".git"), { recursive: true });
     },
     originUrl: () => CLONE_URL,
     startModelProxy: async () => ({ url: "http://127.0.0.1:1", requestCount: () => 0, close: async () => {} }),
@@ -84,7 +84,7 @@ function deps(tracker: Tracker, calls: Calls, recorded: AgentOutcome | undefined
     publisher: () => ({
       pushBranch: () => {
         calls.pushes++;
-        return { pushed: true, head: "abc123", commits: 1 };
+        return { pushed: commits > 0, head: "abc123", commits };
       },
     }),
   };
@@ -103,10 +103,10 @@ async function quietly<T>(fn: () => Promise<T>): Promise<{ result: T; logs: stri
   }
 }
 
-async function runAll(tracker: ReturnType<typeof fakeTracker>, recorded: AgentOutcome | undefined | Error, maxTurnsHit = false) {
+async function runAll(tracker: ReturnType<typeof fakeTracker>, recorded: AgentOutcome | undefined | Error, maxTurnsHit = false, commits = 1) {
   const e = envs();
   const calls: Calls = { prepared: 0, sessions: 0, pushes: 0 };
-  const d = deps(tracker, calls, recorded, maxTurnsHit);
+  const d = deps(tracker, calls, recorded, maxTurnsHit, commits);
   const codes = await quietly(async () => [
     await prepareStage({ ...d, env: e.prepare }),
     await agentStage({ ...d, env: e.agent }),
@@ -133,20 +133,43 @@ test("split run: exit codes come from the publish stage (question → 10, checkp
   assert.equal((await runAll(fakeTracker(), undefined, true)).codes[2], 20);
 });
 
-test("split run: agent stage recording nothing → publish comments and blocks (incomplete)", async () => {
+test("split run: agent stage recording nothing, nothing committed → publish comments and blocks (incomplete)", async () => {
   const tracker = fakeTracker();
-  const { codes } = await runAll(tracker, undefined);
+  const { codes } = await runAll(tracker, undefined, false, 0);
   assert.deepEqual(codes, [0, 0, 1]);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
   assert.match(tracker.comments[0]!, /stopped before finishing/);
 });
 
-test("split run: agent session crashing → no outcome.json, publish falls back to blocked", async () => {
+test("split run: agent stage recording nothing after commits → publish pushes them, blocks, exit 1", async () => {
   const tracker = fakeTracker();
-  const { codes } = await runAll(tracker, new Error("model API 529"));
+  const { codes, calls } = await runAll(tracker, undefined);
+  assert.deepEqual(codes, [0, 0, 1]);
+  assert.equal(calls.pushes, 1);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /stopped without recording an outcome[\s\S]*committed work is on branch `agent\/issue-7`/);
+});
+
+test("split run: agent session crashing, nothing committed → no outcome.json, publish falls back to blocked", async () => {
+  const tracker = fakeTracker();
+  const { codes } = await runAll(tracker, new Error("model API 529"), false, 0);
   assert.deepEqual(codes, [0, 1, 1]);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
-  assert.match(tracker.comments[0]!, /HandoffError: the agent stage left no outcome\.json/);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /I hit an error and stopped[\s\S]*HandoffError: the agent stage left no outcome\.json/);
+});
+
+// #48: the run that committed twice and then died on a 429 must not leave that work unpushed.
+test("split run: agent session crashing after commits → publish still pushes the branch, blocks, exit 1", async () => {
+  const tracker = fakeTracker();
+  const { codes, calls } = await runAll(tracker, new Error("429 rate_limit_error"));
+  assert.deepEqual(codes, [0, 1, 1]);
+  assert.equal(calls.pushes, 1);
+  assert.equal(tracker.reviews, 0);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /stopped by an error[\s\S]*left no outcome\.json[\s\S]*committed work is on branch `agent\/issue-7`/);
 });
 
 test("prepare: an untrusted issue with no trusted directive is blocked before cloning; agent and publish then do nothing", async () => {

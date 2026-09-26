@@ -100,8 +100,9 @@ agent-publish:
   stage: publish
   timeout: 20m
   # Also after a failed agent job: with no recorded outcome to apply, the publish stage still
-  # takes the issue off agent/working (blocked, with a comment pointing at the logs). And a
-  # no-op when the issue isn't agent/working (prepare already settled it).
+  # pushes whatever the agent committed and takes the issue off agent/working (blocked, with a
+  # comment pointing at the logs). And a no-op when the issue isn't agent/working (prepare
+  # already settled it).
   when: always
   dependencies: [agent-agent]
   script:

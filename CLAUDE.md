@@ -80,7 +80,9 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 - `src/clone.ts`'s `prepareRepo` runs git with the token in a work dir the agent may have
   written, so on resume `distrustGitDir` first replaces `.git/config` and removes hooks,
   alternates and similar (or reclones if `.git` isn't a plain dir). Don't run credentialed git
-  in the work dir before that.
+  in the work dir before that. On resume it keeps a cached `agent/issue-<n>` that's ahead of the
+  remote branch (or the default branch) instead of resetting it, so a crashed run's unpushed
+  commits survive; behind or diverged is reset, and logged.
 - `src/tracker.ts` holds the platform-neutral `Tracker` interface, the label names, and `BOT_MARKER`. The marker is a hidden HTML comment that tags our own comments, which is how both CIs avoid re-triggering on them. `withMarker` also prepends `BOT_BADGE`, a visible "🤖 Agent Flywheel" line, since a comment posted with a personal access token (`AGENT_GH_TOKEN`/`AGENT_GITLAB_TOKEN`) otherwise shows up as that token's owner with no sign it's from the agent. `toComment` only honors `BOT_MARKER` when the poster is independently trusted (or a GitHub `Bot`-type account) — the marker text alone, e.g. pasted by an attacker, is not enough.
 - `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`. Both attach a `Trust` to the issue (from its author) and to every comment (from that comment's author) when building a `Ticket`.
@@ -106,7 +108,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     a `PreToolUse` hook denies everything but git Bash commands and the `mcp__ticket__*` tools once
     `CHECKPOINT_AT` (2) or fewer turns remain, telling the agent to commit and call `checkpoint`.
 
-  If the agent calls none of these tools, `applyOutcome` reports `incomplete`, unless the session ended with `error_max_turns`, which is an implicit `checkpoint`. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
+  If the agent calls none of these tools, `applyOutcome` reports `incomplete`, unless the session ended with `error_max_turns`, which is an implicit `checkpoint`, or the branch has commits over the base: then it still pushes them (same validation) and settles `failed` (blocked, exit 1) with `crashedComment`. A session that threw, or (split mode) a missing/invalid `outcome.json`, goes through `run.ts`'s `publishAfterCrash`, which does the same with the scrubbed error in the comment, and rethrows for `guarded`'s fallback when nothing was committed. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
 - `src/publish.ts` is the privileged publisher. `gitPublisher().pushBranch()` fetches the agent's
   `agent/issue-<n>` over `file://` into a fresh scratch repo (minimal env, no credential, fsck on,
   hooks off), fetches the base from the forge, runs `validateRange` over every commit in

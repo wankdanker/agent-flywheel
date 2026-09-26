@@ -34,7 +34,10 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
   once its sub-issues are done, or comment on it to resume broader work.
 - **State:** there is none besides the issue and the git remote. Every run is a fresh container.
   CI does cache the work dir per issue, so a run that dies partway usually resumes from its
-  existing clone instead of starting over, but that cache isn't guaranteed to survive.
+  existing clone instead of starting over, but that cache isn't guaranteed to survive. On
+  resume, a cached `agent/issue-<n>` that's ahead of the remote branch (or of the default
+  branch, if there's none yet) keeps its unpushed commits; one that's behind or has diverged
+  is reset to it, and the prepare log says which.
 
 Only trusted people can start a run:
 - **Labels:** GitHub needs triage access and GitLab needs Reporter+.
@@ -68,6 +71,11 @@ How that's enforced (`src/worker.ts`):
   `agent/blocked`, and exits 20. Reply on the issue (e.g. `/agent continue`) to resume from the
   branch. If the SDK still hits `MAX_TURNS` with nothing recorded, that's treated as an implicit
   checkpoint rather than a crash.
+- **Crash with commits.** If the session ends without an outcome for any other reason (a model
+  API error, a killed agent job, or the agent just stopping), but the branch has commits over
+  the default branch, the publisher still validates and pushes it. The issue gets a comment
+  saying it stopped with its committed work on the branch, goes `agent/blocked`, and the run
+  still exits 1 so CI shows the failure.
 
 Not yet: CI re-dispatching a run on exit 20 by itself (auto-relay). That waits on a cap on
 chained autonomous runs, so for now a human reply continues a checkpointed issue.
@@ -85,7 +93,8 @@ Bad config (missing credential, invalid `MAX_TURNS`, repo outside the allowlist)
 before the issue is touched at all.
 
 What a process can't do is clean up after being killed. In CI the publish job still runs after
-a failed or timed-out agent job, finds no `outcome.json`, and settles the issue as blocked. On
+a failed or timed-out agent job, finds no `outcome.json`, publishes whatever the agent committed
+(see "Crash with commits" above), and settles the issue as blocked. On
 GitHub, an `unstick` job in `.github/workflows/agent.yml` also swaps a leftover
 `agent/working` for `agent/blocked` when any of the three jobs times out or is cancelled.
 Nothing runs if a runner itself is lost, so an issue can still occasionally be stuck on

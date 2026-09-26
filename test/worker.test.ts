@@ -65,13 +65,13 @@ function fakeTracker(platform: "github" | "gitlab"): FakeTracker {
 
 // Stands in for src/publish.ts's gitPublisher (exercised against real git in publish.test.ts):
 // records each push, or rejects with `problems`.
-function fakePublisher(problems?: string[]): Publisher & { pushes: number } {
+function fakePublisher(problems?: string[], commits = 1): Publisher & { pushes: number } {
   const p = {
     pushes: 0,
     pushBranch(): PushResult {
       if (problems) throw new PublishRejected(problems);
       p.pushes++;
-      return { pushed: true, head: "abc123", commits: 1 };
+      return { pushed: commits > 0, head: "abc123", commits };
     },
   };
   return p;
@@ -340,12 +340,25 @@ test("applyOutcome: failed comments the explanation and sets state to blocked", 
   assert.deepEqual(tracker.comments, ["The acceptance criteria conflict with the existing API contract; needs a maintainer decision."]);
 });
 
-test("applyOutcome: no recorded outcome is incomplete and touches the tracker not at all", async () => {
+test("applyOutcome: no recorded outcome and nothing committed is incomplete and touches the tracker not at all", async () => {
   const t = ticket({ number: 42, url: "https://example.test/issues/42" });
   const tracker = fakeTracker("github");
-  const outcome = await applyOutcome(t, cfgFor(tracker), undefined);
+  const outcome = await applyOutcome(t, cfgFor(tracker, fakePublisher(undefined, 0)), undefined);
 
   assert.equal(outcome.kind, "incomplete");
   assert.deepEqual(tracker.states, []);
   assert.deepEqual(tracker.comments, []);
+});
+
+test("applyOutcome: no recorded outcome after a crash, with commits: publishes them, blocked, failed", async () => {
+  const t = ticket({ number: 42, url: "https://example.test/issues/42" });
+  const tracker = fakeTracker("github");
+  const publisher = fakePublisher(undefined, 2);
+  const outcome = await applyOutcome(t, cfgFor(tracker, publisher), undefined, { maxTurnsHit: false, error: "Error: 429 rate limited" });
+
+  assert.equal(outcome.kind, "failed");
+  assert.equal(publisher.pushes, 1);
+  assert.deepEqual(tracker.states, ["blocked"]);
+  assert.equal(tracker.comments.length, 1);
+  assert.match(tracker.comments[0]!, /stopped by an error[\s\S]*> Error: 429 rate limited[\s\S]*committed work is on branch `agent\/issue-42`/);
 });
