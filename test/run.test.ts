@@ -5,8 +5,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
+import { RESUME_HINT, REVIEW_HINT } from "../src/dispatch.ts";
 import { PublishRejected } from "../src/publish.ts";
-import { main, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
+import { EXIT_SKIPPED, MAX_TURNS_LIMIT, main, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
 import type { Comment, Ticket, TicketState, Tracker } from "../src/tracker.ts";
 import { applyOutcome, type AgentOutcome, type Outcome, type SessionEnd, type WorkerConfig } from "../src/worker.ts";
 
@@ -120,7 +121,7 @@ test("clarification: one question, blocked, exit 10", async () => {
   const { result } = await quietly(() => main(deps(tracker, engine({ status: "blocked", question: "Cursor or offset?" }))));
   assert.equal(result, 10);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
-  assert.deepEqual(tracker.comments, ["Cursor or offset?"]);
+  assert.deepEqual(tracker.comments, [`Cursor or offset?\n\n${RESUME_HINT}`]);
 });
 
 test("split: sub-issues opened, blocked, exit 10", async () => {
@@ -137,7 +138,7 @@ test("report_failure: one explanation, blocked, exit 1", async () => {
   const { result } = await quietly(() => main(deps(tracker, engine({ status: "failed", summary: "Can't be done." }))));
   assert.equal(result, 1);
   assert.deepEqual(tracker.states, ["working", "blocked"]);
-  assert.deepEqual(tracker.comments, ["Can't be done."]);
+  assert.deepEqual(tracker.comments, [`Can't be done.\n\n${RESUME_HINT}`]);
 });
 
 test("agent stopped with no outcome recorded (not the turn limit): one blocked message, exit 1", async () => {
@@ -301,7 +302,7 @@ test("setting working itself fails: still tries blocked, exit 1", async () => {
 });
 
 test("a retry doesn't repeat a completion comment already at the end of the thread", async () => {
-  const prior: Comment = { author: "bot", trust: "trusted", fromBot: true, text: "Done.\n\nReview: https://x/pull/1", at: "2026-01-01T00:00:00Z" };
+  const prior: Comment = { author: "bot", trust: "trusted", fromBot: true, text: `Done.\n\nReview: https://x/pull/1\n\n${REVIEW_HINT}`, at: "2026-01-01T00:00:00Z" };
   const tracker = fakeTracker({}, [prior]);
   const { result } = await quietly(() => main(deps(tracker, engine({ status: "ready_for_review", summary: "Done." }))));
   assert.equal(result, 0);
@@ -310,7 +311,7 @@ test("a retry doesn't repeat a completion comment already at the end of the thre
 });
 
 test("invalid MAX_TURNS: exit 2 before the issue is touched", async () => {
-  for (const MAX_TURNS of ["abc", "0", "-3", "1.5"]) {
+  for (const MAX_TURNS of ["abc", "0", "-3", "1.5", "1e2", "501", "100000"]) {
     const tracker = fakeTracker();
     const { result } = await quietly(() => main({ ...deps(tracker, engine(undefined)), env: { ...env, MAX_TURNS } }));
     assert.equal(result, 2, MAX_TURNS);
@@ -318,6 +319,51 @@ test("invalid MAX_TURNS: exit 2 before the issue is touched", async () => {
   }
   assert.equal(parseMaxTurns(undefined), 120);
   assert.equal(parseMaxTurns("40"), 40);
+  assert.equal(parseMaxTurns(String(MAX_TURNS_LIMIT)), MAX_TURNS_LIMIT);
+});
+
+// The prepare step's re-check of AGENT_TRIGGER against the issue's live labels (src/dispatch.ts).
+function withLabels(labels: string[]) {
+  const tracker = fakeTracker();
+  const get = tracker.getTicket;
+  tracker.getTicket = async () => ({ ...(await get()), labels });
+  return tracker;
+}
+
+test("a reply-triggered run whose issue is no longer blocked is skipped before anything is touched", async () => {
+  for (const labels of [["agent", "agent/review"], ["agent", "agent/working"], ["agent"], ["agent/blocked"]]) {
+    const tracker = withLabels(labels);
+    let ran = false;
+    const { result, logs } = await quietly(() => main({ ...deps(tracker, async () => ((ran = true), { kind: "blocked", detail: "" })), env: { ...env, AGENT_TRIGGER: "comment" } }));
+    assert.equal(result, EXIT_SKIPPED, labels.join());
+    assert.equal(ran, false);
+    assert.deepEqual(tracker.states, []);
+    assert.deepEqual(tracker.comments, []);
+    assert.match(logs, /\[trigger\] #7 comment: skipping/);
+  }
+});
+
+test("a trigger that still applies runs: a reply on blocked, a command, a label, a manual run", async () => {
+  for (const [labels, extra] of [
+    [["agent", "agent/blocked"], { AGENT_TRIGGER: "comment" }],
+    [["agent", "agent/review"], { AGENT_TRIGGER: "comment", AGENT_COMMENT: "/agent continue\nrework the docs" }],
+    [["agent", "agent/review"], { AGENT_TRIGGER: "command" }],
+    [["agent"], { AGENT_TRIGGER: "label" }],
+    [["agent/review"], {}],
+    [["agent/review"], { AGENT_TRIGGER: "manual" }],
+  ] as const) {
+    const tracker = withLabels([...labels]);
+    const { result } = await quietly(() => main({ ...deps(tracker, engine({ status: "ready_for_review", summary: "Done." })), env: { ...env, ...extra } }));
+    assert.equal(result, 0, JSON.stringify([labels, extra]));
+    assert.equal(tracker.label, "review");
+  }
+});
+
+test("an unknown AGENT_TRIGGER is a config error", async () => {
+  const tracker = fakeTracker();
+  const { result } = await quietly(() => main({ ...deps(tracker, engine(undefined)), env: { ...env, AGENT_TRIGGER: "whenever" } }));
+  assert.equal(result, 2);
+  assert.deepEqual(tracker.states, []);
 });
 
 test("missing model credential: exit 2 before the issue is touched", async () => {

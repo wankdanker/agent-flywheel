@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { isAllowedRepo, parseAllowlist } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
-import { recheckTrigger, triggerFromEnv, type Trigger } from "./dispatch.ts";
+import { recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
 import { githubTracker } from "./github.ts";
 import { gitlabTracker } from "./gitlab.ts";
 import { resetHandoff } from "./handoff.ts";
@@ -267,7 +267,7 @@ export async function guarded(
 export async function settleIncomplete(outcome: Outcome, tracker: Tracker, ticket: Ticket): Promise<Outcome> {
   if (outcome.kind !== "incomplete") return outcome;
   return settle(outcome, [
-    () => tracker.comment(`I stopped before finishing. Reply here to have me continue from branch \`${branchFor(ticket)}\`.`),
+    () => tracker.comment(`I stopped before finishing. The next run continues from branch \`${branchFor(ticket)}\`.\n\n${RESUME_HINT}`),
     () => tracker.setState("blocked"),
   ]);
 }
@@ -379,7 +379,7 @@ async function fallBackToBlocked(tracker: Tracker, ticket: Ticket, failure: unkn
   const text =
     `${reached}I hit an error and stopped, so I've marked this issue blocked rather than leave it \`agent/working\`.\n\n` +
     `> ${failure === undefined ? "the run ended without setting a final state" : sanitizeError(failure, env)}\n\n` +
-    `Full diagnostics are in the CI job log. Reply here to have me retry from branch \`${branchFor(ticket)}\`.`;
+    `Full diagnostics are in the CI job log. The next run retries from branch \`${branchFor(ticket)}\`.\n\n${RESUME_HINT}`;
   try {
     await tracker.comment(text);
   } catch (err) {
@@ -390,7 +390,7 @@ async function fallBackToBlocked(tracker: Tracker, ticket: Ticket, failure: unkn
   } catch (err) {
     console.error(
       `[cleanup] couldn't set #${ticket.number} to blocked: it may still be labeled agent/working with no run active. ` +
-        `Swap that label for agent/blocked by hand, or reply on the issue to start a new run.`,
+        `Swap that label for agent/blocked by hand, or comment \`/agent continue\` on the issue to start a new run.`,
       err,
     );
   }
