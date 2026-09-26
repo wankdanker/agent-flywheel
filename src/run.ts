@@ -8,8 +8,10 @@ import { join } from "node:path";
 import { isAllowedRepo, parseAllowlist } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
+import { recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
 import { githubTracker } from "./github.ts";
 import { gitlabTracker } from "./gitlab.ts";
+import { resetHandoff } from "./handoff.ts";
 import { gitPublisher } from "./publish.ts";
 import { credentialFromEnv, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import type { Ticket, TicketState, Tracker } from "./tracker.ts";
@@ -23,6 +25,8 @@ import {
 // checkpoint (20) is a graceful pause at the turn limit, work pushed to the branch; also a
 // success for CI, and distinct from 10 so CI can later auto-relay it to a new run.
 export const EXIT_CODES: Record<Outcome["kind"], number> = { ready_for_review: 0, blocked: 10, split: 10, checkpoint: 20, incomplete: 1, failed: 1 };
+// The trigger no longer applies (src/dispatch.ts's recheckTrigger): nothing ran, nothing changed.
+export const EXIT_SKIPPED = 30;
 
 // Bad or missing configuration: exit 2, and (when it's found before we set `working`)
 // without touching the issue at all.
@@ -53,11 +57,35 @@ const req = (env: NodeJS.ProcessEnv, k: string): string => {
   return v;
 };
 
+// A ceiling, not a default: a typo like 8000 would otherwise buy a very expensive run.
+export const MAX_TURNS_LIMIT = 500;
+
 export function parseMaxTurns(raw: string | undefined): number {
   if (raw === undefined || raw === "") return 120;
   const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1) throw new ConfigError(`MAX_TURNS must be a positive integer, got ${JSON.stringify(raw)}`);
+  if (!/^\d+$/.test(raw.trim()) || !Number.isInteger(n) || n < 1 || n > MAX_TURNS_LIMIT) {
+    throw new ConfigError(`MAX_TURNS must be an integer from 1 to ${MAX_TURNS_LIMIT}, got ${JSON.stringify(raw)}`);
+  }
   return n;
+}
+
+// AGENT_TRIGGER (how CI says this run was started; see src/dispatch.ts), checked with the config.
+export function parseTrigger(env: NodeJS.ProcessEnv): Trigger | undefined {
+  try {
+    return triggerFromEnv(env);
+  } catch (err) {
+    throw new ConfigError((err as Error).message);
+  }
+}
+
+// The run's reason re-checked against the issue as it is now (a queued run can outlive it). On
+// a skip nothing is touched but the handoff dir, cleared so no stale prepared.json from a
+// cached work dir can start the agent stage.
+export function triggerStillApplies(ticket: Ticket, trigger: Trigger | undefined, env: NodeJS.ProcessEnv): boolean {
+  const d = recheckTrigger(trigger, ticket.labels);
+  console.log(`[trigger] #${ticket.number} ${trigger ?? "manual"}: ${d.run ? "running" : "skipping"}, ${d.reason}`);
+  if (!d.run) resetHandoff(workDirFor(env, ticket.number));
+  return d.run;
 }
 
 const optionalNumber = (env: NodeJS.ProcessEnv, k: string) => (env[k] ? Number(env[k]) : undefined);
@@ -239,7 +267,7 @@ export async function guarded(
 export async function settleIncomplete(outcome: Outcome, tracker: Tracker, ticket: Ticket): Promise<Outcome> {
   if (outcome.kind !== "incomplete") return outcome;
   return settle(outcome, [
-    () => tracker.comment(`I stopped before finishing. Reply here to have me continue from branch \`${branchFor(ticket)}\`.`),
+    () => tracker.comment(`I stopped before finishing. The next run continues from branch \`${branchFor(ticket)}\`.\n\n${RESUME_HINT}`),
     () => tracker.setState("blocked"),
   ]);
 }
@@ -270,10 +298,11 @@ export async function main(deps: RunDeps = {}): Promise<number> {
   const createPublisher = deps.publisher ?? gitPublisher;
 
   // Everything that can be wrong with our config is checked before we touch the issue.
-  let tracker: Tracker, maxTurns: number;
+  let tracker: Tracker, maxTurns: number, trigger: Trigger | undefined;
   try {
     requireModelCredential(env);
     maxTurns = parseMaxTurns(env.MAX_TURNS);
+    trigger = parseTrigger(env);
     tracker = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
@@ -282,6 +311,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
   const allowed = await fetchAllowedTicket(tracker, env);
   if (!allowed) return 2;
   const { ticket, repo, allowlist } = allowed;
+  if (!triggerStillApplies(ticket, trigger, env)) return EXIT_SKIPPED;
   const guard = guardTracker(tracker, ticket);
 
   // From here on, whatever happens, we owe the issue a terminal label.
@@ -349,7 +379,7 @@ async function fallBackToBlocked(tracker: Tracker, ticket: Ticket, failure: unkn
   const text =
     `${reached}I hit an error and stopped, so I've marked this issue blocked rather than leave it \`agent/working\`.\n\n` +
     `> ${failure === undefined ? "the run ended without setting a final state" : sanitizeError(failure, env)}\n\n` +
-    `Full diagnostics are in the CI job log. Reply here to have me retry from branch \`${branchFor(ticket)}\`.`;
+    `Full diagnostics are in the CI job log. The next run retries from branch \`${branchFor(ticket)}\`.\n\n${RESUME_HINT}`;
   try {
     await tracker.comment(text);
   } catch (err) {
@@ -360,7 +390,7 @@ async function fallBackToBlocked(tracker: Tracker, ticket: Ticket, failure: unkn
   } catch (err) {
     console.error(
       `[cleanup] couldn't set #${ticket.number} to blocked: it may still be labeled agent/working with no run active. ` +
-        `Swap that label for agent/blocked by hand, or reply on the issue to start a new run.`,
+        `Swap that label for agent/blocked by hand, or comment \`/agent continue\` on the issue to start a new run.`,
       err,
     );
   }

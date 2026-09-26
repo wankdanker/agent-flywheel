@@ -4,7 +4,8 @@
 // integration branch, moves that chain along (.gitlab/chain-stages.yml; see src/chain.ts).
 // Runs on stock node with no npm install, so it (and what it imports) stays dependency-free.
 import { readFileSync } from "node:fs";
-import { BOT_MARKER, OPT_IN_LABEL, need } from "../src/tracker.ts";
+import { decideComment, type Decision, type Trigger } from "../src/dispatch.ts";
+import { OPT_IN_LABEL, need } from "../src/tracker.ts";
 import { gitlabMemberTrust } from "../src/trust.ts";
 
 const titles = (labels: any[] = []) => labels.map((l) => l.title);
@@ -22,21 +23,29 @@ async function isDeveloper(userId: number) {
   return trust === "trusted";
 }
 
-async function actionableIssue(p: any): Promise<number | undefined> {
+type Actionable = { iid: number; trigger: Trigger; reason: string };
+
+async function actionableIssue(p: any): Promise<Actionable | Decision | undefined> {
   if (p.object_kind === "issue") {
     const a = p.object_attributes;
-    if (a.state !== "opened" || !titles(p.labels).includes(OPT_IN_LABEL)) return;
+    if (a.state !== "opened") return { run: false, reason: "issue is closed" };
+    if (!titles(p.labels).includes(OPT_IN_LABEL)) return { run: false, reason: `issue has no \`${OPT_IN_LABEL}\` label` };
     // Only when `agent` arrives (on open, reopen, or added later). Our own state-label
     // edits fire issue events too and must not re-trigger us. Adding labels needs Reporter+.
     const added = a.action === "open" || a.action === "reopen"
       || (p.changes?.labels && !titles(p.changes.labels.previous).includes(OPT_IN_LABEL));
-    return added ? a.iid : undefined;
+    return added
+      ? { iid: a.iid, trigger: "label", reason: `\`${OPT_IN_LABEL}\` label added` }
+      : { run: false, reason: `issue event didn't add \`${OPT_IN_LABEL}\`` };
   }
   if (p.object_kind === "note" && p.object_attributes.noteable_type === "Issue") {
     const i = p.issue;
-    if (i.state !== "opened" || !titles(i.labels).includes(OPT_IN_LABEL)) return;
-    if (p.object_attributes.note.includes(BOT_MARKER)) return;
-    return (await isDeveloper(p.user.id)) ? i.iid : undefined;
+    const event = { open: i.state === "opened", labels: titles(i.labels), body: String(p.object_attributes.note ?? "") };
+    // Everything but trust first, so ignored comments never cost a members API call.
+    const pre = decideComment({ ...event, trusted: true });
+    if (!pre.run) return pre;
+    const d = decideComment({ ...event, trusted: await isDeveloper(p.user.id) });
+    return d.run && d.trigger ? { iid: i.iid, trigger: d.trigger, reason: d.reason } : d;
   }
 }
 
@@ -61,12 +70,16 @@ function chainEvent(p: any): { mr: number; sha: string; action: "test" | "advanc
 const payloadFile = process.env.TRIGGER_PAYLOAD;
 const payload = payloadFile && !process.env.ISSUE ? JSON.parse(readFileSync(payloadFile, "utf8")) : undefined;
 const chain = payload ? chainEvent(payload) : undefined;
-const iid = process.env.ISSUE ? Number(process.env.ISSUE) : payload && !chain ? await actionableIssue(payload) : undefined;
+const decided = process.env.ISSUE
+  ? { iid: Number(process.env.ISSUE), trigger: "manual" as const, reason: "manual run" }
+  : payload && !chain ? await actionableIssue(payload) : undefined;
+const issue = decided && "iid" in decided ? decided : undefined;
+const iid = issue?.iid;
 const image = process.env.AGENT_IMAGE || `${need("CI_REGISTRY_IMAGE")}:latest`;
 console.error(
-  iid ? `[dispatch] issue #${iid} on ${image}`
+  issue ? `[dispatch] issue #${issue.iid} on ${image} (${issue.trigger}: ${issue.reason})`
     : chain ? `[dispatch] ${chain.action} sub-issue MR !${chain.mr} into ${chain.target}`
-    : "[dispatch] event not actionable",
+    : `[dispatch] event not actionable${decided ? `: ${decided.reason}` : ` (${payload?.object_kind ?? "no payload"})`}`,
 );
 
 // GitLab rejects an empty child pipeline, so we always emit exactly one job. For an actionable
@@ -84,7 +97,7 @@ chain-mr-${chain.mr}:
     strategy: depend
 ` : iid ? `
 agent-issue-${iid}:
-  variables: { ISSUE: "${iid}", AGENT_IMAGE: ${JSON.stringify(image)} }
+  variables: { ISSUE: "${iid}", AGENT_TRIGGER: "${issue!.trigger}", AGENT_IMAGE: ${JSON.stringify(image)} }
   resource_group: agent-issue-${iid}   # never two runs on one issue
   trigger:
     include: [{ local: .gitlab/agent-stages.yml }]

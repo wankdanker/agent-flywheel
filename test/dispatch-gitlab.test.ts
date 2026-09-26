@@ -1,5 +1,5 @@
 // bin/dispatch-gitlab.ts for sub-issue MR events (src/chain.ts): run as CI runs it, on a saved
-// payload. Issue/note payloads that need the members API aren't covered here.
+// payload. Issue/note payloads (which need the members API) are covered in test/dispatch.test.ts.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";

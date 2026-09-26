@@ -4,6 +4,7 @@ import { applyOutcome, buildPrompt, runTicket, trustedDirectives, type WorkerCon
 import { PublishRejected, type Publisher, type PushResult } from "../src/publish.ts";
 import type { Comment, CreatedIssue, ReviewRequest, SubIssueRequest, Ticket, Tracker } from "../src/tracker.ts";
 import { chainHeader, parseChain } from "../src/chain.ts";
+import { RESUME_HINT } from "../src/dispatch.ts";
 
 const comment = (over: Partial<Comment>): Comment => ({
   author: "someone",
@@ -310,7 +311,7 @@ test("applyOutcome: blocked (question) comments the question and sets state to b
 
   assert.equal(outcome.kind, "blocked");
   assert.deepEqual(tracker.states, ["blocked"]);
-  assert.deepEqual(tracker.comments, ["Which repo should this change land in?"]);
+  assert.deepEqual(tracker.comments, [`Which repo should this change land in?\n\n${RESUME_HINT}`]);
   assert.equal(publisher.pushes, 0);
   assert.deepEqual(tracker.reviews, []);
 });
@@ -392,7 +393,7 @@ test("applyOutcome: failed comments the explanation and sets state to blocked", 
 
   assert.equal(outcome.kind, "failed");
   assert.deepEqual(tracker.states, ["blocked"]);
-  assert.deepEqual(tracker.comments, ["The acceptance criteria conflict with the existing API contract; needs a maintainer decision."]);
+  assert.deepEqual(tracker.comments, [`The acceptance criteria conflict with the existing API contract; needs a maintainer decision.\n\n${RESUME_HINT}`]);
 });
 
 test("applyOutcome: no recorded outcome and nothing committed is incomplete and touches the tracker not at all", async () => {

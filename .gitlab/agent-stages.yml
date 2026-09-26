@@ -3,7 +3,7 @@
 #   prepare  AGENT_GITLAB_TOKEN only: fetch the issue, set agent/working, clone/check out the branch
 #   agent    model key only:          run the agent on that work dir, record its outcome in a file
 #   publish  AGENT_GITLAB_TOKEN only: validate the outcome and the branch as data, push, open the MR, label
-# Triggered by the one job bin/dispatch-gitlab.ts emits, with ISSUE and AGENT_IMAGE set; that
+# Triggered by the one job bin/dispatch-gitlab.ts emits, with ISSUE, AGENT_TRIGGER and AGENT_IMAGE set; that
 # trigger job holds the per-issue resource_group until this whole pipeline is done.
 #
 # Every job runs the image with `docker run` on dind rather than as its `image:`: a job's own env
@@ -54,14 +54,16 @@ agent-prepare:
   script:
     - echo "AGENT_IMAGE_PINNED=$(docker inspect --format '{{index .RepoDigests 0}}' "$AGENT_IMAGE" 2>/dev/null || echo "$AGENT_IMAGE")" > image.env
     - |
-      run_stage prepare -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST \
+      run_stage prepare -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e AGENT_TRIGGER \
         -e CI_API_V4_URL -e CI_SERVER_HOST -e CI_PROJECT_ID -e CI_PROJECT_PATH
       copy_out prepare || [ "$code" != 0 ]
       exit "$code"
   # 10 = blocked before the agent started (an untrusted issue awaiting a maintainer's go-ahead).
-  # The stage cleared the handoff before exiting, so the agent and publish jobs that still run
-  # after an allowed failure find nothing prepared and do nothing.
-  allow_failure: { exit_codes: [10] }
+  # 30 = skipped: AGENT_TRIGGER (set by bin/dispatch-gitlab.ts) no longer applies to the issue's
+  # live labels, e.g. a reply queued behind a run that already took the issue off agent/blocked.
+  # Either way the stage cleared the handoff before exiting, so the agent and publish jobs that
+  # still run after an allowed failure find nothing prepared and do nothing.
+  allow_failure: { exit_codes: [10, 30] }
   artifacts:
     when: always
     paths: [work]

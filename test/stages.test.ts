@@ -185,6 +185,38 @@ test("prepare: an untrusted issue with no trusted directive is blocked before cl
   assert.equal(tracker.comments.length, 1);
 });
 
+test("prepare: a reply queued behind the run that already settled it is skipped (30); a stale prepared.json doesn't start the agent", async () => {
+  const tracker = fakeTracker();
+  tracker.label = "blocked";
+  const e = envs();
+  const calls: Calls = { prepared: 0, sessions: 0, pushes: 0 };
+  const d = deps(tracker, calls, { status: "ready_for_review", summary: "Done." });
+  const reply = { AGENT_TRIGGER: "comment", AGENT_COMMENT: "Cursor-based, please." };
+  const first = await quietly(async () => [
+    await prepareStage({ ...d, env: { ...e.prepare, ...reply } }),
+    await agentStage({ ...d, env: e.agent }),
+    await publishStage({ ...d, env: e.publish }),
+  ]);
+  assert.deepEqual(first.result, [0, 0, 0]);
+  assert.equal(tracker.label, "review");
+
+  const second = await quietly(async () => [
+    await prepareStage({ ...d, env: { ...e.prepare, ...reply } }),
+    await agentStage({ ...d, env: e.agent }),
+    await publishStage({ ...d, env: e.publish }),
+  ]);
+  assert.deepEqual(second.result, [30, 0, 0]);
+  assert.match(second.logs, /\[trigger\] #7 comment: skipping, issue is now `agent\/review`/);
+  assert.deepEqual(calls, { prepared: 1, sessions: 1, pushes: 1 });
+  assert.deepEqual(tracker.states, ["working", "review"]);
+  assert.equal(tracker.comments.length, 1);
+
+  // `/agent continue` reruns it from review.
+  const forced = await quietly(() => prepareStage({ ...d, env: { ...e.prepare, AGENT_TRIGGER: "comment", AGENT_COMMENT: "/agent continue\nRework it." } }));
+  assert.equal(forced.result, 0);
+  assert.equal(tracker.label, "working");
+});
+
 test("prepare: a clone failure settles the issue as blocked and leaves nothing for the agent", async () => {
   const tracker = fakeTracker();
   const e = envs();

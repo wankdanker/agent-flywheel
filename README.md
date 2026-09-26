@@ -15,14 +15,16 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
 
 ## How an issue flows
 
-- **Label `agent`:** a run starts.
+- **Label `agent`:** the initial run starts.
 - **Status labels:** the agent sets `agent/working`, then either:
   - `agent/blocked`, when it asked a question, split the work into sub-issues, reported it
     couldn't complete the task, paused at a checkpoint before running out of turns, or hit an error (see "Stuck on
     `agent/working`" below), or
   - `agent/review`, when it opened an MR/PR.
 - **`agent/queued`:** a split's sub-issue waiting for the one before it to merge (see "Split issues").
-- **Reply on the issue:** a new run reads the whole thread and continues on branch `agent/issue-<n>`.
+- **Reply on an `agent/blocked` issue:** a new run reads the whole thread and continues on branch
+  `agent/issue-<n>`. Replies on an issue in any other state don't start a run; see "When a comment
+  starts a run" below.
   "Whole" is literal: the tracker follows every page of comments (GitHub's `Link: rel="next"`,
   GitLab's `x-next-page`), oldest first, with GitLab system notes left out. There is no
   comment cap and no silent truncation; if any page fails to load, the run errors out (and
@@ -44,9 +46,48 @@ Only trusted people can start a run:
 
 This matters because the agent runs with permissions bypassed and holds your secrets.
 
+### When a comment starts a run
+
+A run costs up to `MAX_TURNS` model turns, so the `agent` label alone doesn't make every comment
+a run. On both platforms (`src/dispatch.ts` has the one policy):
+
+| Event on an open `agent` issue | Runs? |
+| --- | --- |
+| `agent` label added (or the issue opened/reopened with it) | yes: the initial run |
+| trusted comment on an `agent/blocked` issue | yes: resumes |
+| trusted comment whose first nonblank line is `/agent continue` | yes, from any state |
+| any other comment on an unstarted, `agent/working`, `agent/review` or `agent/queued` issue | no |
+| a comment from an untrusted user, or carrying our bot marker | no |
+| manual run (GitHub *Run workflow*, GitLab *Run pipeline* with `ISSUE`) | yes, whatever the state |
+
+`/agent continue` is strict: exactly that, case-sensitive, as the comment's first nonblank line
+(trailing text on later lines is fine and becomes part of the thread the agent reads). Quoted
+(`> /agent continue`), fenced, indented or inline mentions don't count. For example, to have the
+agent rework an issue that's in review:
+
+```text
+/agent continue
+The pagination should be cursor-based; please rework the PR.
+```
+
+Every comment the bot leaves on a blocked issue ends with a line saying so, and the review
+comment says only `/agent continue` reruns it.
+
+Each platform's gate filters events before a run is queued: `.github/workflows/agent.yml`'s
+prepare `if` (and its identical `concurrency` expression), and `bin/dispatch-gitlab.ts`, which
+logs why it accepted or ignored each webhook. The gate hands the run how it was triggered
+(`AGENT_TRIGGER`: `label`, `command`, `comment` or `manual`; on GitHub also the comment body as
+`AGENT_COMMENT`, since Actions expressions can only prefilter the command), and the prepare
+stage re-checks that against the issue's live labels before touching it. A run whose reason has
+gone away, like a second reply on a blocked issue queued behind the run the first reply started,
+logs why and exits 30 without changing anything; both CIs treat that as success. Per-issue
+concurrency (GitHub's `concurrency` group, GitLab's `resource_group`) still keeps two runs on
+one issue from overlapping. `test/dispatch.test.ts` runs one fixture matrix of states,
+commands and commenters through both gates.
+
 Exit codes are 0 ready for review, 10 blocked (asked a question or split into sub-issues),
-20 checkpoint (paused at the turn limit with its work published), 1 incomplete or failed, 2 bad
-config. CI treats 10 and 20 as success.
+20 checkpoint (paused at the turn limit with its work published), 30 skipped (the trigger no
+longer applies), 1 incomplete or failed, 2 bad config. CI treats 10, 20 and 30 as success.
 
 ### Split issues
 
@@ -109,9 +150,9 @@ How that's enforced (`src/worker.ts`):
   outcome tools is denied, with instructions to commit and call `checkpoint`
   (what's done, what's next).
 - **Checkpoint outcome.** The publisher pushes the branch, then a checkpoint comments what's done and what's next, sets
-  `agent/blocked`, and exits 20. Reply on the issue (e.g. `/agent continue`) to resume from the
-  branch. If the SDK still hits `MAX_TURNS` with nothing recorded, that's treated as an implicit
-  checkpoint rather than a crash.
+  `agent/blocked`, and exits 20. Reply on the issue to resume from the branch. If the SDK still
+  hits `MAX_TURNS` with nothing recorded, that's treated as an implicit checkpoint rather than a
+  crash.
 - **Crash with commits.** If the session ends without an outcome for any other reason (a model
   API error, a killed agent job, or the agent just stopping), but the branch has commits over
   the default branch, the publisher still validates and pushes it. The issue gets a comment
@@ -130,8 +171,8 @@ config). That comment only carries the error's first line, capped and with secre
 values (env secrets, tokens, auth headers, URL credentials) scrubbed; the full error is in the
 CI log. If even the label update fails, the log says so and what to fix by hand.
 
-Bad config (missing credential, invalid `MAX_TURNS`, repo outside the allowlist) is caught
-before the issue is touched at all.
+Bad config (missing credential, `MAX_TURNS` that isn't an integer from 1 to 500, an unknown
+`AGENT_TRIGGER`, repo outside the allowlist) is caught before the issue is touched at all.
 
 What a process can't do is clean up after being killed. In CI the publish job still runs after
 a failed or timed-out agent job, finds no `outcome.json`, publishes whatever the agent committed

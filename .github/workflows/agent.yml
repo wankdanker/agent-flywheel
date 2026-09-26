@@ -1,6 +1,8 @@
 # Work an issue with the agent image.
-# Starts when a maintainer adds the `agent` label (only triage+ can), or when a
-# collaborator comments on an `agent` issue (our resume). Manual runs can pick the issue and image.
+# Starts when a maintainer adds the `agent` label (only triage+ can), when a collaborator
+# replies on an `agent/blocked` issue (our resume), or when a collaborator's comment starts with
+# `/agent continue` (a forced rerun from any state). Other comments start nothing. Manual runs
+# can pick the issue and image.
 # Secrets: ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN; optional AGENT_GH_TOKEN (a PAT or app
 # token) so the agent can edit .github/workflows and its PRs trigger CI.
 # Variables: AGENT_IMAGE pins the image (e.g. ghcr.io/owner/repo:sha-1a2b3c4); CLAUDE_MODEL, MAX_TURNS;
@@ -51,7 +53,9 @@ concurrency:
         github.event.issue.state == 'open' &&
         contains(github.event.issue.labels.*.name, 'agent') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
-        !contains(github.event.comment.body, '<!-- agent-flywheel -->')))
+        !contains(github.event.comment.body, '<!-- agent-flywheel -->') &&
+        (contains(github.event.issue.labels.*.name, 'agent/blocked') ||
+          contains(github.event.comment.body, '/agent continue'))))
       && format('agent-issue-{0}', github.event.issue.number || inputs.issue)
       || format('agent-skip-{0}', github.run_id) }}
   cancel-in-progress: false
@@ -61,9 +65,15 @@ env:
 
 jobs:
   prepare:
-    # The author_association allowlist below must stay in sync with
-    # GITHUB_TRUSTED_ASSOCIATIONS in src/trust.ts, which gates what the agent reads as
-    # instructions using the same rule, and with the concurrency group above.
+    # When an event starts a run (src/dispatch.ts has the policy; bin/dispatch-gitlab.ts applies
+    # the same on GitLab): the `agent` label being added; a trusted, non-bot comment on an
+    # `agent/blocked` issue; or one starting with `/agent continue`, from any state. Ordinary
+    # comments on working/review/queued issues start nothing. The command test here is only a
+    # prefilter (expressions can't find the first nonblank line, and `contains` ignores case):
+    # the prepare stage re-checks the command strictly, and the trigger against the issue's live
+    # labels (AGENT_TRIGGER/AGENT_COMMENT below), and skips a run whose reason no longer holds. test/ci-config.test.ts evaluates this `if` against event
+    # fixtures and checks the concurrency group above repeats it exactly. The author_association
+    # allowlist must stay in sync with GITHUB_TRUSTED_ASSOCIATIONS in src/trust.ts.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' && github.event.label.name == 'agent') ||
@@ -72,7 +82,9 @@ jobs:
         github.event.issue.state == 'open' &&
         contains(github.event.issue.labels.*.name, 'agent') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
-        !contains(github.event.comment.body, '<!-- agent-flywheel -->'))
+        !contains(github.event.comment.body, '<!-- agent-flywheel -->') &&
+        (contains(github.event.issue.labels.*.name, 'agent/blocked') ||
+          contains(github.event.comment.body, '/agent continue')))
     # GitHub gives issue/issue_comment-triggered runs a read-only cache by default (untrusted
     # triggers), which silently dropped every work-dir save. These jobs only run for trusted
     # people (the `if` above), no container ever sees the cache token, and the only thing
@@ -118,6 +130,10 @@ jobs:
         env:
           IMAGE: ${{ steps.image.outputs.image }}
           GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          # How this run was started, for the prepare stage's re-check (src/dispatch.ts). The
+          # comment body goes through env, never into the script text.
+          AGENT_TRIGGER: ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name == 'issues' && 'label' || 'comment' }}
+          AGENT_COMMENT: ${{ github.event.comment.body }}
         run: |
           # docker run rather than `container:`: same as a local run. The one bind mount (the
           # work dir) needs its owner matched to the image's user at run time (never
@@ -126,7 +142,7 @@ jobs:
           uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
           sudo chown -R "$uid:$uid" agent-work
           set +e
-          docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN \
+          docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e AGENT_TRIGGER -e AGENT_COMMENT \
             -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
             -v "$PWD/agent-work:/work" \
             "$IMAGE" --stage prepare
@@ -135,6 +151,8 @@ jobs:
           if [ "$code" = 0 ]; then echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           # 10 = blocked before the agent started (an untrusted issue awaiting a maintainer's go-ahead).
           if [ "$code" = 10 ]; then echo "::notice::#$ISSUE is waiting on a trusted maintainer"; exit 0; fi
+          # 30 = the trigger no longer applies to the issue's live state (the log says why); nothing touched.
+          if [ "$code" = 30 ]; then echo "::notice::#$ISSUE: nothing to run ($AGENT_TRIGGER no longer applies)"; exit 0; fi
           exit "$code"
       - name: Hand the work directory to the agent job
         if: steps.prepare.outputs.proceed == 'true'
