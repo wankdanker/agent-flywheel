@@ -99,6 +99,22 @@ jobs:
           # 10 = asked a question on the issue; not a failure for us.
           if [ "$code" = 10 ]; then echo "::notice::Asked a question on #$ISSUE"; exit 0; fi
           exit "$code"
+      # src/run.ts already leaves a terminal label on every failure it can catch. This covers
+      # what it can't: the container killed by the job timeout or a cancel before it could
+      # clean up. (Losing the runner itself runs nothing; see README "Stuck on agent/working".)
+      - name: Unstick agent/working
+        if: failure() || cancelled()
+        env:
+          ISSUE: ${{ github.event.issue.number || inputs.issue }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          if gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' | grep -qx 'agent/working'; then
+            gh issue edit "$ISSUE" -R "$GITHUB_REPOSITORY" --remove-label agent/working --add-label agent/blocked
+            gh issue comment "$ISSUE" -R "$GITHUB_REPOSITORY" --body "$(printf '%s\n\n%s\n\n%s' \
+              '🤖 **Agent Flywheel**' \
+              "The run was stopped (timed out or cancelled) before it could finish, so I've marked this issue blocked. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Reply here to have me retry." \
+              '<!-- agent-flywheel -->')"
+          fi
       - name: Save work directory cache
         if: always()
         uses: actions/cache/save@v4
