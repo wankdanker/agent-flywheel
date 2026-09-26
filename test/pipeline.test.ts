@@ -210,6 +210,151 @@ test("repeated runs target the same branch and each republication updates (not d
   }
 });
 
+// Like mockAgentTurn, but scripts whole assistant turns and runs worker.ts's real
+// PreToolUse/PostToolUse hooks around every tool call, the way the SDK would: each turn is
+// yielded as an assistant message, then each of its tool calls goes through PreToolUse
+// (a deny skips the tool) and, if it ran, PostToolUse. Records what the model would see.
+type Seen = { tool: string; denied?: string; context?: string };
+function mockHookedTurns(turns: ToolCall[][], endSubtype: "success" | "error_max_turns" = "success") {
+  let tools: any[] = [];
+  const seen: Seen[] = [];
+  const runHooks = async (matchers: any[] | undefined, input: any, id: string) => {
+    const outs = [];
+    for (const m of matchers ?? []) for (const h of m.hooks) outs.push(await h(input, id, { signal: new AbortController().signal }));
+    return outs;
+  };
+  const mocked = mock.module("@anthropic-ai/claude-agent-sdk", {
+    cache: false,
+    namedExports: {
+      ...sdk,
+      createSdkMcpServer: (opts: any) => {
+        tools = opts.tools;
+        return { type: "sdk", name: opts.name, instance: {} };
+      },
+      query: (params: any) => {
+        const hooks = params.options.hooks;
+        async function* run() {
+          for await (const _ of params.prompt) break;
+          let n = 0;
+          for (const [i, calls] of turns.entries()) {
+            const blocks = calls.map((c, j) => ({ type: "tool_use", id: `tu_${i}_${j}`, name: c.name, input: c.input }));
+            yield { type: "assistant", parent_tool_use_id: null, message: { id: `msg_${i}`, content: blocks } };
+            for (const [j, call] of calls.entries()) {
+              const id = `tu_${i}_${j}`;
+              const base = { session_id: "s", transcript_path: "/t", cwd: "/tmp/work", tool_name: call.name, tool_input: call.input, tool_use_id: id };
+              const pre = await runHooks(hooks?.PreToolUse, { ...base, hook_event_name: "PreToolUse" }, id);
+              const deny = pre.find((o: any) => o.hookSpecificOutput?.permissionDecision === "deny");
+              if (deny) {
+                seen.push({ tool: call.name, denied: deny.hookSpecificOutput.permissionDecisionReason });
+                continue;
+              }
+              const mcp = call.name.replace(/^mcp__ticket__/, "");
+              const t = tools.find((x) => x.name === mcp);
+              if (call.name.startsWith("mcp__ticket__") && t) await t.handler(call.input, {});
+              const post = await runHooks(hooks?.PostToolUse, { ...base, hook_event_name: "PostToolUse", tool_response: "ok" }, id);
+              seen.push({ tool: call.name, context: post.map((o: any) => o.hookSpecificOutput?.additionalContext).join("") });
+            }
+            n++;
+          }
+          yield { type: "result", subtype: endSubtype, num_turns: n, total_cost_usd: 0 };
+        }
+        return run();
+      },
+    },
+  });
+  return { mocked, seen };
+}
+
+test("turn gauge: every tool result carries [Turn X/Y | Z turns remaining]", async () => {
+  const { mocked, seen } = mockHookedTurns([
+    [{ name: "Read", input: { file_path: "/tmp/work/README.md" } }, { name: "Bash", input: { command: "npm test" } }],
+    [{ name: "Edit", input: { file_path: "/tmp/work/a.ts" } }],
+    [{ name: "mcp__ticket__finish", input: { summary: "Done.", mr_url: "https://example.test/repo/pull/3" } }],
+  ]);
+  const { runTicket } = await importWorker();
+  const tracker = fakeTracker();
+  try {
+    const outcome = await runTicket(ticket(), {
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 10,
+    });
+    assert.equal(outcome.kind, "ready_for_review");
+    assert.deepEqual(seen.map((s) => s.context), [
+      "[Turn 1/10 | 9 turns remaining]",
+      "[Turn 1/10 | 9 turns remaining]",
+      "[Turn 2/10 | 8 turns remaining]",
+      "[Turn 3/10 | 7 turns remaining]",
+    ]);
+  } finally {
+    mocked.restore();
+  }
+});
+
+test("interceptor: at 2 turns remaining, edits are denied with checkpoint instructions; git and checkpoint go through", async () => {
+  const { mocked, seen } = mockHookedTurns([
+    [{ name: "Edit", input: { file_path: "/tmp/work/a.ts" } }],
+    [{ name: "Edit", input: { file_path: "/tmp/work/b.ts" } }, { name: "Bash", input: { command: "npm test" } }],
+    [{ name: "Bash", input: { command: "git add -A && git commit -m 'gauge done; tests next' && git push -u origin HEAD" } }],
+    [{ name: "mcp__ticket__checkpoint", input: { summary: "Gauge done.", next_steps: "Write tests." } }],
+  ]);
+  const { runTicket } = await importWorker();
+  const tracker = fakeTracker();
+  try {
+    const outcome = await runTicket(ticket(), {
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 4,
+    });
+    assert.equal(outcome.kind, "checkpoint");
+    assert.equal(seen[0]!.denied, undefined); // turn 1 of 4: 3 remaining
+    for (const s of seen.slice(1, 3)) {
+      assert.match(s.denied ?? "", /Stop editing now/);
+      assert.match(s.denied ?? "", /agent\/issue-77/);
+      assert.match(s.denied ?? "", /credential\.helper=.*GH_TOKEN/);
+      assert.match(s.denied ?? "", /`checkpoint` tool/);
+    }
+    assert.equal(seen[3]!.denied, undefined);
+    assert.equal(seen[3]!.context, "[Turn 3/4 | 1 turns remaining]");
+    assert.equal(seen[4]!.denied, undefined);
+    assert.deepEqual(tracker.states, ["blocked"]);
+    assert.match(tracker.comments[0]!, /Gauge done\.[\s\S]*Write tests\./);
+  } finally {
+    mocked.restore();
+  }
+});
+
+test("running out of turns without a checkpoint is an implicit checkpoint, not incomplete", async () => {
+  const { mocked } = mockHookedTurns([[{ name: "Edit", input: { file_path: "/tmp/work/a.ts" } }]], "error_max_turns");
+  const { runTicket } = await importWorker();
+  const tracker = fakeTracker();
+  try {
+    const outcome = await runTicket(ticket(), {
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", maxTurns: 1,
+    });
+    assert.equal(outcome.kind, "checkpoint");
+    assert.deepEqual(tracker.states, ["blocked"]);
+    assert.match(tracker.comments[0]!, /used all 1 turns/);
+  } finally {
+    mocked.restore();
+  }
+});
+
+test("checkpoint maps to exit code 20, distinct from blocked (10) and incomplete (1)", async () => {
+  const { EXIT_CODES } = await import("../src/run.ts");
+  assert.equal(EXIT_CODES.checkpoint, 20);
+  assert.equal(EXIT_CODES.blocked, 10);
+  assert.equal(EXIT_CODES.incomplete, 1);
+});
+
+test("allowedWhenOutOfTurns: only git commands and the ticket tools", async () => {
+  const { allowedWhenOutOfTurns } = await importWorker();
+  assert.equal(allowedWhenOutOfTurns("Bash", { command: "git status" }), true);
+  assert.equal(allowedWhenOutOfTurns("Bash", { command: "cd /work/issue-77 && git commit -am wip" }), true);
+  assert.equal(allowedWhenOutOfTurns("Bash", { command: "git -c credential.helper='!f() { echo x; }; f' push -u origin HEAD" }), true);
+  assert.equal(allowedWhenOutOfTurns("mcp__ticket__checkpoint", {}), true);
+  assert.equal(allowedWhenOutOfTurns("Bash", { command: "npm test" }), false);
+  assert.equal(allowedWhenOutOfTurns("Bash", { command: "gitk" }), false);
+  assert.equal(allowedWhenOutOfTurns("Edit", { file_path: "a.ts" }), false);
+  assert.equal(allowedWhenOutOfTurns("Write", {}), false);
+});
+
 test.todo(
   "invalid patch (submodule / path-escape / credential-file change) is rejected by the publisher, nothing pushed -- " +
   "there is no privileged publisher or patch-validation step in this repo yet; the agent sandbox pushes and opens " +

@@ -15,7 +15,9 @@ import { branchFor, runTicket as realRunTicket, settle, SettlementError, type Ou
 
 // split behaves like blocked for CI's purposes: not a failure, nothing merged yet, the
 // issue is left `blocked` for a human or a sub-issue's own run to pick back up.
-export const EXIT_CODES: Record<Outcome["kind"], number> = { ready_for_review: 0, blocked: 10, split: 10, incomplete: 1, failed: 1 };
+// checkpoint (20) is a graceful pause at the turn limit, work pushed to the branch; also a
+// success for CI, and distinct from 10 so CI can later auto-relay it to a new run.
+export const EXIT_CODES: Record<Outcome["kind"], number> = { ready_for_review: 0, blocked: 10, split: 10, checkpoint: 20, incomplete: 1, failed: 1 };
 
 // Bad or missing configuration: exit 2, and (when it's found before we set `working`)
 // without touching the issue at all.
@@ -269,7 +271,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
 
     if (outcome.kind === "incomplete") {
       outcome = await settle(outcome, [
-        () => guard.tracker.comment(`I stopped before finishing (turn limit or error). Reply here to have me continue from branch \`${branchFor(ticket)}\`.`),
+        () => guard.tracker.comment(`I stopped before finishing. Reply here to have me continue from branch \`${branchFor(ticket)}\`.`),
         () => guard.tracker.setState("blocked"),
       ]);
     }

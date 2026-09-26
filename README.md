@@ -18,7 +18,7 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
 - **Label `agent`:** a run starts.
 - **Status labels:** the agent sets `agent/working`, then either:
   - `agent/blocked`, when it asked a question, split the work into sub-issues, reported it
-    couldn't complete the task, ran out of turns, or hit an error (see "Stuck on
+    couldn't complete the task, paused at a checkpoint before running out of turns, or hit an error (see "Stuck on
     `agent/working`" below), or
   - `agent/review`, when it opened an MR/PR.
 - **Reply on the issue:** a new run reads the whole thread and continues on branch `agent/issue-<n>`.
@@ -43,7 +43,36 @@ Only trusted people can start a run:
 This matters because the agent runs with permissions bypassed and holds your secrets.
 
 Exit codes are 0 ready for review, 10 blocked (asked a question or split into sub-issues),
-1 incomplete or failed, 2 bad config. CI treats 10 as a success.
+20 checkpoint (paused at the turn limit with its work pushed), 1 incomplete or failed, 2 bad
+config. CI treats 10 and 20 as success.
+
+### Stateless iteration, durable checkpoints
+
+The container and the model's context are ephemeral. The git remote and the issue thread are
+the single source of truth. Each run starts fresh, reads the task and the branch's commit log,
+completes a bounded milestone, pushes its state, and yields. The work-dir cache is only an
+optimization on top of that.
+
+How that's enforced (`src/worker.ts`):
+
+- **Turn gauge.** Every tool result the model sees ends with `[Turn X/Y | Z turns remaining]`,
+  so it can plan a clean stopping point against `MAX_TURNS`.
+- **Commit-and-push cadence.** `agent/CLAUDE.md` tells the agent to commit and push its
+  `agent/issue-<n>` branch after every passing test run or finished sub-task, with commit
+  messages that say what's done and what's next, so git is a continuous save state.
+- **Interceptor.** With 2 or fewer turns left, every tool call except git commands and the
+  outcome tools is denied, with instructions to commit, push the branch, and call `checkpoint`
+  (what's done, what's next).
+- **Checkpoint outcome.** A checkpoint comments what's done and what's next, sets
+  `agent/blocked`, and exits 20. Reply on the issue (e.g. `/agent continue`) to resume from the
+  branch. If the SDK still hits `MAX_TURNS` with nothing recorded, that's treated as an implicit
+  checkpoint rather than a crash.
+
+Not yet: CI re-dispatching a run on exit 20 by itself (auto-relay). That waits on a cap on
+chained autonomous runs, so for now a human reply continues a checkpointed issue.
+Once the privileged publisher (#26) takes pushing away from the agent, "commit and push" in
+this cadence becomes "commit locally", and the publisher (or a post-step for a checkpoint
+outcome) pushes the branch.
 
 ### Stuck on `agent/working`
 

@@ -1,4 +1,4 @@
-import { query, tool, createSdkMcpServer, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, tool, createSdkMcpServer, type HookCallbackMatcher, type HookEvent, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Comment, NewSubIssue, Repo, Ticket, Tracker } from "./tracker.ts";
 
@@ -22,9 +22,14 @@ export type AgentOutcome =
   | { status: "blocked"; question: string }
   | { status: "ready_for_review"; summary: string; mrUrl: string }
   | { status: "split"; summary: string; subtasks: NewSubIssue[] }
-  | { status: "failed"; summary: string };
+  | { status: "failed"; summary: string }
+  | { status: "checkpoint"; summary: string; nextSteps: string };
 
-export type Outcome = { kind: "blocked" | "ready_for_review" | "split" | "failed" | "incomplete"; detail: string };
+export type Outcome = { kind: "blocked" | "ready_for_review" | "split" | "failed" | "checkpoint" | "incomplete"; detail: string };
+
+// How the agent's session ended, as far as applyOutcome needs to know: running out of
+// MAX_TURNS without recording anything is an implicit checkpoint, not a crash.
+export type SessionEnd = { maxTurnsHit: boolean };
 
 export const branchFor = (t: Ticket) => `agent/issue-${t.number}`;
 
@@ -82,6 +87,105 @@ issue asks about another repo.
 Open the ${cfg.tracker.platform === "github" ? "PR" : "MR"} with the \`${skill}\` skill.`;
 }
 
+// ---- Turn gauge and checkpoint interceptor ----
+//
+// The container and the model's context are ephemeral; the git remote and the issue thread
+// are the only durable state. So the model gets told how much runway it has left on every
+// tool result, and once it's down to CHECKPOINT_AT turns, everything except committing,
+// pushing, and recording an outcome is denied, so the run ends with its work on the branch
+// instead of being cut off mid-edit by the SDK.
+
+export const CHECKPOINT_AT = 2;
+
+export const gaugeText = (turn: number, max: number) => `[Turn ${turn}/${max} | ${Math.max(0, max - turn)} turns remaining]`;
+
+// The same one-shot credential helper the github-pr/gitlab-mr skills push with: nothing
+// token-bearing is written to git config.
+export const pushCommand = (platform: Tracker["platform"]) =>
+  platform === "github"
+    ? `git -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push -u origin HEAD`
+    : `git -c credential.helper='!f() { echo username=oauth2; echo "password=$AGENT_GITLAB_TOKEN"; }; f' push -u origin HEAD`;
+
+export const checkpointInstructions = (t: Ticket, platform: Tracker["platform"]) =>
+  `You are out of turns (${CHECKPOINT_AT} or fewer left), so this tool call was denied. Stop editing now. ` +
+  `Stage and commit your work (\`git add -A && git commit -m "<what's done; what's next>"\`), push branch ` +
+  `${branchFor(t)} with \`${pushCommand(platform)}\`, then call the \`checkpoint\` tool with a summary of ` +
+  `what's done and the next steps. Only git commands and the ticket outcome tools are allowed from here on.`;
+
+// A runway guard for a cooperative agent, not a sandbox: a Bash call is let through when it
+// is a git command (optionally after a `cd`), so `git add && git commit && git push` chains work.
+export function allowedWhenOutOfTurns(toolName: string, input: unknown): boolean {
+  if (toolName.startsWith("mcp__ticket__") || toolName === "ToolSearch") return true;
+  if (toolName !== "Bash") return false;
+  const command = (input as { command?: unknown } | null)?.command;
+  if (typeof command !== "string") return false;
+  return /^git\s/.test(command.trim().replace(/^cd\s+\S+\s*&&\s*/, ""));
+}
+
+// Counts main-thread assistant turns as drain() sees them. The SDK can run a tool's hooks
+// before our consumer has pulled the assistant message that called it, so a tool_use id we
+// haven't seen yet belongs to the turn after the last one counted.
+export class TurnGauge {
+  turns = 0;
+  readonly max: number;
+  private readonly seen = new Set<string>();
+  private readonly messageIds = new Set<string>();
+  constructor(max: number) {
+    this.max = max;
+  }
+  observe(msg: SDKMessage) {
+    if (msg.type !== "assistant" || msg.parent_tool_use_id !== null) return;
+    // One API response can arrive as several assistant messages (one per content block).
+    if (!this.messageIds.has(msg.message.id)) {
+      this.messageIds.add(msg.message.id);
+      this.turns++;
+    }
+    for (const b of msg.message.content) if (b.type === "tool_use") this.seen.add(b.id);
+  }
+  turnFor(toolUseId: string | undefined, fromSubagent: boolean) {
+    return fromSubagent || (toolUseId !== undefined && this.seen.has(toolUseId)) ? this.turns : this.turns + 1;
+  }
+  remaining(turn: number) {
+    return this.max - turn;
+  }
+}
+
+export function turnHooks(gauge: TurnGauge, t: Ticket, platform: Tracker["platform"]): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  return {
+    PreToolUse: [{
+      hooks: [async (input, toolUseId) => {
+        if (input.hook_event_name !== "PreToolUse") return {};
+        const turn = gauge.turnFor(toolUseId ?? input.tool_use_id, input.agent_id !== undefined);
+        if (gauge.remaining(turn) > CHECKPOINT_AT || allowedWhenOutOfTurns(input.tool_name, input.tool_input)) return {};
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: `${checkpointInstructions(t, platform)} ${gaugeText(turn, gauge.max)}`,
+          },
+        };
+      }],
+    }],
+    PostToolUse: [{
+      hooks: [async (input, toolUseId) => {
+        if (input.hook_event_name !== "PostToolUse") return {};
+        const turn = gauge.turnFor(toolUseId ?? input.tool_use_id, input.agent_id !== undefined);
+        return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: gaugeText(turn, gauge.max) } };
+      }],
+    }],
+  };
+}
+
+export const checkpointComment = (t: Ticket, summary: string, nextSteps: string) =>
+  `I'm pausing at a checkpoint before running out of turns. My work so far is committed and pushed to ` +
+  `branch \`${branchFor(t)}\`.\n\n**Done:**\n${summary}\n\n**Next:**\n${nextSteps}\n\n` +
+  `Reply here (e.g. \`/agent continue\`) to have me pick it up from that branch.`;
+
+export const implicitCheckpointComment = (t: Ticket, maxTurns: number) =>
+  `I used all ${maxTurns} turns before recording a checkpoint. Whatever I committed and pushed is on branch ` +
+  `\`${branchFor(t)}\`; its \`git log\` says what's done. Reply here (e.g. \`/agent continue\`) to have me ` +
+  `pick it up from that branch.`;
+
 // Thrown by applyOutcome when some of its forge writes failed. Carries the outcome the
 // agent actually reached, so a tracker failure never hides the worker's result: the caller
 // (src/run.ts) logs it and falls back to `blocked` if no terminal label got applied.
@@ -114,11 +218,20 @@ export async function settle(outcome: Outcome, writes: (() => Promise<unknown>)[
 // The single trusted post-agent step: turns whatever the agent's tool calls recorded in
 // memory into the actual forge writes. Runs once, after the agent's turn is fully over —
 // never from inside a tool handler the model can invoke mid-session.
-export async function applyOutcome(t: Ticket, cfg: WorkerConfig, recorded: AgentOutcome | undefined): Promise<Outcome> {
+export async function applyOutcome(
+  t: Ticket, cfg: WorkerConfig, recorded: AgentOutcome | undefined, end: SessionEnd = { maxTurnsHit: false },
+): Promise<Outcome> {
+  const { tracker } = cfg;
   if (!recorded) {
+    if (end.maxTurnsHit) {
+      const text = implicitCheckpointComment(t, cfg.maxTurns);
+      return settle({ kind: "checkpoint", detail: `used all ${cfg.maxTurns} turns without recording an outcome` }, [
+        () => tracker.comment(text),
+        () => tracker.setState("blocked"),
+      ]);
+    }
     return { kind: "incomplete", detail: "Agent stopped without asking, splitting, or finishing." };
   }
-  const { tracker } = cfg;
   switch (recorded.status) {
     case "blocked":
       return settle({ kind: "blocked", detail: recorded.question }, [
@@ -150,6 +263,11 @@ export async function applyOutcome(t: Ticket, cfg: WorkerConfig, recorded: Agent
     case "failed":
       return settle({ kind: "failed", detail: recorded.summary }, [
         () => tracker.comment(recorded.summary),
+        () => tracker.setState("blocked"),
+      ]);
+    case "checkpoint":
+      return settle({ kind: "checkpoint", detail: recorded.summary }, [
+        () => tracker.comment(checkpointComment(t, recorded.summary, recorded.nextSteps)),
         () => tracker.setState("blocked"),
       ]);
   }
@@ -213,6 +331,18 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
           recorded = { status: "failed", summary };
           return { content: [{ type: "text", text: "Failure recorded. End your turn now." }] };
         }),
+      tool("checkpoint",
+        "Pause at a durable checkpoint when you're about to run out of turns: after committing your work " +
+          "and pushing your branch, record what's done and what's next so the next run can continue from " +
+          "the branch. Stop working after calling this.",
+        {
+          summary: z.string().describe("What's done so far and is committed and pushed."),
+          next_steps: z.string().describe("What remains, specific enough for a fresh run to pick up from the branch."),
+        },
+        async ({ summary, next_steps }) => {
+          recorded = { status: "checkpoint", summary, nextSteps: next_steps };
+          return { content: [{ type: "text", text: "Checkpoint recorded. End your turn now." }] };
+        }),
     ],
   });
 
@@ -221,6 +351,8 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
     yield { type: "user" as const, message: { role: "user" as const, content: buildPrompt(t, cfg) }, parent_tool_use_id: null };
   }
 
+  const gauge = new TurnGauge(cfg.maxTurns);
+  const end: SessionEnd = { maxTurnsHit: false };
   try {
     await drain(query({
       prompt: prompt(),
@@ -236,19 +368,23 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         systemPrompt: { type: "preset", preset: "claude_code" },
+        hooks: turnHooks(gauge, t, cfg.tracker.platform),
       },
-    }));
+    }), gauge, end);
   } catch (err) {
     // The agent already decided (and e.g. already pushed a PR) before the SDK or model API
-    // blew up on the way out: honor that decision rather than discard it.
-    if (!recorded) throw err;
-    console.error(`[error] agent session failed after recording ${recorded.status}; applying it anyway:`, err);
+    // blew up on the way out: honor that decision rather than discard it. Likewise the SDK
+    // may throw after an error_max_turns result; that's an implicit checkpoint, not a crash.
+    if (!recorded && !end.maxTurnsHit) throw err;
+    console.error(`[error] agent session failed after ${recorded ? `recording ${recorded.status}` : "running out of turns"}; applying it anyway:`, err);
   }
-  return applyOutcome(t, cfg, recorded);
+  return applyOutcome(t, cfg, recorded, end);
 }
 
-async function drain(messages: AsyncIterable<SDKMessage>) {
+async function drain(messages: AsyncIterable<SDKMessage>, gauge: TurnGauge, end: SessionEnd) {
   for await (const msg of messages) {
+    gauge.observe(msg);
+    if (msg.type === "result" && msg.subtype === "error_max_turns") end.maxTurnsHit = true;
     if (msg.type === "assistant") {
       for (const b of msg.message.content) {
         if (b.type === "text") console.log(`[claude] ${b.text}`);

@@ -54,7 +54,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - starts `src/model-proxy.ts` with the real `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`
     and runs the worker with that credential stripped from its env (see README's "Model
     credential exposure"), closing the proxy in a `finally` regardless of outcome;
-  - maps the outcome to an exit code: 0 ready for review, 10 blocked (question or split into sub-issues), 1 incomplete or failed, 2 bad config. Both CIs treat 10 as success.
+  - maps the outcome to an exit code: 0 ready for review, 10 blocked (question or split into sub-issues), 20 checkpoint (paused at the turn limit, work pushed), 1 incomplete or failed, 2 bad config. Both CIs treat 10 and 20 as success.
   - Pushing (opening the PR/MR) still happens inside the agent's own shell, via the
     `github-pr`/`gitlab-mr` skills, which pass `GH_TOKEN`/`AGENT_GITLAB_TOKEN` to a one-shot
     `git -c credential.helper=...` on the push command itself rather than persistent config.
@@ -66,8 +66,8 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 - `src/worker.ts`'s `buildPrompt` renders the issue into a prompt, gated by trust (see README's "Trust model"): a trusted-authored issue's title/body/trusted-thread are used as before; an untrusted-authored issue's title/body are never included, and only trusted human comments (`trustedDirectives`) become the task. `runTicket` short-circuits to `agent/blocked` before ever calling the model when an untrusted-authored issue has no trusted directive yet. It then runs `query()` with:
   - `bypassPermissions`;
   - our plugin;
-  - an in-process MCP server with `ask_question`, `finish`, `split_into_subtasks` and
-    `report_failure`. None of these tool handlers touch the tracker directly — while the
+  - an in-process MCP server with `ask_question`, `finish`, `split_into_subtasks`,
+    `report_failure` and `checkpoint`. None of these tool handlers touch the tracker directly — while the
     agent's turn is running, in the same process that holds the tracker's forge token, they
     only record a structured `AgentOutcome` in memory and return a short confirmation to the
     model. `runTicket` calls `applyOutcome` once the `query()` loop is fully over, which is
@@ -75,9 +75,13 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     `ask_question` → blocked; `finish` → review; `split_into_subtasks` → blocked, opening
     sub-issues, each carrying the `agent` label so it starts its own run
     (`Tracker#createSubIssue`, one per platform since GitHub and GitLab differ in what makes
-    a newly-created issue's label actually fire the trigger); `report_failure` → blocked.
+    a newly-created issue's label actually fire the trigger); `report_failure` → blocked; `checkpoint` → blocked, with a done/next comment, exit 20.
+  - It also registers `turnHooks`: a `PostToolUse` hook appends `[Turn X/Y | Z turns remaining]`
+    (`TurnGauge`, counting main-thread assistant messages seen by `drain`) to every tool result, and
+    a `PreToolUse` hook denies everything but git Bash commands and the `mcp__ticket__*` tools once
+    `CHECKPOINT_AT` (2) or fewer turns remain, telling the agent to commit, push, and call `checkpoint`.
 
-  If the agent calls none of these tools, `applyOutcome` reports `incomplete`. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
+  If the agent calls none of these tools, `applyOutcome` reports `incomplete`, unless the session ended with `error_max_turns`, which is an implicit `checkpoint`. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
 - `src/smoke.ts` (`bin/smoke.ts`, `entrypoint.sh --smoke`) is the image's pre-`:latest` smoke test (see README's "Image versions and rollback"). It deliberately reuses `src/run.ts`'s `stripEmptyEnv`, `requireModelCredential` and `startProxyFromEnv`, plus `sandboxEnv`, instead of copying them, so it can't drift from the path a real run takes. Then it runs one `query()` (`maxTurns: 1`, no tools, `SMOKE_MODEL` falling back to `CLAUDE_MODEL`, aborted after `SMOKE_TIMEOUT_MS`) and passes only on a `success` result with at least one request through the proxy. Keep any new proxy/env setup for issue runs in those shared helpers.
 - `src/model-proxy.ts` is the loopback-only HTTP proxy `bin/run-ticket.ts` puts in front of
   the real model credential (`startModelProxy`, `credentialFromEnv`, `sandboxEnv`; see
