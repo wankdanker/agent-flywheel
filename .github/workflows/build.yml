@@ -1,5 +1,6 @@
 # Build and push the agent image to GHCR.
-#   default branch → :latest + :sha-<short>   (what issues run on, unless AGENT_IMAGE pins one)
+#   default branch → :sha-<short>, then :latest only once that image passes the smoke test
+#                    (what issues run on, unless AGENT_IMAGE pins one)
 #   tag            → :<tag>
 #   other branch   → :<branch>                (try an image change via the agent workflow's `image` input)
 # Run this workflow by hand once to make the first image.
@@ -45,7 +46,6 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-,enable={{is_default_branch}}
             type=ref,event=tag
             type=ref,event=branch,enable=${{ github.ref_name != github.event.repository.default_branch }}
@@ -55,6 +55,54 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # One real model turn through the new image's own proxy path (entrypoint.sh --smoke, see
+  # src/smoke.ts) before it becomes :latest: unit tests mock the SDK and the upstream, and a
+  # broken :latest also breaks the run that would fix it (#28). Default branch only, so it
+  # costs one tiny request per merge. Fails → :latest stays on the last good image.
+  smoke:
+    needs: [image]
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # Same model secret and optional vars as agent.yml, passed the same way (`-e VAR`, so an
+      # unset one arrives as ""). No GH_TOKEN/AGENT_GITLAB_TOKEN: the smoke test needs none.
+      - name: Smoke-test the image
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          SMOKE_MODEL: ${{ vars.SMOKE_MODEL }}
+          MODEL_PROXY_MAX_REQUESTS: ${{ vars.MODEL_PROXY_MAX_REQUESTS }}
+          MODEL_PROXY_MAX_LIFETIME_MS: ${{ vars.MODEL_PROXY_MAX_LIFETIME_MS }}
+          MODEL_PROXY_REQUEST_TIMEOUT_MS: ${{ vars.MODEL_PROXY_REQUEST_TIMEOUT_MS }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA::7}"
+          docker run --rm \
+            -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e SMOKE_MODEL \
+            -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS \
+            "$image" --smoke
+
+  latest:
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      # Re-points the tag at the already-pushed manifest; nothing is rebuilt.
+      - run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker buildx imagetools create -t "$repo:latest" "$repo:sha-${GITHUB_SHA::7}"
 
   labels:
     # Keep issue labels in sync with labels.json. Only on the default branch, since

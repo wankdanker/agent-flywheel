@@ -36,6 +36,8 @@ export type RunDeps = {
   runTicket?: typeof realRunTicket;
 };
 
+export const DEFAULT_PLUGIN_DIR = "/opt/agent/agent/plugin";
+
 const req = (env: NodeJS.ProcessEnv, k: string): string => {
   const v = env[k];
   if (!v) throw new ConfigError(`missing env ${k}`);
@@ -50,6 +52,30 @@ export function parseMaxTurns(raw: string | undefined): number {
 }
 
 const optionalNumber = (env: NodeJS.ProcessEnv, k: string) => (env[k] ? Number(env[k]) : undefined);
+
+// CI and `docker --env-file` hand us unset optional vars as "", which would read as set.
+// Both entry points (bin/run-ticket.ts, bin/smoke.ts) call this first, on process.env.
+export function stripEmptyEnv(env: NodeJS.ProcessEnv): void {
+  for (const [k, v] of Object.entries(env)) if (v === "") delete env[k];
+}
+
+export function requireModelCredential(env: NodeJS.ProcessEnv): void {
+  if (!env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) throw new ConfigError("missing env ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN");
+}
+
+// The agent subprocess (and anything its Bash tool spawns) never sees the real
+// ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN: this trusted process reads it once here and
+// hands it only to a loopback-only proxy, then launches the agent with a placeholder key
+// and ANTHROPIC_BASE_URL pointed at that proxy (sandboxEnv). See src/model-proxy.ts and the
+// README's "Model credential exposure" section for what this does and doesn't eliminate.
+// Shared with src/smoke.ts, so the image's pre-`:latest` smoke test runs this exact path.
+export function startProxyFromEnv(env: NodeJS.ProcessEnv, startModelProxy: NonNullable<RunDeps["startModelProxy"]> = realStartModelProxy) {
+  return startModelProxy(credentialFromEnv(env), {
+    maxRequests: optionalNumber(env, "MODEL_PROXY_MAX_REQUESTS"),
+    maxLifetimeMs: optionalNumber(env, "MODEL_PROXY_MAX_LIFETIME_MS"),
+    requestTimeoutMs: optionalNumber(env, "MODEL_PROXY_REQUEST_TIMEOUT_MS"),
+  });
+}
 
 function detectTracker(env: NodeJS.ProcessEnv): Tracker {
   const platform = env.AGENT_PLATFORM || (env.GITLAB_CI ? "gitlab" : env.GITHUB_ACTIONS ? "github" : "");
@@ -146,7 +172,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
   // Everything that can be wrong with our config is checked before we touch the issue.
   let tracker: Tracker, maxTurns: number;
   try {
-    if (!env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) throw new ConfigError("missing env ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN");
+    requireModelCredential(env);
     maxTurns = parseMaxTurns(env.MAX_TURNS);
     tracker = deps.tracker ?? detectTracker(env);
   } catch (err) {
@@ -221,16 +247,8 @@ export async function main(deps: RunDeps = {}): Promise<number> {
       throw new ConfigError(`refusing to continue: ${workDir} is a clone of a repo outside the allowlist.`);
     }
 
-    // The agent subprocess (and anything its Bash tool spawns) never sees the real
-    // ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN: this trusted process reads it once here and
-    // hands it only to a loopback-only proxy, then launches the agent with a placeholder key
-    // and ANTHROPIC_BASE_URL pointed at that proxy. See src/model-proxy.ts and the README's
-    // "Model credential exposure" section for what this does and doesn't eliminate.
-    const proxy = await startModelProxy(credentialFromEnv(env), {
-      maxRequests: optionalNumber(env, "MODEL_PROXY_MAX_REQUESTS"),
-      maxLifetimeMs: optionalNumber(env, "MODEL_PROXY_MAX_LIFETIME_MS"),
-      requestTimeoutMs: optionalNumber(env, "MODEL_PROXY_REQUEST_TIMEOUT_MS"),
-    });
+    // The real model credential goes only to a loopback proxy; see startProxyFromEnv.
+    const proxy = await startProxyFromEnv(env, startModelProxy);
 
     let outcome: Outcome;
     try {
@@ -238,7 +256,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
         tracker: guard.tracker,
         repo,
         workDir,
-        pluginDir: env.PLUGIN_DIR ?? "/opt/agent/agent/plugin",
+        pluginDir: env.PLUGIN_DIR ?? DEFAULT_PLUGIN_DIR,
         model: env.CLAUDE_MODEL,
         maxTurns,
         env: sandboxEnv(env, proxy.url),

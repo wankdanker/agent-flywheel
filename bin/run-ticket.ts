@@ -1,10 +1,9 @@
 // CLI: work one issue, configured entirely by env. Exit codes let whatever
 // invokes us (CI, a human) branch on the outcome. The run itself is src/run.ts's main(),
 // importable so tests can drive it with a fake tracker and agent engine.
-import { main } from "../src/run.ts";
+import { main, stripEmptyEnv } from "../src/run.ts";
 
-// CI and `docker --env-file` hand us unset optional vars as "", which would read as set.
-for (const [k, v] of Object.entries(process.env)) if (v === "") delete process.env[k];
+stripEmptyEnv(process.env);
 
 let code: number;
 try {

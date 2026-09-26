@@ -18,6 +18,7 @@ It's stateless. The only state is:
 - `npm run typecheck` runs `tsc -p .`. There is no linter.
 - `npm test` runs the `node:test` suite in `test/` (zero extra deps; Node runs the `.test.ts` files directly, same as `src`/`bin`). Both CIs run typecheck + tests before building the image (`test` job in `.github/workflows/build.yml`, `.gitlab/ci/test.yml`), and the image build `needs` it, so a red suite never reaches `:latest`.
 - `docker build -t agent-flywheel . && docker run --rm --env-file .env agent-flywheel` works one issue end to end. See `.env.example`.
+- `docker run --rm -e ANTHROPIC_API_KEY agent-flywheel --smoke` (or `node bin/smoke.ts`) runs the image's smoke test: one real model turn, no forge token, no issue. Default-branch CI runs it on the new `:sha-<short>` image and moves `:latest` only if it passes.
 - `TRIGGER_PAYLOAD=payload.json CI_REGISTRY_IMAGE=x node bin/dispatch-gitlab.ts` prints the GitLab child-pipeline YAML for a saved webhook payload. Payloads for human comments also call the members API, which needs `CI_API_V4_URL`, `CI_PROJECT_ID` and `AGENT_GITLAB_TOKEN`.
 
 There is no build step: Node 24 runs the `.ts` files directly. So:
@@ -27,7 +28,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 
 ## Architecture
 
-- `bin/run-ticket.ts` is the container entry, run via `entrypoint.sh` (which only sets git identity and `safe.directory`, no credentials — see below). It only blanks out empty env vars and exits with `main()`'s code. `src/run.ts`'s `main()` is the run itself, importable so `test/run.test.ts` drives it with a fake tracker and a fake `runTicket` (every dependency is an optional `RunDeps` seam). It:
+- `bin/run-ticket.ts` is the container entry, run via `entrypoint.sh` (which only sets git identity and `safe.directory`, no credentials — see below — and runs `bin/smoke.ts` instead when given `--smoke`). It only blanks out empty env vars and exits with `main()`'s code. `src/run.ts`'s `main()` is the run itself, importable so `test/run.test.ts` drives it with a fake tracker and a fake `runTicket` (every dependency is an optional `RunDeps` seam). It:
   - validates config first (model credential, `MAX_TURNS`, platform env) and returns 2 on a
     `ConfigError` before touching the issue;
   - detects the platform from `AGENT_PLATFORM`, `GITLAB_CI` or `GITHUB_ACTIONS`;
@@ -77,6 +78,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     a newly-created issue's label actually fire the trigger); `report_failure` → blocked.
 
   If the agent calls none of these tools, `applyOutcome` reports `incomplete`. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
+- `src/smoke.ts` (`bin/smoke.ts`, `entrypoint.sh --smoke`) is the image's pre-`:latest` smoke test (see README's "Image versions and rollback"). It deliberately reuses `src/run.ts`'s `stripEmptyEnv`, `requireModelCredential` and `startProxyFromEnv`, plus `sandboxEnv`, instead of copying them, so it can't drift from the path a real run takes. Then it runs one `query()` (`maxTurns: 1`, no tools, `SMOKE_MODEL` falling back to `CLAUDE_MODEL`, aborted after `SMOKE_TIMEOUT_MS`) and passes only on a `success` result with at least one request through the proxy. Keep any new proxy/env setup for issue runs in those shared helpers.
 - `src/model-proxy.ts` is the loopback-only HTTP proxy `bin/run-ticket.ts` puts in front of
   the real model credential (`startModelProxy`, `credentialFromEnv`, `sandboxEnv`; see
   README's "Model credential exposure"). It enforces `maxRequests`/`maxLifetimeMs` (on top
@@ -85,6 +87,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   API.
 - CI on each platform:
   - **GitHub:** `.github/workflows/agent.yml` gates on the label and the commenter's association, then `docker run`s the image on a plain runner. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work` (separate `restore`/`save` steps, the save `if: always()` so a failed run still keeps its work; the job sets `cache-mode: write`, since GitHub otherwise makes the cache read-only for issue/comment-triggered runs); its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid. The per-issue `concurrency` group is on the job, not the workflow, so skipped runs (our own label/comment events) never displace a pending real one.
+  - **Image builds** (`.github/workflows/build.yml`: `test` → `image` → `smoke` → `latest`; `.gitlab/ci/build.yml`: `build-image` → `smoke-image`): a default-branch build pushes `:sha-<short>` only, smoke-tests it with `docker run … --smoke`, and only then tags `:latest`. The smoke container gets the model secret and optional vars as `-e VAR` (so an unset one arrives as `""`, same as in `agent.yml`), and never a forge token. On GitLab that's why it's `docker run` on dind, not `image:`, since a job's env holds every project variable.
   - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline that runs the image, with a native GitLab `cache:` (`when: always`, so a failed run still saves) on `WORK_DIR`.
 
   Keep `bin/dispatch-gitlab.ts` and `src/tracker.ts` free of npm dependencies.
