@@ -331,17 +331,20 @@ export async function runTicket(t: Ticket, cfg: WorkerConfig): Promise<Outcome> 
   // Untrusted-authored issue, no trusted maintainer has approved a task yet: stop before
   // the model ever sees the issue. This mirrors what ask_question does (comment + blocked),
   // so CI's exit-code handling treats it the same way — waiting on a human, not a failure.
-  if (needsDirective(t)) {
-    const message = blockedNoDirectiveMessage(t);
-    await cfg.tracker.comment(message);
-    await cfg.tracker.setState("blocked");
-    return { kind: "blocked", detail: message };
-  }
+  if (needsDirective(t)) return blockForDirective(t, cfg.tracker);
   const { recorded, end } = await runSession(t, { ...cfg, platform: cfg.tracker.platform });
   return applyOutcome(t, cfg, recorded, end);
 }
 
 export const needsDirective = (t: Ticket) => t.trust === "untrusted" && trustedDirectives(t).length === 0;
+
+// Shared with the split `--stage prepare` (src/stages.ts), which makes this call before cloning.
+export async function blockForDirective(t: Ticket, tracker: Tracker): Promise<Outcome> {
+  const message = blockedNoDirectiveMessage(t);
+  await tracker.comment(message);
+  await tracker.setState("blocked");
+  return { kind: "blocked", detail: message };
+}
 
 // The agent's session alone: runs query() and returns what the agent recorded, touching
 // neither the tracker nor the publisher. Throws only if the session failed before the agent

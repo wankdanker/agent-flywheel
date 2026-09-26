@@ -12,7 +12,7 @@ import { gitlabTracker } from "./gitlab.ts";
 import { gitPublisher } from "./publish.ts";
 import { credentialFromEnv, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import type { Ticket, TicketState, Tracker } from "./tracker.ts";
-import { branchFor, runTicket as realRunTicket, settle, SettlementError, type Outcome } from "./worker.ts";
+import { branchFor, runSession as realRunSession, runTicket as realRunTicket, settle, SettlementError, type Outcome } from "./worker.ts";
 
 // split behaves like blocked for CI's purposes: not a failure, nothing merged yet, the
 // issue is left `blocked` for a human or a sub-issue's own run to pick back up.
@@ -37,6 +37,7 @@ export type RunDeps = {
   originUrl?: typeof realOriginUrl;
   startModelProxy?: (...a: Parameters<typeof realStartModelProxy>) => Promise<{ url: string; requestCount(): number; close(): Promise<void> }>;
   runTicket?: typeof realRunTicket;
+  runSession?: typeof realRunSession; // the split `--stage agent` (src/stages.ts)
   publisher?: typeof gitPublisher;
 };
 
@@ -81,7 +82,7 @@ export function startProxyFromEnv(env: NodeJS.ProcessEnv, startModelProxy: NonNu
   });
 }
 
-function detectTracker(env: NodeJS.ProcessEnv): Tracker {
+export function detectTracker(env: NodeJS.ProcessEnv): Tracker {
   const platform = env.AGENT_PLATFORM || (env.GITLAB_CI ? "gitlab" : env.GITHUB_ACTIONS ? "github" : "");
   const issue = Number(req(env, "ISSUE"));
   if (platform === "github") {
@@ -100,7 +101,7 @@ function detectTracker(env: NodeJS.ProcessEnv): Tracker {
 
 // The only credential a `git` subprocess we spawn ever sees; never written to git config,
 // so it can't be read back out of it once prepareRepo() returns. See src/clone.ts.
-function credentialFor(platform: Tracker["platform"], env: NodeJS.ProcessEnv): Credential {
+export function credentialFor(platform: Tracker["platform"], env: NodeJS.ProcessEnv): Credential {
   return platform === "github"
     ? { username: "x-access-token", token: req(env, "GH_TOKEN") }
     : { username: "oauth2", token: req(env, "AGENT_GITLAB_TOKEN") };
@@ -167,6 +168,81 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
 
 const isTerminal = (s: TicketState | undefined) => s === "review" || s === "blocked";
 
+// A ConfigError found before we touch the issue: exit 2. Anything else is a bug; rethrow.
+export function configExit(err: unknown): number {
+  if (err instanceof ConfigError) {
+    console.error(err.message);
+    return 2;
+  }
+  throw err;
+}
+
+// The issue and its repo, or undefined (having logged why) if the repo isn't allowlisted.
+// Refuses before granting any credential or running `git clone` at all: an issue's title,
+// body, or comments never get a say in which repo we touch (see README's Trust model for
+// the parallel rule about what the *model* is allowed to read as instructions).
+export async function fetchAllowedTicket(tracker: Tracker, env: NodeJS.ProcessEnv) {
+  const [ticket, repo] = await Promise.all([tracker.getTicket(), tracker.repo()]);
+  console.log(`[ticket] #${ticket.number} ${ticket.title}, ${ticket.comments.length} comments`);
+  const allowlist = parseAllowlist(env);
+  if (!isAllowedRepo(repo.cloneUrl, allowlist)) {
+    console.error(
+      `refusing to clone ${repo.cloneUrl}: not in the repo allowlist (${allowlist.join(", ") || "<empty>"}). ` +
+        `Set AGENT_REPO_ALLOWLIST to a comma-separated list of owner/repo to allow it.`,
+    );
+    return undefined;
+  }
+  return { ticket, repo, allowlist };
+}
+
+// Namespaced per issue: if WORK_DIR is cached/persisted across runs (so a failed
+// run doesn't lose its clone), two issues sharing that cache must not collide.
+export const workDirFor = (env: NodeJS.ProcessEnv, issue: number) => join(env.WORK_DIR ?? "/work", `issue-${issue}`);
+
+// Runs `work` (which owes the issue its labels from here on) and makes sure no failure
+// strands `agent/working`: if it throws, or with `mustSettle` returns without a terminal
+// label having landed, the issue falls back to `blocked` with a scrubbed error comment.
+export async function guarded(
+  guard: ReturnType<typeof guardTracker>, ticket: Ticket, env: NodeJS.ProcessEnv,
+  work: () => Promise<number>, { mustSettle }: { mustSettle: boolean },
+): Promise<number> {
+  let code: number;
+  let failure: unknown;
+  try {
+    code = await work();
+  } catch (err) {
+    failure = err;
+    code = err instanceof ConfigError ? 2 : 1;
+    console.error(`[error] run failed on #${ticket.number}:`, err);
+    if (err instanceof SettlementError) {
+      // Don't let the tracker failure hide what the agent actually got done.
+      console.error(`[outcome] the agent had reached ${err.outcome.kind}: ${err.outcome.detail}`);
+      for (const c of err.causes) console.error("[error] cause:", c);
+    }
+  }
+
+  if (!isTerminal(guard.state()) && (mustSettle || failure !== undefined)) {
+    await fallBackToBlocked(guard.tracker, ticket, failure, env);
+    if (code === 0) code = 1; // a "success" whose label never landed isn't one
+  } else if (failure !== undefined) {
+    console.error(`[error] #${ticket.number} is labeled ${guard.state()}, but the run above failed; see the error for what's missing.`);
+  }
+  return code;
+}
+
+// The agent recorded nothing (and didn't run out of turns): say so on the issue, set blocked.
+export async function settleIncomplete(outcome: Outcome, tracker: Tracker, ticket: Ticket): Promise<Outcome> {
+  if (outcome.kind !== "incomplete") return outcome;
+  return settle(outcome, [
+    () => tracker.comment(`I stopped before finishing. Reply here to have me continue from branch \`${branchFor(ticket)}\`.`),
+    () => tracker.setState("blocked"),
+  ]);
+}
+
+// The combined, single-process run: prepare, agent and publish in one container, holding
+// both the forge token and the model credential (the model's behind src/model-proxy.ts).
+// The default for a local `docker run`; CI runs the three as separate jobs instead (see
+// src/stages.ts), so that no one job holds both.
 export async function main(deps: RunDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
   const prepareRepo = deps.prepareRepo ?? realPrepareRepo;
@@ -182,59 +258,22 @@ export async function main(deps: RunDeps = {}): Promise<number> {
     maxTurns = parseMaxTurns(env.MAX_TURNS);
     tracker = deps.tracker ?? detectTracker(env);
   } catch (err) {
-    if (err instanceof ConfigError) {
-      console.error(err.message);
-      return 2;
-    }
-    throw err;
+    return configExit(err);
   }
 
-  const [ticket, repo] = await Promise.all([tracker.getTicket(), tracker.repo()]);
-  console.log(`[ticket] #${ticket.number} ${ticket.title}, ${ticket.comments.length} comments`);
-
-  // Refuse before granting any credential or running `git clone` at all: an issue's title,
-  // body, or comments never get a say in which repo we touch (see README's Trust model for
-  // the parallel rule about what the *model* is allowed to read as instructions).
-  const allowlist = parseAllowlist(env);
-  if (!isAllowedRepo(repo.cloneUrl, allowlist)) {
-    console.error(
-      `refusing to clone ${repo.cloneUrl}: not in the repo allowlist (${allowlist.join(", ") || "<empty>"}). ` +
-        `Set AGENT_REPO_ALLOWLIST to a comma-separated list of owner/repo to allow it.`,
-    );
-    return 2;
-  }
-
+  const allowed = await fetchAllowedTicket(tracker, env);
+  if (!allowed) return 2;
+  const { ticket, repo, allowlist } = allowed;
   const guard = guardTracker(tracker, ticket);
 
   // From here on, whatever happens, we owe the issue a terminal label.
-  let code: number;
-  let failure: unknown;
-  try {
+  return guarded(guard, ticket, env, async () => {
     await guard.tracker.setState("working");
-    code = await work();
-  } catch (err) {
-    failure = err;
-    code = err instanceof ConfigError ? 2 : 1;
-    console.error(`[error] run failed on #${ticket.number}:`, err);
-    if (err instanceof SettlementError) {
-      // Don't let the tracker failure hide what the agent actually got done.
-      console.error(`[outcome] the agent had reached ${err.outcome.kind}: ${err.outcome.detail}`);
-      for (const c of err.causes) console.error("[error] cause:", c);
-    }
-  }
-
-  if (!isTerminal(guard.state())) {
-    await fallBackToBlocked(guard.tracker, ticket, failure, env);
-    if (code === 0) code = 1; // a "success" whose label never landed isn't one
-  } else if (failure) {
-    console.error(`[error] #${ticket.number} is labeled ${guard.state()}, but the run above failed; see the error for what's missing.`);
-  }
-  return code;
+    return work();
+  }, { mustSettle: true });
 
   async function work(): Promise<number> {
-    // Namespaced per issue: if WORK_DIR is cached/persisted across runs (so a failed
-    // run doesn't lose its clone), two issues sharing that cache must not collide.
-    const workDir = join(env.WORK_DIR ?? "/work", `issue-${ticket.number}`);
+    const workDir = workDirFor(env, ticket.number);
     mkdirSync(workDir, { recursive: true });
 
     // Cloning happens here, before the agent's own (permission-bypassed) shell ever starts, so
@@ -271,12 +310,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
       await proxy.close().catch((err) => console.error("[cleanup] model proxy close failed:", err));
     }
 
-    if (outcome.kind === "incomplete") {
-      outcome = await settle(outcome, [
-        () => guard.tracker.comment(`I stopped before finishing. Reply here to have me continue from branch \`${branchFor(ticket)}\`.`),
-        () => guard.tracker.setState("blocked"),
-      ]);
-    }
+    outcome = await settleIncomplete(outcome, guard.tracker, ticket);
     console.log(`[outcome] ${outcome.kind}: ${outcome.detail}`);
     return EXIT_CODES[outcome.kind];
   }
