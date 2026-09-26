@@ -134,3 +134,100 @@ test("originUrl reports what a resumed work dir is actually a clone of", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function commitIn(workDir: string, msg: string): string {
+  git(["-c", "user.email=t@t.test", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", msg], workDir);
+  return git(["rev-parse", "HEAD"], workDir);
+}
+
+function captureLog<T>(fn: () => T): { result: T; logs: string } {
+  const orig = console.log;
+  const lines: string[] = [];
+  console.log = (...a: unknown[]) => void lines.push(a.join(" "));
+  try {
+    return { result: fn(), logs: lines.join("\n") };
+  } finally {
+    console.log = orig;
+  }
+}
+
+// A run that committed and then crashed before anything was pushed (#48): the cache is all
+// that holds those commits, so resuming must not reset them away.
+test("prepareRepo keeps unpushed commits on a cached branch that's ahead of the default branch", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-flywheel-clone-test-"));
+  try {
+    const cloneUrl = makeOrigin(root);
+    const workDir = join(root, "work");
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
+    commitIn(workDir, "one");
+    const head = commitIn(workDir, "two");
+
+    const { logs } = captureLog(() => prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" }));
+
+    assert.equal(git(["branch", "--show-current"], workDir), "agent/issue-1");
+    assert.equal(git(["rev-parse", "HEAD"], workDir), head);
+    assert.match(logs, /keeping 2 unpushed commit\(s\) on the cached agent\/issue-1 \(ahead of origin\/main\)/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prepareRepo keeps unpushed commits on top of the branch an earlier run pushed", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-flywheel-clone-test-"));
+  try {
+    const cloneUrl = makeOrigin(root);
+    const workDir = join(root, "work");
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
+    commitIn(workDir, "pushed");
+    git(["push", "-q", "origin", "agent/issue-1"], workDir);
+    const head = commitIn(workDir, "not pushed");
+
+    const { logs } = captureLog(() => prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" }));
+
+    assert.equal(git(["rev-parse", "HEAD"], workDir), head);
+    assert.match(logs, /keeping 1 unpushed commit\(s\) .*ahead of origin\/agent\/issue-1/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prepareRepo resets a cached branch that has diverged from the remote one, and says so", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-flywheel-clone-test-"));
+  try {
+    const cloneUrl = makeOrigin(root);
+    const workDir = join(root, "work");
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
+    commitIn(workDir, "pushed");
+    git(["push", "-q", "origin", "agent/issue-1"], workDir);
+    const remote = commitIn(workDir, "pushed later, e.g. by a maintainer");
+    git(["push", "-q", "origin", "agent/issue-1"], workDir);
+    git(["reset", "-q", "--hard", "HEAD~1"], workDir);
+    commitIn(workDir, "local only");
+
+    const { logs } = captureLog(() => prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" }));
+
+    assert.equal(git(["rev-parse", "HEAD"], workDir), remote);
+    assert.match(logs, /resetting the cached agent\/issue-1 \([0-9a-f]{12}\) to origin\/agent\/issue-1: it has diverged from it/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prepareRepo fast-forwards a cached branch that's behind the remote one", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-flywheel-clone-test-"));
+  try {
+    const cloneUrl = makeOrigin(root);
+    const workDir = join(root, "work");
+    prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" });
+    const remote = commitIn(workDir, "pushed");
+    git(["push", "-q", "origin", "agent/issue-1"], workDir);
+    git(["reset", "-q", "--hard", "HEAD~1"], workDir);
+
+    const { logs } = captureLog(() => prepareRepo({ cloneUrl, workDir, branch: "agent/issue-1", defaultBranch: "main" }));
+
+    assert.equal(git(["rev-parse", "HEAD"], workDir), remote);
+    assert.match(logs, /resetting the cached agent\/issue-1 .* it is behind it/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
