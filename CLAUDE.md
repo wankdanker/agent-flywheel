@@ -16,7 +16,7 @@ It's stateless. The only state is:
 ## Commands
 
 - `npm run typecheck` runs `tsc -p .`. There is no linter.
-- `npm test` runs the `node:test` suite in `test/` (zero extra deps; Node runs the `.test.ts` files directly, same as `src`/`bin`).
+- `npm test` runs the `node:test` suite in `test/` (zero extra deps; Node runs the `.test.ts` files directly, same as `src`/`bin`). Both CIs run typecheck + tests before building the image (`test` job in `.github/workflows/build.yml`, `.gitlab/ci/test.yml`), and the image build `needs` it, so a red suite never reaches `:latest`.
 - `docker build -t agent-flywheel . && docker run --rm --env-file .env agent-flywheel` works one issue end to end. See `.env.example`.
 - `TRIGGER_PAYLOAD=payload.json CI_REGISTRY_IMAGE=x node bin/dispatch-gitlab.ts` prints the GitLab child-pipeline YAML for a saved webhook payload. Payloads for human comments also call the members API, which needs `CI_API_V4_URL`, `CI_PROJECT_ID` and `AGENT_GITLAB_TOKEN`.
 
@@ -75,7 +75,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   `upstream ?? DEFAULT_UPSTREAM` so tests can point it at a fake server instead of the real
   API.
 - CI on each platform:
-  - **GitHub:** `.github/workflows/agent.yml` gates on the label and the commenter's association, then `docker run`s the image on a plain runner. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work`; its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid.
+  - **GitHub:** `.github/workflows/agent.yml` gates on the label and the commenter's association, then `docker run`s the image on a plain runner. The work dir is an `actions/cache`-backed host dir bind-mounted to `/work` (separate `restore`/`save` steps, the save `if: always()` so a failed run still keeps its work); its owner is chowned to the image's user (looked up at run time) before each run, since the cache round-trip doesn't preserve uid. The per-issue `concurrency` group is on the job, not the workflow, so skipped runs (our own label/comment events) never displace a pending real one.
   - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline that runs the image, with a native GitLab `cache:` (`when: always`, so a failed run still saves) on `WORK_DIR`.
 
   Keep `bin/dispatch-gitlab.ts` and `src/tracker.ts` free of npm dependencies.

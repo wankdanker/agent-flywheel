@@ -16,7 +16,22 @@ permissions:
   packages: write
 
 jobs:
+  # The image we publish is what the next issue runs on, so a red typecheck/test must never
+  # reach it. Runs on every branch push too, so agent PRs (branches in this repo) get it as a check.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
   image:
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
