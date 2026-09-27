@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { RESUME_HINT, REVIEW_HINT } from "../src/dispatch.ts";
 import { PublishRejected } from "../src/publish.ts";
-import { EXIT_SKIPPED, MAX_TURNS_LIMIT, main, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
+import { EXIT_SKIPPED, MAX_CHAINED_RUNS_LIMIT, MAX_TURNS_LIMIT, main, parseMaxBudgetUsd, parseMaxChainedRuns, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
 import type { Comment, Ticket, TicketState, Tracker } from "../src/tracker.ts";
 import { applyOutcome, type AgentOutcome, type Outcome, type SessionEnd, type WorkerConfig } from "../src/worker.ts";
 
@@ -323,6 +323,49 @@ test("invalid MAX_TURNS: exit 2 before the issue is touched", async () => {
   assert.equal(parseMaxTurns(undefined), 120);
   assert.equal(parseMaxTurns("40"), 40);
   assert.equal(parseMaxTurns(String(MAX_TURNS_LIMIT)), MAX_TURNS_LIMIT);
+});
+
+test("invalid MAX_BUDGET_USD or MAX_CHAINED_RUNS: exit 2 before the issue is touched", async () => {
+  for (const extra of [
+    { MAX_BUDGET_USD: "abc" }, { MAX_BUDGET_USD: "0" }, { MAX_BUDGET_USD: "-1" }, { MAX_BUDGET_USD: "$5" }, { MAX_BUDGET_USD: "1e3" },
+    { MAX_CHAINED_RUNS: "-1" }, { MAX_CHAINED_RUNS: "two" }, { MAX_CHAINED_RUNS: "1.5" }, { MAX_CHAINED_RUNS: String(MAX_CHAINED_RUNS_LIMIT + 1) },
+  ]) {
+    const tracker = fakeTracker();
+    const { result } = await quietly(() => main({ ...deps(tracker, engine(undefined)), env: { ...env, ...extra } }));
+    assert.equal(result, 2, JSON.stringify(extra));
+    assert.deepEqual(tracker.states, []);
+  }
+  assert.equal(parseMaxBudgetUsd(undefined), undefined);
+  assert.equal(parseMaxBudgetUsd(""), undefined);
+  assert.equal(parseMaxBudgetUsd("5"), 5);
+  assert.equal(parseMaxBudgetUsd("2.50"), 2.5);
+  assert.equal(parseMaxChainedRuns(undefined), 3);
+  assert.equal(parseMaxChainedRuns("0"), 0);
+  assert.equal(parseMaxChainedRuns("5"), 5);
+});
+
+test("MAX_BUDGET_USD reaches the session config", async () => {
+  const tracker = fakeTracker();
+  let seen: number | undefined;
+  const d = deps(tracker, engine({ status: "ready_for_review", summary: "ok" }));
+  const runTicket = d.runTicket!;
+  d.runTicket = async (t, cfg) => ((seen = cfg.maxBudgetUsd), runTicket(t, cfg));
+  const { result } = await quietly(() => main({ ...d, env: { ...env, MAX_BUDGET_USD: "4.25" } }));
+  assert.equal(result, 0);
+  assert.equal(seen, 4.25);
+});
+
+test("hit MAX_BUDGET_USD: a checkpoint (20) with commits, blocked (10) without; never left on working", async () => {
+  const withWork = fakeTracker();
+  const a = await quietly(() => main(deps(withWork, engine(undefined, { maxTurnsHit: false, budgetHit: true }))));
+  assert.equal(a.result, 20);
+  assert.deepEqual(withWork.states, ["working", "blocked"]);
+  assert.match(withWork.comments.join("\n"), /MAX_BUDGET_USD[\s\S]*published to branch/);
+  const noWork = fakeTracker();
+  const b = await quietly(() => main(deps(noWork, engine(undefined, { maxTurnsHit: false, budgetHit: true }), nothingCommitted)));
+  assert.equal(b.result, 10);
+  assert.deepEqual(noWork.states, ["working", "blocked"]);
+  assert.match(noWork.comments.join("\n"), /MAX_BUDGET_USD[\s\S]*hadn't committed anything/);
 });
 
 // The prepare step's re-check of AGENT_TRIGGER against the issue's live labels (src/dispatch.ts).

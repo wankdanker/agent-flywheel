@@ -276,3 +276,20 @@ test("github chain: listQueued skips PRs, release swaps queued for agent (remova
   await chain.mergeReview(5, "aaa");
   assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa", merge_method: "merge" });
 });
+
+test("github dispatchRelay: dispatches agent.yml on the default branch with trigger=relay", async (t) => {
+  const posts: { url: string; body: unknown }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    if (url === "https://api.github.com/repos/o/r") return jsonResponse({ default_branch: "trunk" });
+    if (url.endsWith("/actions/workflows/agent.yml/dispatches") && init.method === "POST") {
+      posts.push({ url, body: JSON.parse(String(init.body)) });
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  await githubTracker({ token: "x", repo: "o/r", issue: 3 }).dispatchRelay();
+  assert.deepEqual(posts, [{
+    url: "https://api.github.com/repos/o/r/actions/workflows/agent.yml/dispatches",
+    body: { ref: "trunk", inputs: { issue: "3", trigger: "relay" } },
+  }]);
+});
