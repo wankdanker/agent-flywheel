@@ -1,0 +1,33 @@
+{
+  "prompt": {
+    "includes": [
+      "BOT: I'm pausing at a checkpoint",
+      "Wire the new parser into the CLI flags.",
+      "TRUSTED HUMAN @maintainer: /agent continue",
+      "Keep `--cfg` as an alias",
+      "on branch agent/issue-30"
+    ],
+    "excludes": [
+      "🤖",
+      "<!-- agent-flywheel -->"
+    ]
+  },
+  "branch": "agent/issue-30",
+  "base": "main",
+  "outcome": "ready_for_review",
+  "exitCodes": [
+    0,
+    0,
+    0
+  ],
+  "labels": [
+    "agent",
+    "agent/review"
+  ],
+  "comments": [
+    "^Parser wired into the CLI; `--cfg` kept as an alias\\.\\n\\nReview: https://github\\.com/acme/widgets/pull/1"
+  ],
+  "reviews": 1,
+  "relays": 0,
+  "pushes": 1
+}

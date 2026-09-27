@@ -1,0 +1,28 @@
+{
+  "prompt": {
+    "includes": [
+      "issue #12 \"Add a --version flag\"",
+      "Print package.json's version and exit 0.",
+      "(no comments yet)",
+      "on branch agent/issue-12",
+      "`github-pr` skill"
+    ],
+    "excludes": []
+  },
+  "branch": "agent/issue-12",
+  "base": "main",
+  "outcome": "ready_for_review",
+  "exitCodes": [
+    0
+  ],
+  "labels": [
+    "agent",
+    "agent/review"
+  ],
+  "comments": [
+    "^Added `--version`; `npm test` passes\\.\\n\\nReview: https://github\\.com/acme/widgets/pull/1\\n"
+  ],
+  "reviews": 1,
+  "relays": 0,
+  "pushes": 1
+}

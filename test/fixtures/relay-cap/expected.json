@@ -1,0 +1,28 @@
+{
+  "prompt": {
+    "includes": [
+      "chained run 3 of at most 3",
+      "batch 3."
+    ],
+    "excludes": []
+  },
+  "branch": "agent/issue-80",
+  "base": "main",
+  "outcome": "checkpoint",
+  "exitCodes": [
+    0,
+    0,
+    20
+  ],
+  "labels": [
+    "agent",
+    "agent/blocked"
+  ],
+  "comments": [
+    "^I'm pausing at a checkpoint[\\s\\S]*Batch 4 migrated\\.",
+    "^I've already continued 3 time\\(s\\) in a row on my own[\\s\\S]*/agent continue"
+  ],
+  "reviews": 0,
+  "relays": 0,
+  "pushes": 1
+}

@@ -29,7 +29,7 @@ export type Recorded = { method: string; url: string; headers: Record<string, st
 export type Review = { branch: string; base: string; title: string; body: string; url: string };
 export type Relay = { ref: string; issue: string; trigger: string };
 type Stored = { author: Person & { bot?: boolean }; body: string; at: string; system?: boolean };
-type Failure = { method: string; path: RegExp; status: number; body: string; times: number };
+type Failure = { method: string; path: RegExp; status: number; body: string; times: number; skip: number };
 
 export const TOKEN = { github: "ghs_contractTOKEN0123456789", gitlab: "glpat-contractTOKEN0123456789" };
 export const BOT = { github: "github-actions[bot]", gitlab: "project_1_bot" };
@@ -68,9 +68,15 @@ export class FakeForge {
       : gitlabTracker({ token: this.token, apiUrl: GITLAB_API, project: REPO, issue: this.seed.number });
   }
 
-  // The next `times` requests matching `method` and `path` (the URL's pathname) answer `status`.
-  failNext(method: string, path: RegExp, status: number, body = `{"message":"injected ${status}"}`, times = 1) {
-    this.failures.push({ method, path, status, body, times });
+  // After letting `skip` through, the next `times` requests matching `method` and `path` (the
+  // URL's pathname) answer `status`.
+  failNext(method: string, path: RegExp, status: number, body = `{"message":"injected ${status}"}`, times = 1, skip = 0) {
+    this.failures.push({ method, path, status, body, times, skip });
+  }
+
+  // The forge is back: no more injected failures.
+  heal() {
+    this.failures = [];
   }
 
   // Our own comments as a human reads them: badge and marker stripped.
@@ -88,7 +94,8 @@ export class FakeForge {
     const authed = this.platform === "github" ? headers.authorization === `Bearer ${this.token}` : headers["private-token"] === this.token;
     if (!authed) return json({ message: "401 Unauthorized" }, 401);
     const failure = this.failures.find((f) => f.times > 0 && f.method === method && f.path.test(url.pathname));
-    if (failure) {
+    if (failure && failure.skip > 0) failure.skip--;
+    else if (failure) {
       failure.times--;
       return new Response(failure.body, { status: failure.status });
     }

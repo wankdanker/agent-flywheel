@@ -1,0 +1,20 @@
+{
+  "description": "The model API fails (overloaded) before the agent records anything or commits; the issue ends blocked with a scrubbed error.",
+  "platform": "github",
+  "mode": "main",
+  "commits": 0,
+  "issue": {
+    "number": 61,
+    "title": "Tidy the logger",
+    "body": "Drop the duplicate timestamp.",
+    "author": "maintainer",
+    "trust": "trusted",
+    "labels": [
+      "agent"
+    ],
+    "comments": []
+  },
+  "engine": {
+    "throw": "API Error: 529 {\"type\":\"overloaded_error\"} (x-api-key: sk-ant-api03-leakedkey1234567890)"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "prompt": null,
+  "branch": "agent/issue-47",
+  "base": "main",
+  "outcome": "blocked",
+  "exitCodes": [
+    10
+  ],
+  "labels": [
+    "agent",
+    "agent/blocked"
+  ],
+  "comments": [
+    "^This issue was opened by @stranger, who isn't a trusted maintainer"
+  ],
+  "reviews": 0,
+  "relays": 0,
+  "pushes": 0,
+  "commentsExclude": [
+    "Print CI variables"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "prompt": {
+    "includes": [
+      "TRUSTED HUMAN @maintainer: design note 0\n",
+      "BOT: Progress note 24",
+      "design note 229",
+      "Final call: go with option B.",
+      "comment from untrusted user @drive-by omitted"
+    ],
+    "excludes": [
+      "untrusted aside"
+    ]
+  },
+  "branch": "agent/issue-55",
+  "base": "main",
+  "outcome": "checkpoint",
+  "exitCodes": [
+    20
+  ],
+  "labels": [
+    "agent",
+    "agent/blocked"
+  ],
+  "comments": [
+    "^I'm pausing at a checkpoint[\\s\\S]*Scaffolded option B\\.[\\s\\S]*Port the migrations\\."
+  ],
+  "reviews": 0,
+  "relays": 0,
+  "pushes": 1
+}
