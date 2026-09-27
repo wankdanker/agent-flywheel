@@ -58,6 +58,9 @@ export class FakeForge {
   branches = new Map<string, string>();
   requests: Recorded[] = [];
   private failures: Failure[] = [];
+  // Runs after each request is recorded and before it's served: lets a test play someone else
+  // editing the issue in between two of our calls.
+  onRequest?: (r: Recorded) => void;
   private clock = 0;
   private userIds = new Map<string, number>();
   readonly platform: Platform;
@@ -111,6 +114,7 @@ export class FakeForge {
     const headers = Object.fromEntries(new Headers(init.headers).entries());
     const body = typeof init.body === "string" && init.body ? JSON.parse(init.body) : undefined;
     this.requests.push({ method, url: url.href, headers, body });
+    this.onRequest?.(this.requests.at(-1)!);
 
     const authed = this.platform === "github" ? headers.authorization === `Bearer ${this.token}` : headers["private-token"] === this.token;
     if (!authed) return json({ message: "401 Unauthorized" }, 401);
@@ -164,9 +168,18 @@ export class FakeForge {
       return json({ clone_url: CLONE_URL.github, html_url: `https://github.com/${REPO}`, default_branch: this.seed.defaultBranch ?? "main" });
     }
     if (method === "GET" && p === `${base}/issues/${n}`) return json(issue());
-    if (method === "PATCH" && p === `${base}/issues/${n}`) {
-      this.labels = body.labels;
-      return json(issue());
+    // Only the per-label endpoints: a PATCH of the whole label set isn't served, so an adapter
+    // that replaced it from a stale read would fail loudly here.
+    if (method === "POST" && p === `${base}/issues/${n}/labels`) {
+      this.labels = [...this.labels, ...body.labels.filter((l: string) => !this.labels.includes(l))];
+      return json(issue().labels);
+    }
+    const unlabel = p.match(new RegExp(`^${esc(base)}/issues/${n}/labels/([^/]+)$`));
+    if (method === "DELETE" && unlabel) {
+      const name = decodeURIComponent(unlabel[1]!);
+      if (!this.labels.includes(name)) return json({ message: "Label does not exist" }, 404);
+      this.labels = this.labels.filter((l) => l !== name);
+      return json(issue().labels);
     }
     if (method === "GET" && p === `${base}/issues/${n}/comments`) {
       const { items, next } = this.page(this.comments, url);

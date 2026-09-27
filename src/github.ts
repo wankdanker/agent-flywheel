@@ -86,7 +86,7 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
   const apiUrl = o.apiUrl ?? "https://api.github.com";
   const issue = `/issues/${o.issue}`;
 
-  async function request(url: string, init: RequestInit, label: string) {
+  async function request(url: string, init: RequestInit, label: string, okStatus: number[] = []) {
     const res = await fetch(url, {
       ...init,
       headers: {
@@ -96,7 +96,7 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
         "Content-Type": "application/json",
       },
     });
-    if (!res.ok) throw new Error(`GitHub ${init.method ?? "GET"} ${label}: ${res.status} ${await res.text()}`);
+    if (!res.ok && !okStatus.includes(res.status)) throw new Error(`GitHub ${init.method ?? "GET"} ${label}: ${res.status} ${await res.text()}`);
     return res;
   }
 
@@ -170,12 +170,18 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
       await gh(`${issue}/comments`, { method: "POST", body: JSON.stringify({ body: withMarker(text) }) });
     },
 
-    // Exactly one state label at a time; everything else on the issue is left alone.
+    // Exactly one state label at a time; everything else on the issue is left alone. Only the
+    // per-label endpoints, and nothing decided from an earlier read: a PATCH of the whole set
+    // would undo any label someone else added or removed since we read it. Add the target first
+    // (so the issue is never without a state), then remove every other state label, whether or
+    // not it's there; a 404 means it already isn't, so a retry is a no-op.
     async setState(state) {
-      const i = await gh(issue);
-      const states: string[] = Object.values(STATE_LABELS);
-      const labels = i.labels.map((l: any) => l.name).filter((n: string) => !states.includes(n));
-      await gh(issue, { method: "PATCH", body: JSON.stringify({ labels: [...labels, STATE_LABELS[state]] }) });
+      const target = STATE_LABELS[state];
+      await gh(`${issue}/labels`, { method: "POST", body: JSON.stringify({ labels: [target] }) });
+      for (const name of Object.values(STATE_LABELS).filter((l) => l !== target)) {
+        const path = `${issue}/labels/${encodeURIComponent(name)}`;
+        await request(`${apiUrl}/repos/${o.repo}${path}`, { method: "DELETE" }, path, [404]);
+      }
     },
 
     // A runnable one takes two calls, not one create-with-labels: GitHub doesn't fire a

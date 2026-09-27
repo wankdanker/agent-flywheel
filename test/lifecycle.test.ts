@@ -17,8 +17,8 @@ const scenario = (platform: Platform, mode: Scenario["mode"], over: Partial<Scen
   ...over,
 });
 
-// The PATCH (GitHub) / PUT (GitLab) that sets labels; the first one is `working`.
-const labelWrite = (p: Platform) => ({ method: p === "github" ? "PATCH" : "PUT", path: "/issues/5$" });
+// The label add (GitHub POST /labels) / PUT (GitLab) that sets a state; the first one is `working`.
+const labelWrite = (p: Platform) => (p === "github" ? { method: "POST", path: "/issues/5/labels$" } : { method: "PUT", path: "/issues/5$" });
 const commentPost = { method: "POST", path: "/issues/5/(comments|notes)$" };
 
 for (const platform of ["github", "gitlab"] as const) {
