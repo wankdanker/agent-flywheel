@@ -1,7 +1,7 @@
 // Platform-specific adapter behavior only; what both adapters must do alike is in tracker-contract.test.ts.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { botIdentityFromEnv, githubChain, githubTracker, graphqlUrl, isWorker, nextLink } from "../src/github.ts";
+import { botIdentityFromEnv, githubAuthorTrust, githubChain, githubTracker, graphqlUrl, isWorker, nextLink } from "../src/github.ts";
 
 function jsonResponse(body: unknown, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
@@ -98,6 +98,74 @@ test("github getTicket: when the identity can't be resolved, no Bot comment coun
   const tracker = githubTracker({ token: "x", repo: "o/r", issue: 42 });
   const comments = (await tracker.getTicket()).comments;
   assert.ok(comments.every((c) => !c.fromBot && c.trust === "untrusted"));
+});
+
+// A sub-issue the worker opened with an app installation token: authored by the app's bot,
+// association NONE. Ours by identity; another app's bot with the same association is not.
+function issueByBot(t: any, user: { login: string; id: number }, viewer: () => Response) {
+  const calls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    calls.push(url);
+    if (url.endsWith("/graphql")) return viewer();
+    if (url.endsWith("/issues/43")) {
+      return jsonResponse({
+        number: 43, html_url: "https://github.com/o/r/issues/43", title: "Part 2", body: "Parent: #42\n\ndo part 2",
+        author_association: "NONE", user: { ...user, type: "Bot" }, labels: [{ name: "agent" }],
+      });
+    }
+    if (url.includes("/issues/43/comments")) return jsonResponse([]);
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  return calls;
+}
+
+test("github getTicket: an issue authored by the worker's own app bot (association NONE) is trusted", async (t) => {
+  issueByBot(t, { login: "agent-flywheel[bot]", id: 5001 }, () => jsonResponse({ data: { viewer: { login: "agent-flywheel[bot]", databaseId: 5001 } } }));
+  const ticket = await githubTracker({ token: "x", repo: "o/r", issue: 43 }).getTicket();
+  assert.equal(ticket.author, "agent-flywheel[bot]");
+  assert.equal(ticket.trust, "trusted");
+});
+
+test("github getTicket: an issue authored by a different bot with association NONE stays untrusted", async (t) => {
+  issueByBot(t, { login: "evil-app[bot]", id: 666 }, () => jsonResponse({ data: { viewer: { login: "agent-flywheel[bot]", databaseId: 5001 } } }));
+  assert.equal((await githubTracker({ token: "x", repo: "o/r", issue: 43 }).getTicket()).trust, "untrusted");
+});
+
+test("github getTicket: a configured AGENT_BOT_ID decides issue authorship too, not a same-login impostor", async (t) => {
+  const calls = issueByBot(t, { login: "agent-flywheel[bot]", id: 666 }, () => jsonResponse({ data: { viewer: { login: "agent-flywheel[bot]", databaseId: 666 } } }));
+  assert.equal((await githubTracker({ token: "x", repo: "o/r", issue: 43, self: { id: 5001, login: "agent-flywheel[bot]" } }).getTicket()).trust, "untrusted");
+  assert.ok(!calls.some((u) => u.endsWith("/graphql")));
+});
+
+test("github getTicket: when the identity can't be resolved, a bot-authored issue stays untrusted (fail closed)", async (t) => {
+  t.mock.method(console, "error", () => {});
+  issueByBot(t, { login: "agent-flywheel[bot]", id: 5001 }, () => new Response("nope", { status: 403 }));
+  assert.equal((await githubTracker({ token: "x", repo: "o/r", issue: 43 }).getTicket()).trust, "untrusted");
+});
+
+test("githubAuthorTrust: a trusted association, or exactly the worker's identity; nothing else", () => {
+  const self = { id: 5001, login: "agent-flywheel[bot]" };
+  assert.equal(githubAuthorTrust({ id: 7, login: "maintainer" }, "MEMBER", self), "trusted");
+  assert.equal(githubAuthorTrust({ id: 7, login: "maintainer" }, "MEMBER", undefined), "trusted");
+  assert.equal(githubAuthorTrust({ id: 5001, login: "agent-flywheel[bot]" }, "NONE", self), "trusted");
+  assert.equal(githubAuthorTrust({ id: 666, login: "evil-app[bot]" }, "NONE", self), "untrusted");
+  assert.equal(githubAuthorTrust({ id: 5001, login: "agent-flywheel[bot]" }, "NONE", undefined), "untrusted");
+  assert.equal(githubAuthorTrust({ id: 8, login: "rando" }, "CONTRIBUTOR", self), "untrusted");
+});
+
+test("github chain: listQueued trusts a queued sub-issue opened by the worker's own app bot, not another bot's", async (t) => {
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    if (url.endsWith("/graphql")) return jsonResponse({ data: { viewer: { login: "agent-flywheel[bot]", databaseId: 5001 } } });
+    if (url.includes("/issues?state=open&labels=agent%2Fqueued")) {
+      return jsonResponse([
+        { number: 23, html_url: "u23", body: "b", author_association: "NONE", user: { login: "agent-flywheel[bot]", id: 5001, type: "Bot" } },
+        { number: 24, html_url: "u24", body: "b", author_association: "NONE", user: { login: "evil-app[bot]", id: 666, type: "Bot" } },
+      ]);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  const queued = await githubChain({ token: "x", repo: "o/r" }).listQueued();
+  assert.deepEqual(queued.map((q) => [q.number, q.trust]), [[23, "trusted"], [24, "untrusted"]]);
 });
 
 test("isWorker: matches by immutable id when known, else by login; never without an identity", () => {
@@ -250,6 +318,7 @@ test("github chain: listQueued skips PRs, release swaps queued for agent (remova
   const calls: { url: string; method: string; body: string }[] = [];
   t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
     const method = init.method ?? "GET";
+    if (url.endsWith("/graphql")) return jsonResponse({ data: { viewer: { login: "agent-flywheel[bot]", databaseId: 5001 } } });
     calls.push({ url, method, body: (init.body as string) ?? "" });
     if (url.includes("/issues?state=open&labels=agent%2Fqueued")) {
       return jsonResponse([
