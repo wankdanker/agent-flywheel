@@ -1,0 +1,23 @@
+{
+  "description": "A chain sub-issue opened by the worker's own GitHub App bot (type Bot, association NONE) is ours: its header and task are trusted and it runs on the integration branch.",
+  "platform": "github",
+  "mode": "stages",
+  "issue": {
+    "number": 57,
+    "title": "Widgets v2: storage",
+    "body": "Parent: #56\nBase branch: agent/issue-56\nSub-issue: 1 of 2\n\nAdd the v2 storage layer.",
+    "author": "github-actions[bot]",
+    "authorType": "Bot",
+    "trust": "untrusted",
+    "labels": ["agent"],
+    "comments": []
+  },
+  "env": {
+    "AGENT_BOT_ID": "41898282"
+  },
+  "engine": {
+    "calls": [
+      { "tool": "finish", "input": { "summary": "Storage layer added." } }
+    ]
+  }
+}

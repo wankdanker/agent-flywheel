@@ -293,6 +293,14 @@ That identity is, in order:
    don't, so at worst our own history is dropped from the prompt and a pending auto-relay is
    skipped — never another account's comment read as ours. Set `AGENT_BOT_ID` to fix it.
 
+The same identity decides whether an *issue* is ours. A sub-issue the worker opens while
+splitting (README's "Split issues") is authored by whoever `GH_TOKEN` is; with a GitHub App
+installation token or `GITHUB_TOKEN` that's the app's bot, association `NONE`. Such an issue
+counts as trusted — so its chain header and body are believed and the chain continues — only
+when its author is exactly the worker's identity; an issue from any other bot, or any other
+`NONE` author, stays untrusted. With a PAT, the issue is its owner's, trusted by association as
+before.
+
 Never by the `[bot]` login suffix or the `Bot` account type alone. GitLab has no such case: our
 comments there count only from a Developer+ member, like everyone else's.
 

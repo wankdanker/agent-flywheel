@@ -13,7 +13,7 @@ publish stages), the real `githubTracker`/`gitlabTracker` talking to an in-memor
 | `description` | One line; becomes the test name. |
 | `platform` | `github` or `gitlab`: which adapter and wire format the fake forge speaks. |
 | `mode` | `main` (the combined local run) or `stages` (the three CI jobs, each with only its own credential). |
-| `issue` | The issue as the forge holds it: `number`, `title`, `body`, `author`, `trust` (`trusted`/`untrusted`), `labels`, and `comments` (`author`, `trust`, `text`, `at`; `bot: true` for a comment our tracker posted earlier), plus an optional `defaultBranch`. |
+| `issue` | The issue as the forge holds it: `number`, `title`, `body`, `author`, `trust` (`trusted`/`untrusted`), `labels`, optional `authorType: "Bot"` (GitHub: a bot opened it, reported with association `NONE` whatever `trust` says; ours only when `author` is `github-actions[bot]`, the fake forge's token identity), and `comments` (`author`, `trust`, `text`, `at`; `bot: true` for a comment our tracker posted earlier), plus an optional `defaultBranch`. |
 | `env` | Extra env for the run, e.g. `AGENT_TRIGGER`, `MAX_BUDGET_USD`, `MAX_CHAINED_RUNS`. |
 | `engine` | What the fake model does: `calls` (ticket tools in order, e.g. `{ "tool": "finish", "input": { "summary": "…" } }`, validated against the tool's real schema), then either `throw` (an error message, e.g. a provider failure) or `result` (`success`, `error_max_turns`, `error_max_budget_usd`). |
 | `commits` | How many commits the publisher finds over the base (default 1; 0 means nothing to publish). |
