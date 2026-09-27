@@ -11,6 +11,14 @@
 # `-e VAR`s listed for its stage. The work dir goes in as a tar on stdin (extracted by the image's
 # own user) and comes back out with `docker cp`; between jobs it travels as an artifact.
 # This file isn't under .gitlab/ci/, so .gitlab-ci.yml's include doesn't pick it up.
+#
+# Opt-in workspace persistence (PERSISTENCE_BUCKET, bin/persist.sh, README "Persistent workspace
+# images"): each job loop-mounts the issue's ext4 image from the bucket on `work`, over whatever
+# the cache or artifact put there, and saves it (sync, fstrim, umount, zstd, upload) before it
+# exits, with after_script as a backstop. That needs a privileged runner (which dind already
+# does) or a shell executor; a runner that can't loop-mount logs so and uses the native cache
+# and artifacts as if persistence were off. The bucket credential is only in this job's shell;
+# no `docker run` below is handed it.
 
 stages: [prepare, agent, publish]
 
@@ -27,6 +35,34 @@ variables:
     - export AGENT_IMAGE="${AGENT_IMAGE_PINNED:-$AGENT_IMAGE}"
     - docker pull "$AGENT_IMAGE"
     - mkdir -p work
+    # Persistence only: the host tools, and persist.sh from the pinned image (docker create/cp
+    # run nothing from it).
+    - |
+      if [ -n "${PERSISTENCE_BUCKET:-}" ]; then
+        apk add --no-cache bash coreutils e2fsprogs util-linux util-linux-misc zstd aws-cli >/dev/null
+        id="$(docker create "$AGENT_IMAGE")"
+        docker cp "$id:/opt/agent/bin/persist.sh" persist.sh
+        docker rm "$id" >/dev/null
+      fi
+    # persist_restore [--read-only] / persist_save: no-ops unless persistence is on. Exit 3 from
+    # restore is "can't loop-mount here", the one failure that falls back to the cache.
+    - |
+      persist_restore() {
+        [ -f persist.sh ] || return 0
+        set +e
+        bash persist.sh restore work "$@"
+        rc=$?
+        set -e
+        if [ "$rc" = 3 ]; then
+          echo "PERSISTENCE_BUCKET is set, but this runner can't loop-mount (it needs a privileged runner or a shell executor); falling back to the native cache for this job"
+          rm -f persist.sh
+          return 0
+        fi
+        return "$rc"
+      }
+      persist_save() {
+        [ ! -f persist.sh ] || bash persist.sh save work
+      }
     # run_stage <stage> <docker run options...>: the work dir in on stdin, the stage's exit
     # code in $code, the container left behind as agent-<stage> for `docker cp`.
     - |
@@ -39,8 +75,13 @@ variables:
         set -e
       }
       copy_out() {
-        rm -rf work && mkdir work && docker cp "agent-$1:/work/." work/
+        # A mounted workspace image can't be removed, only emptied.
+        if mountpoint -q work 2>/dev/null; then find work -mindepth 1 -delete; else rm -rf work && mkdir work; fi \
+          && docker cp "agent-$1:/work/." work/
       }
+  after_script:
+    # Unmounts and uploads if the script didn't get to (a no-op if it did).
+    - '[ ! -f persist.sh ] || bash persist.sh save work'
 
 agent-prepare:
   extends: .stage
@@ -54,9 +95,11 @@ agent-prepare:
   script:
     - echo "AGENT_IMAGE_PINNED=$(docker inspect --format '{{index .RepoDigests 0}}' "$AGENT_IMAGE" 2>/dev/null || echo "$AGENT_IMAGE")" > image.env
     - |
+      persist_restore
       run_stage prepare -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e AGENT_TRIGGER -e MAX_CHAINED_RUNS \
         -e CI_API_V4_URL -e CI_SERVER_HOST -e CI_PROJECT_ID -e CI_PROJECT_PATH
       copy_out prepare || [ "$code" != 0 ]
+      persist_save
       exit "$code"
   # 10 = blocked before the agent started (an untrusted issue awaiting a maintainer's go-ahead).
   # 30 = skipped: AGENT_TRIGGER (set by bin/dispatch-gitlab.ts) no longer applies to the issue's
@@ -83,13 +126,16 @@ agent-agent:
     policy: push
     when: always
   script:
-    - echo "AGENT_IMAGE_PINNED=$AGENT_IMAGE" > image.env
+    # AGENT_RAN tells the publish job this job ran, so the workspace image is this run's.
+    - printf 'AGENT_IMAGE_PINNED=%s\nAGENT_RAN=1\n' "$AGENT_IMAGE" > image.env
     # No AGENT_GITLAB_TOKEN, no CI_JOB_TOKEN: the agent runs Bash with permissions bypassed.
     # `--stage agent` also refuses to start if a forge credential reaches it.
     - |
+      persist_restore
       run_stage agent -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS -e MAX_BUDGET_USD \
         -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS
       copy_out agent || [ "$code" != 0 ]
+      persist_save
       exit "$code"
   artifacts:
     when: always
@@ -109,10 +155,14 @@ agent-publish:
   dependencies: [agent-agent]
   script:
     # The work dir (the agent's commits and its outcome.json) is only read as data: see
-    # src/handoff.ts and src/publish.ts.
+    # src/handoff.ts and src/publish.ts. With persistence, mounted read-only, and only when the
+    # agent job ran: otherwise (prepare failed, maybe before its save landed) the bucket could still
+    # hold the last run's image, outcome.json and all.
     - |
+      if [ -n "${AGENT_RAN:-}" ]; then persist_restore --read-only; fi
       run_stage publish -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e MAX_TURNS -e MAX_CHAINED_RUNS \
         -e CI_API_V4_URL -e CI_SERVER_HOST -e CI_PROJECT_ID -e CI_PROJECT_PATH
+      persist_save
       exit "$code"
   # 10 = asked a question, 20 = checkpointed (and, below MAX_CHAINED_RUNS, relayed to a new pipeline); not failures for us
   allow_failure: { exit_codes: [10, 20] }

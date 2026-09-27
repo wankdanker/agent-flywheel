@@ -4,7 +4,10 @@
 // deps; they only need to find each job's block and the variable names in it.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MODEL_CREDENTIAL_VARS } from "../src/stages.ts";
 import { FORGE_TOKEN_VARS } from "../src/model-proxy.ts";
 
@@ -125,4 +128,114 @@ test("no CI pipeline runs the live model eval (npm run eval:live is manual, and 
   ];
   assert.ok(files.length > 5);
   for (const f of files) assert.doesNotMatch(readFileSync(f, "utf8"), /eval:live|eval-live|src\/eval/, f);
+});
+
+// Opt-in workspace persistence (bin/persist.sh). The bucket credential lives only in the host
+// steps that run persist.sh; with PERSISTENCE_BUCKET unset, those steps are skipped and the
+// cache handoff and the chown before each `docker run` are exactly what they were.
+const PERSIST_CREDS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PERSISTENCE_GCS_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG"];
+
+// A job's steps, each from its `- ` line to the next.
+const steps = (job: string) => job.split(/^ {6}- /m).slice(1);
+const ifOf = (step: string) => /^\s+if: (.*)$/m.exec(step)?.[1] ?? "";
+
+test("GitHub agent.yml persistence: the bucket credential is only in persist.sh steps, which run no container; cache steps only run with it off", () => {
+  const jobs = blocks(readFileSync("./.github/workflows/agent.yml", "utf8").split(/^jobs:\n/m)[1]!, 2);
+  for (const name of ["prepare", "agent", "publish"]) {
+    const all = steps(jobs.get(name)!);
+    const persist = all.filter((s) => /persist\.sh" (restore|save)/.test(s));
+    assert.deepEqual(persist.map((s) => /persist\.sh" (\w+)/.exec(s)![1]), ["restore", "save"], `${name}: one restore, one save`);
+    for (const s of all) {
+      const creds = mentions(s, PERSIST_CREDS);
+      if (persist.includes(s)) {
+        assert.deepEqual(creds.sort(), ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "PERSISTENCE_GCS_KEY"], `${name}: ${s.split("\n")[0]}`);
+        assert.doesNotMatch(s, /docker (run|create)|\s-e\s/, `${name}: a credentialed step runs a container`);
+        assert.deepEqual(mentions(s, [...MODEL_CREDENTIAL_VARS, ...FORGE]), [], `${name}: persist step holds another secret`);
+        assert.match(ifOf(s), /env\.PERSISTENCE_BUCKET != ''/);
+      } else {
+        assert.deepEqual(creds, [], `${name}: ${s.split("\n")[0]} mentions a bucket credential`);
+      }
+      if (/uses: actions\/cache/.test(s)) assert.match(ifOf(s), /env\.PERSISTENCE_BUCKET == ''/, `${name}: ${s.split("\n")[0]}`);
+    }
+    // Sync, trim, unmount and upload even after a failed or cancelled run.
+    assert.match(ifOf(persist[1]!), /^always\(\) && /);
+    const order = all.map((s) => (persist[0] === s ? "restore" : persist[1] === s ? "save" : /"\$IMAGE" --stage /.test(s) ? "run" : "")).filter(Boolean);
+    assert.deepEqual(order, ["restore", "run", "save"], name);
+  }
+  assert.match(steps(jobs.get("publish")!).find((s) => /persist\.sh" restore/.test(s))!, /restore agent-work --read-only/);
+});
+
+// The `run:` script of a job's `docker run … --stage <name>` step, executed against a fake
+// `docker` and `sudo` that log their argv.
+function runStageStep(job: string, stage: string, env: Record<string, string>) {
+  const step = steps(job).find((s) => s.includes(`"$IMAGE" --stage ${stage}`))!;
+  const script = step.split(/^ {8}run: \|\n/m)[1]!.split("\n").filter((l) => l.startsWith("          ") || !l.trim()).map((l) => l.slice(10)).join("\n");
+  const root = mkdtempSync(join(tmpdir(), "agent-flywheel-ci-test-"));
+  try {
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "docker"), `#!/bin/sh\necho "docker $*" >> "${root}/log"\n[ "$4" != id ] || echo 1000\n`);
+    writeFileSync(join(bin, "sudo"), `#!/bin/sh\necho "sudo $*" >> "${root}/log"\n`);
+    chmodSync(join(bin, "docker"), 0o755);
+    chmodSync(join(bin, "sudo"), 0o755);
+    writeFileSync(join(root, "log"), "");
+    const res = spawnSync("bash", ["-e", "-c", script], {
+      cwd: root,
+      encoding: "utf8",
+      env: { PATH: `${bin}:${process.env.PATH}`, IMAGE: "img", ISSUE: "1", GITHUB_OUTPUT: join(root, "out"), ...env },
+    });
+    assert.equal(res.status, 0, res.stderr);
+    return readFileSync(join(root, "log"), "utf8").split("\n").filter(Boolean);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("GitHub agent.yml: persistence off chowns agent-work to the image's user as before; on, runs the container as the runner user, no chown", () => {
+  const jobs = blocks(readFileSync("./.github/workflows/agent.yml", "utf8").split(/^jobs:\n/m)[1]!, 2);
+  const me = `${process.getuid!()}:${process.getgid!()}`;
+  for (const stage of ["prepare", "agent", "publish"]) {
+    const off = runStageStep(jobs.get(stage)!, stage, { PERSISTENCE_BUCKET: "" });
+    assert.ok(off.includes("sudo chown -R 1000:1000 agent-work"), `${stage}: ${off.join("\n")}`);
+    const run = off.find((l) => l.includes("--stage"))!;
+    assert.match(run, /^docker run --rm -e /, `${stage}: nothing added to the docker run when off`);
+    assert.doesNotMatch(run, /--user/);
+
+    const on = runStageStep(jobs.get(stage)!, stage, { PERSISTENCE_BUCKET: "s3://bucket" });
+    assert.ok(!on.some((l) => l.startsWith("sudo")), `${stage}: no sudo with persistence`);
+    assert.match(on.find((l) => l.includes("--stage"))!, new RegExp(`^docker run --rm --user ${me} -e `));
+  }
+});
+
+test("GitLab agent-stages.yml persistence: no container is handed a bucket credential; every job saves before it exits, with after_script as a backstop", () => {
+  const text = readFileSync("./.gitlab/agent-stages.yml", "utf8");
+  const jobs = blocks(text, 0);
+  for (const name of ["prepare", "agent", "publish"]) {
+    const job = jobs.get(`agent-${name}`)!;
+    const run = /run_stage (\w+)((?:.*\\\n)*.*)/.exec(job)![2]!;
+    assert.deepEqual(mentions(run, PERSIST_CREDS), [], `agent-${name} hands a bucket credential to its container`);
+    assert.match(job, /persist_restore[^\n]*\n\s+run_stage /, `agent-${name} restores right before its run`);
+    assert.match(job, /persist_save\n\s+exit "\$code"/, `agent-${name} saves before it exits`);
+  }
+  assert.match(jobs.get("agent-publish")!, /persist_restore --read-only/);
+  const shared = jobs.get(".stage")!;
+  assert.match(shared, /after_script:\n(?:\s+#.*\n)?\s+- '\[ ! -f persist\.sh \] \|\| bash persist\.sh save work'/);
+  // Exit 3 (can't loop-mount) is the only restore failure that falls back to the cache.
+  assert.match(shared, /if \[ "\$rc" = 3 \]; then\n\s+echo "PERSISTENCE_BUCKET is set, but this runner can't loop-mount/);
+  assert.deepEqual(mentions(text.replace(/^.*docker login.*$/m, ""), PERSIST_CREDS), []);
+});
+
+test("persist-cleanup.yml: deletes a closed issue's image holding only the bucket credential, inside the issue's concurrency group", () => {
+  const text = readFileSync("./.github/workflows/persist-cleanup.yml", "utf8");
+  assert.match(text, /issues:\n\s+types: \[closed\]/);
+  assert.match(text, /group: agent-issue-\$\{\{ github\.event\.issue\.number \}\}/);
+  assert.match(text, /if: vars\.PERSISTENCE_BUCKET != ''/);
+  assert.match(text, /run: bash bin\/persist\.sh delete/);
+  assert.deepEqual(mentions(text, [...MODEL_CREDENTIAL_VARS, ...FORGE]), []);
+  assert.doesNotMatch(text, /docker run/);
+  // The arbitrary-uid smoke test only gates :latest for repos that opted in.
+  const smoke = steps(blocks(readFileSync("./.github/workflows/build.yml", "utf8").split(/^jobs:\n/m)[1]!, 2).get("smoke")!);
+  const asUser = smoke.find((s) => s.includes("--user"))!;
+  assert.equal(ifOf(asUser), "vars.PERSISTENCE_BUCKET != ''");
+  assert.match(asUser, /docker run --rm --user "\$\(id -u\):\$\(id -g\)" /);
 });

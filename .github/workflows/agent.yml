@@ -19,7 +19,11 @@
 #   agent    model key only: run the agent on that work dir, record its outcome in a file
 #   publish  GH_TOKEN only:  validate the outcome and the branch as data, push, open the PR, label
 # The work dir travels between them through the per-issue actions/cache, under a key unique to
-# this run, attempt and stage.
+# this run, attempt and stage. Or, opt-in with vars.PERSISTENCE_BUCKET, as a per-issue ext4 image
+# in S3/GCS that each job loop-mounts around its `docker run` (bin/persist.sh, README "Persistent
+# workspace images"); the cache steps are skipped then. The bucket credential (secrets
+# PERSISTENCE_AWS_ACCESS_KEY_ID/PERSISTENCE_AWS_SECRET_ACCESS_KEY or PERSISTENCE_GCS_KEY) is only
+# in the host-side restore/save steps, never handed to a container.
 name: agent
 
 on:
@@ -73,6 +77,8 @@ concurrency:
 
 env:
   ISSUE: ${{ github.event.issue.number || inputs.issue }}
+  PERSISTENCE_BUCKET: ${{ vars.PERSISTENCE_BUCKET }}
+  PERSISTENCE_SIZE: ${{ vars.PERSISTENCE_SIZE }}
 
 jobs:
   prepare:
@@ -125,11 +131,34 @@ jobs:
           docker pull "$image" || { echo "::error::No agent image $image. Run the build workflow first."; exit 2; }
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image" 2>/dev/null || true)"
           echo "image=${digest:-$image}" >> "$GITHUB_OUTPUT"
+      # Persistence only: persist.sh comes from the pinned image (no checkout in these jobs), and
+      # runs on this host, outside any container. docker create/cp run nothing from the image.
+      - name: Fetch the persistence script
+        if: env.PERSISTENCE_BUCKET != ''
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          docker pull -q "$IMAGE" >/dev/null
+          id="$(docker create "$IMAGE")"
+          docker cp "$id:/opt/agent/bin/persist.sh" "$RUNNER_TEMP/persist.sh"
+          docker rm "$id" >/dev/null
+      # Mounts the issue's image (or a fresh one) on agent-work, or fails the job; nothing below
+      # falls back to the cache once PERSISTENCE_BUCKET is set.
+      - name: Restore the workspace image
+        if: env.PERSISTENCE_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.PERSISTENCE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PERSISTENCE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
+          PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
+        run: bash "$RUNNER_TEMP/persist.sh" restore agent-work
       # Work dir is cached per issue so a run that dies partway (turn limit, crash) doesn't
       # lose its clone; the next run on that issue resumes from the newest entry (normally the
       # agent job's save) instead of recloning. Each save gets a fresh key, since actions/cache
       # only saves on a key miss.
       - name: Restore work directory cache
+        if: env.PERSISTENCE_BUCKET == ''
         uses: actions/cache/restore@v4
         with:
           path: agent-work
@@ -149,12 +178,18 @@ jobs:
         run: |
           # docker run rather than `container:`: same as a local run. The one bind mount (the
           # work dir) needs its owner matched to the image's user at run time (never
-          # hardcoded, in case the image changes it), so it isn't a uid fight.
+          # hardcoded, in case the image changes it), so it isn't a uid fight. With persistence,
+          # the mounted image is owned by the runner user instead, so the container runs as that.
           mkdir -p agent-work
-          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
-          sudo chown -R "$uid:$uid" agent-work
+          if [ -n "$PERSISTENCE_BUCKET" ]; then
+            as=(--user "$(id -u):$(id -g)")
+          else
+            uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+            sudo chown -R "$uid:$uid" agent-work
+            as=()
+          fi
           set +e
-          docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e AGENT_TRIGGER -e AGENT_COMMENT -e MAX_CHAINED_RUNS \
+          docker run --rm "${as[@]}" -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e AGENT_TRIGGER -e AGENT_COMMENT -e MAX_CHAINED_RUNS \
             -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
             -v "$PWD/agent-work:/work" \
             "$IMAGE" --stage prepare
@@ -167,11 +202,20 @@ jobs:
           if [ "$code" = 30 ]; then echo "::notice::#$ISSUE: nothing to run ($AGENT_TRIGGER no longer applies)"; exit 0; fi
           exit "$code"
       - name: Hand the work directory to the agent job
-        if: steps.prepare.outputs.proceed == 'true'
+        if: steps.prepare.outputs.proceed == 'true' && env.PERSISTENCE_BUCKET == ''
         uses: actions/cache/save@v4
         with:
           path: agent-work
           key: ${{ steps.prepare.outputs.work-key }}
+      - name: Save the workspace image
+        if: always() && env.PERSISTENCE_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.PERSISTENCE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PERSISTENCE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
+          PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
+        run: '[ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work'
 
   agent:
     needs: prepare
@@ -188,11 +232,30 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Restore the prepared work directory
+        if: env.PERSISTENCE_BUCKET == ''
         uses: actions/cache/restore@v4
         with:
           path: agent-work
           key: ${{ needs.prepare.outputs.work-key }}
           fail-on-cache-miss: true
+      - name: Fetch the persistence script
+        if: env.PERSISTENCE_BUCKET != ''
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          docker pull -q "$IMAGE" >/dev/null
+          id="$(docker create "$IMAGE")"
+          docker cp "$id:/opt/agent/bin/persist.sh" "$RUNNER_TEMP/persist.sh"
+          docker rm "$id" >/dev/null
+      - name: Restore the workspace image
+        if: env.PERSISTENCE_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.PERSISTENCE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PERSISTENCE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
+          PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
+        run: bash "$RUNNER_TEMP/persist.sh" restore agent-work
       - name: Name this job's work directory save
         id: key
         run: echo "work-key=agent-work-issue-$ISSUE-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-agent" >> "$GITHUB_OUTPUT"
@@ -212,9 +275,14 @@ jobs:
           MODEL_PROXY_REQUEST_TIMEOUT_MS: ${{ vars.MODEL_PROXY_REQUEST_TIMEOUT_MS }}
         run: |
           docker pull "$IMAGE"
-          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
-          sudo chown -R "$uid:$uid" agent-work
-          docker run --rm -e ISSUE \
+          if [ -n "$PERSISTENCE_BUCKET" ]; then
+            as=(--user "$(id -u):$(id -g)")
+          else
+            uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+            sudo chown -R "$uid:$uid" agent-work
+            as=()
+          fi
+          docker run --rm "${as[@]}" -e ISSUE \
             -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS -e MAX_BUDGET_USD \
             -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS \
             -v "$PWD/agent-work:/work" \
@@ -222,11 +290,22 @@ jobs:
       # Always, so a failed or timed-out agent still keeps its work for the next run to resume,
       # and the publish job still gets a work dir to settle the issue from.
       - name: Save work directory cache
-        if: always()
+        if: always() && env.PERSISTENCE_BUCKET == ''
         uses: actions/cache/save@v4
         with:
           path: agent-work
           key: ${{ steps.key.outputs.work-key }}
+      # Same always(), for the same reason: a failed run's tree, uncommitted edits included, is
+      # what the next run resumes from.
+      - name: Save the workspace image
+        if: always() && env.PERSISTENCE_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.PERSISTENCE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PERSISTENCE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
+          PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
+        run: '[ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work'
 
   publish:
     needs: [prepare, agent]
@@ -247,10 +326,33 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       # A miss (the agent job never saved) is left to the publish stage to report.
       - name: Restore the agent's work directory
+        if: env.PERSISTENCE_BUCKET == ''
         uses: actions/cache/restore@v4
         with:
           path: agent-work
           key: ${{ needs.agent.outputs.work-key || 'none' }}
+      - name: Fetch the persistence script
+        if: env.PERSISTENCE_BUCKET != '' && needs.agent.result != 'skipped'
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          docker pull -q "$IMAGE" >/dev/null
+          id="$(docker create "$IMAGE")"
+          docker cp "$id:/opt/agent/bin/persist.sh" "$RUNNER_TEMP/persist.sh"
+          docker rm "$id" >/dev/null
+      # Read-only: this job only reads the work dir as data, so its save just unmounts. Not
+      # when the agent job never ran (prepare failed, maybe before its save landed): the bucket
+      # could still hold the last run's image, outcome.json and all. An empty agent-work is what
+      # the cache's miss gives the publish stage, too.
+      - name: Restore the workspace image
+        if: env.PERSISTENCE_BUCKET != '' && needs.agent.result != 'skipped'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.PERSISTENCE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PERSISTENCE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
+          PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
+        run: bash "$RUNNER_TEMP/persist.sh" restore agent-work --read-only
       # The forge token and no model credential. The work dir (the agent's commits and its
       # outcome.json) is only read as data: see src/handoff.ts and src/publish.ts.
       - name: Publish the outcome
@@ -262,10 +364,15 @@ jobs:
         run: |
           docker pull "$IMAGE"
           mkdir -p agent-work
-          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
-          sudo chown -R "$uid:$uid" agent-work
+          if [ -n "$PERSISTENCE_BUCKET" ]; then
+            as=(--user "$(id -u):$(id -g)")
+          else
+            uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+            sudo chown -R "$uid:$uid" agent-work
+            as=()
+          fi
           set +e
-          docker run --rm -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e MAX_TURNS -e MAX_CHAINED_RUNS \
+          docker run --rm "${as[@]}" -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e MAX_TURNS -e MAX_CHAINED_RUNS \
             -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
             -v "$PWD/agent-work:/work" \
             "$IMAGE" --stage publish
@@ -276,6 +383,15 @@ jobs:
           # The stage has already relayed it to a new run of this workflow, unless MAX_CHAINED_RUNS was reached.
           if [ "$code" = 20 ]; then echo "::notice::Checkpointed #$ISSUE (see the issue for whether it relayed)"; exit 0; fi
           exit "$code"
+      - name: Save the workspace image
+        if: always() && env.PERSISTENCE_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.PERSISTENCE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PERSISTENCE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
+          PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
+        run: '[ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work'
 
   # The stages already leave a terminal label on every failure they can catch. This covers
   # what they can't: a container killed by a job timeout or a cancel before it could clean up.

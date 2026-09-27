@@ -88,6 +88,25 @@ jobs:
             -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e SMOKE_MODEL \
             -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS \
             "$image" --smoke
+      # Only with opt-in workspace persistence (bin/persist.sh), whose agent jobs run the image as
+      # the runner's own uid, which has no passwd entry in it (entrypoint.sh gives it a HOME).
+      # This proves Claude Code still works that way before the image becomes :latest.
+      - name: Smoke-test the image as an arbitrary uid
+        if: vars.PERSISTENCE_BUCKET != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          SMOKE_MODEL: ${{ vars.SMOKE_MODEL }}
+          MODEL_PROXY_MAX_REQUESTS: ${{ vars.MODEL_PROXY_MAX_REQUESTS }}
+          MODEL_PROXY_MAX_LIFETIME_MS: ${{ vars.MODEL_PROXY_MAX_LIFETIME_MS }}
+          MODEL_PROXY_REQUEST_TIMEOUT_MS: ${{ vars.MODEL_PROXY_REQUEST_TIMEOUT_MS }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA::7}"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e SMOKE_MODEL \
+            -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS \
+            "$image" --smoke
 
   latest:
     needs: [smoke]
