@@ -53,6 +53,7 @@ function fakeForge(o: { released?: number[] } = {}) {
     createSubIssue: async () => { throw new Error("unused"); },
     ensureBranch: async () => { throw new Error("unused"); },
     openReview: async (r) => (reviews.push(r), { url: "https://x/pull/99", created: reviews.length === 1 }),
+    dispatchRelay: async () => { throw new Error("unused"); },
   });
   const forge: ChainForge = {
     tracker,

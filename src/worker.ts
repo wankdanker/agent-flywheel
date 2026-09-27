@@ -12,6 +12,7 @@ export type WorkerConfig = {
   pluginDir: string;     // our baked-in skills/agents/hooks
   model?: string;
   maxTurns: number;
+  maxBudgetUsd?: number; // the SDK's per-run spend cap (MAX_BUDGET_USD); unset, only maxTurns bounds a run
   // Env for the SDK's own subprocess. bin/run-ticket.ts sets this to sandboxEnv(...) so
   // the real model credential never reaches it (see src/model-proxy.ts); defaults to
   // process.env (real credential included) so tests and other callers don't need to care.
@@ -40,10 +41,11 @@ export type AgentOutcome =
 export type Outcome = { kind: "blocked" | "ready_for_review" | "split" | "failed" | "checkpoint" | "incomplete"; detail: string };
 
 // How the agent's session ended, as far as applyOutcome needs to know: running out of
-// MAX_TURNS without recording anything is an implicit checkpoint, not a crash. `error` is a
-// crash (already scrubbed for the issue thread, see run.ts's sanitizeError) that ended it
-// before the agent recorded anything.
-export type SessionEnd = { maxTurnsHit: boolean; error?: string };
+// MAX_TURNS without recording anything is an implicit checkpoint, not a crash, and so is running
+// out of MAX_BUDGET_USD (`budgetHit`) with something committed. `error` is a crash (already
+// scrubbed for the issue thread, see run.ts's sanitizeError) that ended it before the agent
+// recorded anything.
+export type SessionEnd = { maxTurnsHit: boolean; budgetHit?: boolean; error?: string };
 
 export const branchFor = (t: Ticket) => `agent/issue-${t.number}`;
 
@@ -202,6 +204,13 @@ export const implicitCheckpointComment = (t: Ticket, maxTurns: number) =>
   `I used all ${maxTurns} turns before recording a checkpoint. Whatever I committed is published to branch ` +
   `\`${branchFor(t)}\`; its \`git log\` says what's done, and the next run picks it up from there.\n\n${RESUME_HINT}`;
 
+export const budgetComment = (t: Ticket, commits: number) =>
+  `I hit this run's spend cap (\`MAX_BUDGET_USD\`) before recording an outcome. ` +
+  (commits
+    ? `What I committed is published to branch \`${branchFor(t)}\`; its \`git log\` says what's done, and the next run picks it up from there.`
+    : `I hadn't committed anything yet, so there's nothing new on branch \`${branchFor(t)}\`.`) +
+  `\n\n${RESUME_HINT}`;
+
 // No outcome recorded, but the branch had commits, so they were published anyway (#48).
 export const crashedComment = (t: Ticket, error: string | undefined) =>
   (error ? `I was stopped by an error before recording an outcome:\n\n> ${error}\n\n` : `I stopped without recording an outcome. `) +
@@ -287,6 +296,17 @@ export async function applyOutcome(
       const text = implicitCheckpointComment(t, cfg.maxTurns);
       return settle(reached, [
         () => tracker.comment(text),
+        () => tracker.setState("blocked"),
+      ]);
+    }
+    if (end.budgetHit) {
+      // Out of money, not broken: a checkpoint if there's work to continue from, else blocked.
+      const reached: Outcome = { kind: "checkpoint", detail: "hit MAX_BUDGET_USD without recording an outcome" };
+      const res = publish(cfg, reached, false);
+      if ("problems" in res) return rejected("checkpoint", res.problems);
+      const settled: Outcome = res.commits ? reached : { kind: "blocked", detail: "hit MAX_BUDGET_USD before committing anything" };
+      return settle(settled, [
+        () => tracker.comment(budgetComment(t, res.commits)),
         () => tracker.setState("blocked"),
       ]);
     }
@@ -495,6 +515,7 @@ export async function runSession(t: Ticket, cfg: SessionConfig): Promise<{ recor
         cwd: cfg.workDir,
         model: cfg.model,
         maxTurns: cfg.maxTurns,
+        ...(cfg.maxBudgetUsd !== undefined ? { maxBudgetUsd: cfg.maxBudgetUsd } : {}),
         env: cfg.env ?? process.env,
         mcpServers: { ticket: ticketTools },
         // Our house rules come from ~/.claude/CLAUDE.md; skills/agents/hooks from our plugin.
@@ -509,17 +530,20 @@ export async function runSession(t: Ticket, cfg: SessionConfig): Promise<{ recor
   } catch (err) {
     // The agent already decided (and e.g. already committed its work) before the SDK or model API
     // blew up on the way out: honor that decision rather than discard it. Likewise the SDK
-    // may throw after an error_max_turns result; that's an implicit checkpoint, not a crash.
-    if (!recorded && !end.maxTurnsHit) throw err;
-    console.error(`[error] agent session failed after ${recorded ? `recording ${recorded.status}` : "running out of turns"}; applying it anyway:`, err);
+    // may throw after an error_max_turns or error_max_budget_usd result; those are implicit
+    // checkpoints, not crashes.
+    if (!recorded && !end.maxTurnsHit && !end.budgetHit) throw err;
+    const after = recorded ? `recording ${recorded.status}` : end.maxTurnsHit ? "running out of turns" : "hitting the spend cap";
+    console.error(`[error] agent session failed after ${after}; applying it anyway:`, err);
   }
   return { recorded, end };
 }
 
-async function drain(messages: AsyncIterable<SDKMessage>, gauge: TurnGauge, end: SessionEnd) {
+export async function drain(messages: AsyncIterable<SDKMessage>, gauge: TurnGauge, end: SessionEnd) {
   for await (const msg of messages) {
     gauge.observe(msg);
     if (msg.type === "result" && msg.subtype === "error_max_turns") end.maxTurnsHit = true;
+    if (msg.type === "result" && msg.subtype === "error_max_budget_usd") end.budgetHit = true;
     if (msg.type === "assistant") {
       for (const b of msg.message.content) {
         if (b.type === "text") console.log(`[claude] ${b.text}`);

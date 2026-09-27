@@ -17,16 +17,16 @@ import { join } from "node:path";
 import { isAllowedRepo } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo } from "./clone.ts";
-import type { Trigger } from "./dispatch.ts";
+import { chainedRuns, chainMarker, CONTINUE_COMMAND, RESUME_HINT, type Trigger } from "./dispatch.ts";
 import { clearOutcome, HandoffError, readOutcome, readPrepared, resetHandoff, writeOutcome, writePrepared } from "./handoff.ts";
 import { FORGE_TOKEN_VARS, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import { gitPublisher } from "./publish.ts";
 import {
   ConfigError, configExit, credentialFor, DEFAULT_PLUGIN_DIR, detectTracker, EXIT_CODES, EXIT_SKIPPED, fetchAllowedTicket, guarded,
-  guardTracker, parseMaxTurns, parseTrigger, publishAfterCrash, requireModelCredential, settleIncomplete, startProxyFromEnv, triggerStillApplies,
+  guardTracker, parseMaxBudgetUsd, parseMaxChainedRuns, parseMaxTurns, parseTrigger, publishAfterCrash, requireModelCredential, settleIncomplete, startProxyFromEnv, triggerStillApplies,
   workDirFor, type RunDeps,
 } from "./run.ts";
-import { STATE_LABELS, type Tracker } from "./tracker.ts";
+import { STATE_LABELS, type Ticket, type Tracker } from "./tracker.ts";
 import {
   applyOutcome, blockForDirective, branchFor, needsDirective, runSession as realRunSession, type AgentOutcome, type Outcome, type SessionEnd,
   type WorkerConfig,
@@ -80,10 +80,11 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
   const prepareRepo = deps.prepareRepo ?? realPrepareRepo;
   const originUrl = deps.originUrl ?? realOriginUrl;
 
-  let tracker: Tracker, trigger: Trigger | undefined;
+  let tracker: Tracker, trigger: Trigger | undefined, maxChained: number;
   try {
     refuseModelCredential(env, "prepare");
     trigger = parseTrigger(env);
+    maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
     tracker = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
@@ -92,7 +93,7 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
   if (!allowed) return 2;
   const { ticket, repo, allowlist } = allowed;
   // Before `working`: a skipped run leaves the issue exactly as it was.
-  if (!triggerStillApplies(ticket, trigger, env)) return EXIT_SKIPPED;
+  if (!triggerStillApplies(ticket, trigger, env, maxChained)) return EXIT_SKIPPED;
   const guard = guardTracker(tracker, ticket);
 
   // Success leaves the issue on `working` for the publish stage to settle; a failure here
@@ -124,10 +125,11 @@ export async function agentStage(deps: RunDeps = {}): Promise<number> {
   const startModelProxy = deps.startModelProxy ?? realStartModelProxy;
   const runSession = deps.runSession ?? realRunSession;
 
-  let maxTurns: number, issue: number;
+  let maxTurns: number, maxBudgetUsd: number | undefined, issue: number;
   try {
     requireModelCredential(env);
     maxTurns = parseMaxTurns(env.MAX_TURNS);
+    maxBudgetUsd = parseMaxBudgetUsd(env.MAX_BUDGET_USD);
     issue = parseIssue(env);
   } catch (err) {
     return configExit(err);
@@ -156,6 +158,7 @@ export async function agentStage(deps: RunDeps = {}): Promise<number> {
       pluginDir: env.PLUGIN_DIR ?? DEFAULT_PLUGIN_DIR,
       model: env.CLAUDE_MODEL,
       maxTurns,
+      maxBudgetUsd,
       env: sandboxEnv(env, proxy.url),
     });
   } catch (err) {
@@ -166,8 +169,10 @@ export async function agentStage(deps: RunDeps = {}): Promise<number> {
     await proxy.close().catch((err) => console.error("[cleanup] model proxy close failed:", err));
   }
 
-  writeOutcome(workDir, { issue, recorded: result.recorded ?? null, maxTurnsHit: result.end.maxTurnsHit });
-  console.log(`[agent] recorded ${result.recorded?.status ?? "no outcome"}${result.end.maxTurnsHit ? " (out of turns)" : ""}; the publish stage applies it`);
+  const budgetHit = result.end.budgetHit ?? false;
+  writeOutcome(workDir, { issue, recorded: result.recorded ?? null, maxTurnsHit: result.end.maxTurnsHit, budgetHit });
+  const why = result.end.maxTurnsHit ? " (out of turns)" : budgetHit ? " (hit MAX_BUDGET_USD)" : "";
+  console.log(`[agent] recorded ${result.recorded?.status ?? "no outcome"}${why}; the publish stage applies it`);
   return 0;
 }
 
@@ -175,10 +180,11 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
   const createPublisher = deps.publisher ?? gitPublisher;
 
-  let tracker: Tracker, maxTurns: number;
+  let tracker: Tracker, maxTurns: number, maxChained: number;
   try {
     refuseModelCredential(env, "publish");
     maxTurns = parseMaxTurns(env.MAX_TURNS);
+    maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
     tracker = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
@@ -208,7 +214,7 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
     let outcome: Outcome;
     try {
       const handed = readOutcome(workDir, ticket.number);
-      outcome = await applyOutcome(ticket, cfg, handed.recorded ?? undefined, { maxTurnsHit: handed.maxTurnsHit });
+      outcome = await applyOutcome(ticket, cfg, handed.recorded ?? undefined, { maxTurnsHit: handed.maxTurnsHit, budgetHit: handed.budgetHit });
     } catch (err) {
       // No (usable) outcome.json: the agent stage crashed, or was killed. If the work dir made it
       // here, publish what the agent committed anyway, same as the combined run does.
@@ -217,8 +223,41 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
     }
     outcome = await settleIncomplete(outcome, guard.tracker, ticket);
     console.log(`[outcome] ${outcome.kind}: ${outcome.detail}`);
+    if (outcome.kind === "checkpoint") await relayCheckpoint(ticket, guard.tracker, maxChained);
     return EXIT_CODES[outcome.kind];
   }, { mustSettle: true });
+}
+
+export const relayComment = (t: Ticket, n: number, max: number) =>
+  `Continuing from branch \`${branchFor(t)}\` on my own: this is chained run ${n} of at most ${max} ` +
+  `(\`MAX_CHAINED_RUNS\`) before I stop for a maintainer. A comment from a maintainer resets the count.\n\n${chainMarker(n)}`;
+
+export const chainLimitComment = (t: Ticket, runs: number, max: number) =>
+  `I've already continued ${runs} time(s) in a row on my own, which is the limit (\`MAX_CHAINED_RUNS\`=${max}), so I'm not ` +
+  `starting another run by myself. Please review branch \`${branchFor(t)}\` and its \`git log\`, then comment ` +
+  `\`${CONTINUE_COMMAND}\` (with any directions on the lines after it) to have me keep going.\n\n${RESUME_HINT}`;
+
+// The auto-relay after a checkpoint (the issue is already `blocked`, the work pushed): start the
+// next run ourselves, with AGENT_TRIGGER=relay, unless MAX_CHAINED_RUNS of them have already run
+// in a row since a trusted human last commented (0 turns relaying off). The announcement goes up
+// before the dispatch, since it's what the relay's prepare stage re-checks (recheckTrigger). Never
+// throws: the checkpoint itself has landed, and a relay that didn't start just leaves the issue
+// blocked, waiting on a human like any other checkpoint.
+export async function relayCheckpoint(ticket: Ticket, tracker: Tracker, max: number): Promise<void> {
+  if (max === 0) return;
+  const runs = chainedRuns(ticket.comments);
+  try {
+    if (runs >= max) {
+      console.log(`[relay] #${ticket.number} has had ${runs} chained run(s) in a row (MAX_CHAINED_RUNS=${max}); waiting on a maintainer`);
+      await tracker.comment(chainLimitComment(ticket, runs, max));
+      return;
+    }
+    await tracker.comment(relayComment(ticket, runs + 1, max));
+    await tracker.dispatchRelay();
+    console.log(`[relay] #${ticket.number}: dispatched chained run ${runs + 1} of at most ${max}`);
+  } catch (err) {
+    console.error(`[relay] couldn't start the next run on #${ticket.number}; it stays blocked for a maintainer:`, err);
+  }
 }
 
 export const STAGE_MAINS: Record<Stage, (deps?: RunDeps) => Promise<number>> = { prepare: prepareStage, agent: agentStage, publish: publishStage };

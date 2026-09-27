@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyOutcome, buildPrompt, runTicket, trustedDirectives, type WorkerConfig } from "../src/worker.ts";
+import { applyOutcome, buildPrompt, drain, runTicket, trustedDirectives, TurnGauge, type SessionEnd, type WorkerConfig } from "../src/worker.ts";
 import { PublishRejected, type Publisher, type PushResult } from "../src/publish.ts";
 import type { Comment, CreatedIssue, ReviewRequest, SubIssueRequest, Ticket, Tracker } from "../src/tracker.ts";
 import { chainHeader, parseChain } from "../src/chain.ts";
@@ -417,4 +417,25 @@ test("applyOutcome: no recorded outcome after a crash, with commits: publishes t
   assert.deepEqual(tracker.states, ["blocked"]);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]!, /stopped by an error[\s\S]*> Error: 429 rate limited[\s\S]*committed work is on branch `agent\/issue-42`/);
+});
+
+test("drain: an error_max_budget_usd result marks the session budgetHit; error_max_turns marks maxTurnsHit", async () => {
+  async function* results(subtype: string) {
+    yield { type: "result", subtype, num_turns: 3, total_cost_usd: 1.5 } as any;
+  }
+  for (const [subtype, want] of [
+    ["error_max_budget_usd", { maxTurnsHit: false, budgetHit: true }],
+    ["error_max_turns", { maxTurnsHit: true }],
+    ["success", { maxTurnsHit: false }],
+  ] as const) {
+    const end: SessionEnd = { maxTurnsHit: false };
+    const log = console.log;
+    console.log = () => {};
+    try {
+      await drain(results(subtype), new TurnGauge(10), end);
+    } finally {
+      console.log = log;
+    }
+    assert.deepEqual(end, want, subtype);
+  }
 });

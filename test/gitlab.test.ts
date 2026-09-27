@@ -240,3 +240,20 @@ test("gitlab chain: release is one label update, getReview maps the MR, merge pi
   await chain.mergeReview(5, "aaa");
   assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa" });
 });
+
+test("gitlab dispatchRelay: a default-branch pipeline with ISSUE and AGENT_TRIGGER=relay", async (t) => {
+  const posts: unknown[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    if (url === "https://gitlab.example/api/v4/projects/g%2Fp") return jsonResponse({ default_branch: "trunk" });
+    if (url === "https://gitlab.example/api/v4/projects/g%2Fp/pipeline" && init.method === "POST") {
+      posts.push(JSON.parse(String(init.body)));
+      return jsonResponse({ id: 1 }, 201);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  await gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 }).dispatchRelay();
+  assert.deepEqual(posts, [{
+    ref: "trunk",
+    variables: [{ key: "ISSUE", value: "3" }, { key: "AGENT_TRIGGER", value: "relay" }],
+  }]);
+});

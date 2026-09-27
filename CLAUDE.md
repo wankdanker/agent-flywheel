@@ -57,7 +57,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - re-checks how the run was triggered (`AGENT_TRIGGER`, see `src/dispatch.ts` below) against the
     issue's live labels right after fetching it, and exits 30 without touching anything if that
     reason no longer holds;
-  - maps the outcome to an exit code: 0 ready for review, 10 blocked (question or split into sub-issues), 20 checkpoint (paused at the turn limit, work pushed), 30 skipped (trigger no longer applies), 1 incomplete or failed, 2 bad config. Both CIs treat 10, 20 and 30 as success.
+  - maps the outcome to an exit code: 0 ready for review, 10 blocked (question or split into sub-issues), 20 checkpoint (paused at the turn or `MAX_BUDGET_USD` limit, work pushed), 30 skipped (trigger no longer applies), 1 incomplete or failed, 2 bad config. Both CIs treat 10, 20 and 30 as success.
   - The agent never pushes: `sandboxEnv` strips the forge tokens (`FORGE_TOKEN_VARS`) as well as
     the model credential, and the `github-pr`/`gitlab-mr` skills only tell it to commit. `main()`
     builds a `gitPublisher` (`src/publish.ts`, a `RunDeps` seam) with the scoped credential and
@@ -74,7 +74,12 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     env, credential files or any git config scope): `runSession` (`src/worker.ts`, the session
     half of `runTicket` without the tracker writes) and write `outcome.json`. No tracker at all.
   - `publishStage` (forge token; exits 2 on a model credential): re-fetch the issue, no-op
-    unless it's still `working`, `readOutcome`, then `applyOutcome` with the publisher.
+    unless it's still `working`, `readOutcome`, then `applyOutcome` with the publisher. On a
+    `checkpoint` it then auto-relays (`relayCheckpoint`): posts an announcement with a hidden
+    `chainMarker(n)` and calls `Tracker#dispatchRelay` (GitHub `workflow_dispatch` of `agent.yml`
+    with `trigger: relay`; GitLab an `api` pipeline with `AGENT_TRIGGER=relay`), unless
+    `chainedRuns` already reached `MAX_CHAINED_RUNS` (default 3, 0 = off), in which case it
+    comments asking for `/agent continue`. A relay failure is logged, never thrown.
   `src/handoff.ts` reads/writes those files in `<workDir>.handoff/`. `outcome.json` is
   agent-writable, so it's read with `O_NOFOLLOW`, size-capped, and parsed with a strict zod schema
   with length caps; nothing in it picks a URL, branch or repo. `test/stages.test.ts` drives the
@@ -93,7 +98,11 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   (`isContinueCommand`). `decideComment` is what `bin/dispatch-gitlab.ts` applies to webhooks;
   `.github/workflows/agent.yml`'s prepare `if` and `concurrency` group mirror it as a prefilter;
   both hand the run `AGENT_TRIGGER` (GitHub also `AGENT_COMMENT`), and the prepare stage /
-  `main()` re-check it with `recheckTrigger`. `test/dispatch.test.ts` runs one fixture matrix
+  `main()` re-check it with `recheckTrigger`. A `relay` trigger (our own auto-relay, README's
+  "Chained runs and spend caps") runs only on `agent/blocked` while the newest trusted comment is
+  our relay announcement (`pendingRelay`) within `MAX_CHAINED_RUNS`; the chain count is derived
+  from the thread (`chainedRuns`: newest trusted chain marker, reset by a trusted human comment),
+  never stored. `test/dispatch.test.ts` runs one fixture matrix
   through all of them (interpreting agent.yml's expression). Dependency-free, like `tracker.ts`.
 - `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`. Both attach a `Trust` to the issue (from its author) and to every comment (from that comment's author) when building a `Ticket`.
@@ -121,7 +130,7 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     a `PreToolUse` hook denies everything but git Bash commands and the `mcp__ticket__*` tools once
     `CHECKPOINT_AT` (2) or fewer turns remain, telling the agent to commit and call `checkpoint`.
 
-  If the agent calls none of these tools, `applyOutcome` reports `incomplete`, unless the session ended with `error_max_turns`, which is an implicit `checkpoint`, or the branch has commits over the base: then it still pushes them (same validation) and settles `failed` (blocked, exit 1) with `crashedComment`. A session that threw, or (split mode) a missing/invalid `outcome.json`, goes through `run.ts`'s `publishAfterCrash`, which does the same with the scrubbed error in the comment, and rethrows for `guarded`'s fallback when nothing was committed. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
+  If the agent calls none of these tools, `applyOutcome` reports `incomplete`, unless the session ended with `error_max_turns`, which is an implicit `checkpoint`, or `error_max_budget_usd` (`SessionEnd.budgetHit`, from `MAX_BUDGET_USD` → the SDK's `maxBudgetUsd`), which is a `checkpoint` with commits and `blocked` without, or the branch has commits over the base: then it still pushes them (same validation) and settles `failed` (blocked, exit 1) with `crashedComment`. A session that threw, or (split mode) a missing/invalid `outcome.json`, goes through `run.ts`'s `publishAfterCrash`, which does the same with the scrubbed error in the comment, and rethrows for `guarded`'s fallback when nothing was committed. `applyOutcome` attempts every write even when an earlier one fails (so a failed comment still gets the label applied) and then throws a `SettlementError`. If `query()` throws after the agent already recorded an outcome, `runTicket` still applies it.
 - `src/chain.ts` is a split's sub-issue chain (README's "Split issues"). Each sub-issue body
   starts with a chain header (`chainHeader`/`parseChain`: parent, `Sub-issue: i of n`,
   `Blocked by`), believed only from a trusted author (`chainOf`). `baseBranchFor` makes a

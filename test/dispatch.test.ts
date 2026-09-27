@@ -14,8 +14,8 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decideComment, isContinueCommand, recheckTrigger, triggerFromEnv } from "../src/dispatch.ts";
-import { BOT_MARKER } from "../src/tracker.ts";
+import { chainedRuns, chainMarker, decideComment, isContinueCommand, pendingRelay, recheckTrigger, triggerFromEnv } from "../src/dispatch.ts";
+import { BOT_MARKER, toComment, type Comment } from "../src/tracker.ts";
 
 test("isContinueCommand: the first nonblank line, exactly, case-sensitive", () => {
   for (const body of [
@@ -121,6 +121,51 @@ test("triggerFromEnv: a comment trigger is upgraded to a command only by a stric
   assert.throws(() => triggerFromEnv({ AGENT_TRIGGER: "Comment" }), /AGENT_TRIGGER/);
 });
 
+// ---- Chained runs (auto-relay) ----
+
+const at = "2026-09-26T00:00:00Z";
+const BOT = `${BOT_MARKER}\n`;
+const relayAnnouncement = (n: number) => toComment("agent-bot", `${BOT}Continuing.\n\n${chainMarker(n)}`, at, "trusted");
+const human = (text = "looks good") => toComment("maintainer", text, at, "trusted");
+const checkpointNote = () => toComment("agent-bot", `${BOT}Checkpoint: done X, next Y.`, at, "trusted");
+
+test("chainedRuns: the latest relay's position, reset by a trusted human comment", () => {
+  assert.equal(chainedRuns([]), 0);
+  assert.equal(chainedRuns([human(), checkpointNote()]), 0);
+  assert.equal(chainedRuns([relayAnnouncement(1), checkpointNote(), relayAnnouncement(2), checkpointNote()]), 2);
+  assert.equal(chainedRuns([relayAnnouncement(1), relayAnnouncement(2), relayAnnouncement(3), checkpointNote()]), 3);
+  assert.equal(chainedRuns([relayAnnouncement(1), relayAnnouncement(2), human("/agent continue"), checkpointNote()]), 0);
+  assert.equal(chainedRuns([relayAnnouncement(3), human(), relayAnnouncement(1)]), 1);
+});
+
+test("chainedRuns: an untrusted comment doesn't reset it, and a pasted marker doesn't count", () => {
+  const stranger = (body: string) => toComment("stranger", body, at, "untrusted");
+  assert.equal(chainedRuns([relayAnnouncement(2), stranger("please keep going")]), 2);
+  // An untrusted poster pasting our markers is neither ours nor a trusted human.
+  assert.equal(chainedRuns([relayAnnouncement(3), stranger(`${BOT}${chainMarker(0)}`)]), 3);
+  // A trusted human quoting a marker is still a human: it resets.
+  assert.equal(chainedRuns([relayAnnouncement(3), human(chainMarker(1))]), 0);
+});
+
+test("pendingRelay: only while the relay announcement is the newest trusted comment", () => {
+  assert.equal(pendingRelay([relayAnnouncement(2)]), 2);
+  assert.equal(pendingRelay([relayAnnouncement(2), toComment("stranger", "hi", at, "untrusted")]), 2);
+  assert.equal(pendingRelay([relayAnnouncement(2), human()]), undefined);
+  assert.equal(pendingRelay([relayAnnouncement(2), checkpointNote()]), undefined);
+  assert.equal(pendingRelay([]), undefined);
+  assert.equal(pendingRelay([toComment("stranger", `${BOT}${chainMarker(1)}`, at, "untrusted")]), undefined);
+});
+
+test("recheckTrigger(relay): blocked, announced, and within MAX_CHAINED_RUNS", () => {
+  const blocked = ["agent", "agent/blocked"];
+  for (const n of [1, 2, 3]) assert.equal(recheckTrigger("relay", blocked, [relayAnnouncement(n)]).run, true, `relay ${n}`);
+  assert.equal(recheckTrigger("relay", blocked, [relayAnnouncement(4)]).run, false);
+  assert.equal(recheckTrigger("relay", blocked, [relayAnnouncement(2)], 1).run, false);
+  assert.equal(recheckTrigger("relay", blocked, [relayAnnouncement(1), human()]).run, false);
+  assert.equal(recheckTrigger("relay", ["agent", "agent/review"], [relayAnnouncement(1)]).run, false);
+  assert.equal(recheckTrigger("relay", ["agent/blocked"], [relayAnnouncement(1)]).run, false);
+});
+
 // ---- GitHub: agent.yml's gate, evaluated ----
 
 // Just enough of GitHub Actions' expression language for agent.yml's gates: literals, property
@@ -223,10 +268,10 @@ const commentEvent = (f: Fixture) => ({
 
 // What a GitHub run does with an event: the job's `if`, then (if it passes) prepare's re-check
 // with the env the workflow gives it, against the same labels (nothing changed in between).
-function githubRuns(github: Record<string, unknown>, labels: string[]) {
-  if (!evaluate(gate, { github, inputs: {} })) return false;
-  const env = { AGENT_TRIGGER: String(evaluate(triggerExpr, { github })), AGENT_COMMENT: String(evaluate(commentExpr, { github }) ?? "") };
-  return recheckTrigger(triggerFromEnv(env), labels).run;
+function githubRuns(github: Record<string, unknown>, labels: string[], inputs: Record<string, string> = {}, comments: Comment[] = []) {
+  if (!evaluate(gate, { github, inputs })) return false;
+  const env = { AGENT_TRIGGER: String(evaluate(triggerExpr, { github, inputs })), AGENT_COMMENT: String(evaluate(commentExpr, { github }) ?? "") };
+  return recheckTrigger(triggerFromEnv(env), labels, comments).run;
 }
 
 test("GitHub: agent.yml's gate plus prepare's re-check match the policy on every comment fixture", () => {
@@ -248,6 +293,16 @@ test("GitHub: adding `agent` starts the initial run; other label events and manu
   }
   // workflow_dispatch runs whatever the issue's state.
   for (const labels of Object.values(STATES)) assert.equal(githubRuns({ event_name: "workflow_dispatch", event: {} }, labels), true);
+});
+
+test("GitHub: a workflow_dispatch with trigger=relay is re-checked as a relay, not a manual run", () => {
+  const dispatched = { event_name: "workflow_dispatch", event: {} };
+  const blocked = ["agent", "agent/blocked"];
+  assert.equal(githubRuns(dispatched, blocked, { trigger: "relay" }, [relayAnnouncement(1)]), true);
+  // Nothing on the thread announcing it: a hand-dispatched "relay" doesn't run.
+  assert.equal(githubRuns(dispatched, blocked, { trigger: "relay" }, []), false);
+  assert.equal(githubRuns(dispatched, ["agent", "agent/working"], { trigger: "relay" }, [relayAnnouncement(1)]), false);
+  assert.equal(githubRuns(dispatched, blocked, { trigger: "manual" }, []), true);
 });
 
 // ---- GitLab: bin/dispatch-gitlab.ts on saved payloads ----
@@ -337,5 +392,9 @@ test("GitLab: adding `agent` starts the initial run; state-label edits don't; a 
     const { out } = await dispatch(api, undefined, { ISSUE: "7" });
     assert.match(out, /agent-issue-7:/);
     assert.match(out, /AGENT_TRIGGER: "manual"/);
+    // The publish stage's auto-relay: a pipeline with ISSUE and AGENT_TRIGGER=relay.
+    const relayed = await dispatch(api, undefined, { ISSUE: "7", AGENT_TRIGGER: "relay" });
+    assert.match(relayed.out, /agent-issue-7:/);
+    assert.match(relayed.out, /AGENT_TRIGGER: "relay"/);
   });
 });

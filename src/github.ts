@@ -14,6 +14,9 @@ export function nextLink(link: string | null): string | undefined {
   return undefined;
 }
 
+// The workflow a relay dispatches (see dispatchRelay); its `trigger` input becomes AGENT_TRIGGER.
+export const AGENT_WORKFLOW = "agent.yml";
+
 export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string }): Tracker {
   const apiUrl = o.apiUrl ?? "https://api.github.com";
   const issue = `/issues/${o.issue}`;
@@ -143,6 +146,16 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
       if (Array.isArray(open) && open.length) return { url: open[0].html_url, created: false };
       const pr = await gh("/pulls", { method: "POST", body: JSON.stringify({ title, head: branch, base, body }) });
       return { url: pr.html_url, created: true };
+    },
+
+    // workflow_dispatch is one of the few events GITHUB_TOKEN may start a workflow with. Answers 204.
+    async dispatchRelay() {
+      const r = await gh("");
+      const path = `/actions/workflows/${AGENT_WORKFLOW}/dispatches`;
+      await request(`${apiUrl}/repos/${o.repo}${path}`, {
+        method: "POST",
+        body: JSON.stringify({ ref: r.default_branch, inputs: { issue: String(o.issue), trigger: "relay" } }),
+      }, path);
     },
   };
 }

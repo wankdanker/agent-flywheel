@@ -71,6 +71,22 @@ test("GitLab agent-stages.yml: the agent job's container gets no forge token; pr
   assert.doesNotMatch(shared, /--env-file|--env /);
 });
 
+test("both platforms hand the caps to the stage that enforces them: MAX_BUDGET_USD to agent, MAX_CHAINED_RUNS to prepare and publish", () => {
+  const gh = blocks(readFileSync("./.github/workflows/agent.yml", "utf8").split(/^jobs:\n/m)[1]!, 2);
+  const gl = blocks(readFileSync("./.gitlab/agent-stages.yml", "utf8"), 0);
+  for (const [name, vars] of [["prepare", ["MAX_CHAINED_RUNS"]], ["agent", ["MAX_BUDGET_USD"]], ["publish", ["MAX_CHAINED_RUNS"]]] as const) {
+    for (const v of vars) {
+      assert.match(gh.get(name)!, new RegExp(`-e ${v}\\b`), `agent.yml ${name} doesn't pass ${v}`);
+      assert.match(gl.get(`agent-${name}`)!, new RegExp(`-e ${v}\\b`), `agent-stages.yml agent-${name} doesn't pass ${v}`);
+    }
+  }
+  // Only publish (forge token only) relays, so only it gets actions: write to dispatch agent.yml.
+  assert.match(gh.get("publish")!, /actions: write/);
+  for (const name of ["prepare", "agent"]) assert.doesNotMatch(gh.get(name)!, /actions: write/, name);
+  // GitLab runs the relay's api-sourced pipeline only when it says it's a relay.
+  assert.match(readFileSync("./.gitlab/ci/agent.yml", "utf8"), /\$CI_PIPELINE_SOURCE == "api" && \$ISSUE && \$AGENT_TRIGGER == "relay"/);
+});
+
 test("GitHub chain workflows: the PR-code ones get no secret; the one holding the forge token runs from the default branch", () => {
   for (const f of ["chain-test", "chain-merged"]) {
     const text = readFileSync(`./.github/workflows/${f}.yml`, "utf8");

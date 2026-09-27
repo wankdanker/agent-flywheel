@@ -30,7 +30,7 @@ export class HandoffError extends Error {
 }
 
 export type Prepared = { version: number; platform: Tracker["platform"]; ticket: Ticket; repo: Repo };
-export type HandedOutcome = { version: number; issue: number; recorded: AgentOutcome | null; maxTurnsHit: boolean };
+export type HandedOutcome = { version: number; issue: number; recorded: AgentOutcome | null; maxTurnsHit: boolean; budgetHit?: boolean };
 
 // Well under GitHub's 65,536-character comment limit, even with a checkpoint's two fields
 // and our own wording around them.
@@ -56,6 +56,7 @@ const HandedOutcomeSchema = z.strictObject({
   issue: z.number().int().positive(),
   recorded: AgentOutcomeSchema.nullable(),
   maxTurnsHit: z.boolean(),
+  budgetHit: z.boolean().optional(),
 });
 
 // The prepare job wrote this, and only the (unprivileged) agent job reads it, so a sanity check

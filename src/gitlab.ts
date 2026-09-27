@@ -135,6 +135,19 @@ export function gitlabTracker(o: Project & { issue: number }): Tracker {
       });
       return { url: mr.web_url, created: true };
     },
+
+    // A pipeline on the default branch with ISSUE and AGENT_TRIGGER=relay set, which
+    // .gitlab/ci/agent.yml's rules hand to bin/dispatch-gitlab.ts like a manual run.
+    async dispatchRelay() {
+      const p = await gl("");
+      await gl("/pipeline", {
+        method: "POST",
+        body: JSON.stringify({
+          ref: p.default_branch,
+          variables: [{ key: "ISSUE", value: String(o.issue) }, { key: "AGENT_TRIGGER", value: "relay" }],
+        }),
+      });
+    },
   };
 }
 
