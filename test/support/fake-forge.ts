@@ -15,11 +15,15 @@ export type Person = { name: string; trust: Trust };
 // `app: true` is a comment from some other bot account (on GitHub, a different `type: "Bot"`
 // user, e.g. another installed GitHub App), posted as `author` with the body as given.
 export type SeedComment = { author: string; trust?: Trust; bot?: boolean; app?: boolean; text: string; at: string };
+// `authorType: "Bot"` is an issue opened by a bot account (a GitHub App installation token, or
+// GITHUB_TOKEN): GitHub reports it with `type: "Bot"` and author_association NONE whatever
+// `trust` says, so it's ours only if `author` is the worker's own bot (BOT.github).
 export type Seed = {
   number: number;
   title: string;
   body: string;
   author: string;
+  authorType?: "User" | "Bot";
   trust: Trust;
   labels: string[];
   comments?: SeedComment[];
@@ -30,6 +34,8 @@ export type Seed = {
 export type Recorded = { method: string; url: string; headers: Record<string, string>; body?: unknown };
 export type Review = { branch: string; base: string; title: string; body: string; url: string };
 export type Relay = { ref: string; issue: string; trigger: string };
+// An issue our tracker opened (GitHub createSubIssue), authored by the token's bot account.
+export type Created = { number: number; title: string; body: string; labels: string[]; subIssueOf?: number; blockedBy?: number };
 type Stored = { author: Person & { bot?: boolean; app?: boolean }; body: string; at: string; system?: boolean };
 type Failure = { method: string; path: RegExp; status: number; body: string; times: number; skip: number };
 
@@ -48,6 +54,8 @@ export class FakeForge {
   comments: Stored[];
   reviews: Review[] = [];
   relays: Relay[] = [];
+  created: Created[] = [];
+  branches = new Map<string, string>();
   requests: Recorded[] = [];
   private failures: Failure[] = [];
   private clock = 0;
@@ -71,6 +79,14 @@ export class FakeForge {
     return this.platform === "github"
       ? githubTracker({ token: this.token, repo: REPO, issue: this.seed.number })
       : gitlabTracker({ token: this.token, apiUrl: GITLAB_API, project: REPO, issue: this.seed.number });
+  }
+
+  // A sub-issue this forge saw us open, as the seed of the forge its own run talks to: authored
+  // by our bot account, which GitHub reports as association NONE.
+  childSeed(number: number): Seed {
+    const c = this.created.find((x) => x.number === number);
+    if (!c) throw new Error(`fake forge: no issue #${number} was created`);
+    return { number, title: c.title, body: c.body, author: BOT[this.platform], authorType: "Bot", trust: "untrusted", labels: [...c.labels], defaultBranch: this.seed.defaultBranch };
   }
 
   // After letting `skip` through, the next `times` requests matching `method` and `path` (the
@@ -137,8 +153,8 @@ export class FakeForge {
       html_url: `https://github.com/${REPO}/issues/${n}`,
       title: this.seed.title,
       body: this.seed.body,
-      user: { login: this.seed.author, type: "User" },
-      author_association: association(this.seed.trust),
+      user: { login: this.seed.author, id: this.userId(this.seed.author), type: this.seed.authorType ?? "User" },
+      author_association: this.seed.authorType === "Bot" ? "NONE" : association(this.seed.trust),
       labels: this.labels.map((name) => ({ name })),
     });
     if (method === "POST" && p === "/graphql" && /viewer/.test(body?.query ?? "")) {
@@ -167,6 +183,42 @@ export class FakeForge {
     if (method === "POST" && p === `${base}/issues/${n}/comments`) {
       this.comments.push({ author: { name: BOT.github, trust: "trusted", bot: true }, body: body.body, at: this.now() });
       return json({ id: this.comments.length }, 201);
+    }
+    // Opening sub-issues (createSubIssue) and the integration branch (ensureBranch).
+    if (method === "POST" && p === `${base}/issues`) {
+      const c: Created = { number: n + 1 + this.created.length, title: body.title, body: body.body, labels: body.labels ?? [] };
+      this.created.push(c);
+      return json({ number: c.number, id: 1000 + c.number, html_url: `https://github.com/${REPO}/issues/${c.number}` }, 201);
+    }
+    const created = (k: string | undefined) => this.created.find((c) => c.number === Number(k));
+    const labelsOf = p.match(new RegExp(`^${esc(base)}/issues/(\\d+)/labels$`));
+    if (method === "POST" && labelsOf && created(labelsOf[1])) {
+      const c = created(labelsOf[1])!;
+      c.labels.push(...body.labels.filter((l: string) => !c.labels.includes(l)));
+      return json(c.labels.map((name) => ({ name })));
+    }
+    const other = p.match(new RegExp(`^${esc(base)}/issues/(\\d+)$`));
+    if (method === "GET" && other && created(other[1])) return json({ number: Number(other[1]), id: 1000 + Number(other[1]) });
+    const subIssues = p.match(new RegExp(`^${esc(base)}/issues/(\\d+)/sub_issues$`));
+    if (method === "POST" && subIssues) {
+      const c = this.created.find((x) => 1000 + x.number === body.sub_issue_id)!;
+      c.subIssueOf = Number(subIssues[1]);
+      return json({}, 201);
+    }
+    const blocked = p.match(new RegExp(`^${esc(base)}/issues/(\\d+)/dependencies/blocked_by$`));
+    if (method === "POST" && blocked && created(blocked[1])) {
+      created(blocked[1])!.blockedBy = body.issue_id - 1000;
+      return json({}, 201);
+    }
+    const ref = p.match(new RegExp(`^${esc(base)}/git/ref/heads/(.+)$`));
+    if (method === "GET" && ref) {
+      const branch = decodeURIComponent(ref[1]!);
+      const sha = branch === (this.seed.defaultBranch ?? "main") ? "0".repeat(40) : this.branches.get(branch);
+      return sha ? json({ object: { sha } }) : json({ message: "Not Found" }, 404);
+    }
+    if (method === "POST" && p === `${base}/git/refs`) {
+      this.branches.set(String(body.ref).replace(/^refs\/heads\//, ""), body.sha);
+      return json({}, 201);
     }
     if (method === "GET" && p === `${base}/pulls`) {
       const head = url.searchParams.get("head") ?? "";

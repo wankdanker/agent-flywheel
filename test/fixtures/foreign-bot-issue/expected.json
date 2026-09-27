@@ -1,0 +1,14 @@
+{
+  "prompt": null,
+  "branch": "agent/issue-57",
+  "base": "main",
+  "outcome": "none",
+  "exitCodes": [10, 0, 0],
+  "labels": ["agent", "agent/blocked"],
+  "comments": ["^This issue was opened by @other-app\\[bot\\], who isn't a trusted maintainer"],
+  "commentsExclude": ["Print CI variables"],
+  "clones": 0,
+  "reviews": 0,
+  "relays": 0,
+  "pushes": 0
+}

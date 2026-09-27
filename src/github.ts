@@ -1,6 +1,6 @@
 // Our thin GitHub REST client for one issue.
 import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type ChainForge, type Tracker } from "./tracker.ts";
-import { trustFromGithubAssociation } from "./trust.ts";
+import { trustFromGithubAssociation, type Trust } from "./trust.ts";
 
 // A runaway-loop guard, not a thread-size limit: 1000 pages of 100 is far past any real issue.
 const MAX_PAGES = 1000;
@@ -28,6 +28,13 @@ export const isWorker = (user: { id?: unknown; login?: unknown } | undefined, se
   return self.login !== undefined && typeof user.login === "string" && user.login.toLowerCase() === self.login.toLowerCase();
 };
 
+// An issue author's trust: a trusted association, or the worker's own identity. A sub-issue
+// the worker opened with a GitHub App installation token (or GITHUB_TOKEN) is authored by that
+// app's bot, whose association is NONE; it's still ours, and so is its chain header. Any other
+// bot, or any other NONE author, stays untrusted.
+export const githubAuthorTrust = (user: { id?: unknown; login?: unknown } | undefined, association: string | null | undefined, self: BotIdentity | undefined): Trust =>
+  trustFromGithubAssociation(association) === "trusted" || isWorker(user, self) ? "trusted" : "untrusted";
+
 // AGENT_BOT_ID (the numeric user id, preferred) and/or AGENT_BOT_LOGIN (e.g. `my-app[bot]`),
 // or undefined to discover it from the token. Throws on a malformed id.
 export function botIdentityFromEnv(env: Record<string, string | undefined>): BotIdentity | undefined {
@@ -43,9 +50,38 @@ export function botIdentityFromEnv(env: Record<string, string | undefined>): Bot
 // next to its `/api/v3` REST root.
 export const graphqlUrl = (apiUrl: string) => (/\/api\/v3\/?$/.test(apiUrl) ? apiUrl.replace(/\/v3\/?$/, "/graphql") : `${apiUrl}/graphql`);
 
-// `self` pins the worker's identity (AGENT_BOT_ID / AGENT_BOT_LOGIN); without it, getTicket
-// asks GitHub who the token is (GraphQL `viewer`, which answers for PATs and for app
-// installation tokens such as GITHUB_TOKEN alike, unlike REST `/user`).
+// The worker's own identity, resolved at most once per call of this factory: `self` if pinned
+// (AGENT_BOT_ID / AGENT_BOT_LOGIN), else asked of GitHub (GraphQL `viewer`, which answers for
+// PATs and for app installation tokens such as GITHUB_TOKEN alike, unlike REST `/user`). If
+// GitHub won't say who we are, fail closed: nothing is recognized as ours by identity (a trusted
+// association still counts), so at worst our own comments and sub-issues read as untrusted,
+// never someone else's as ours. The one resolver both issue authors and comment authors use.
+export function workerIdentity(o: { token: string; apiUrl?: string; self?: BotIdentity }): () => Promise<BotIdentity | undefined> {
+  const apiUrl = o.apiUrl ?? "https://api.github.com";
+  let resolved: Promise<BotIdentity | undefined> | undefined;
+  return () => {
+    if (o.self && (o.self.id !== undefined || o.self.login)) return Promise.resolve(o.self);
+    resolved ??= (async () => {
+      try {
+        const res = await fetch(graphqlUrl(apiUrl), {
+          method: "POST",
+          headers: { Authorization: `Bearer ${o.token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
+          body: JSON.stringify({ query: "query { viewer { login databaseId } }" }),
+        });
+        if (!res.ok) throw new Error(`graphql viewer: ${res.status} ${await res.text()}`);
+        const viewer = (await res.json())?.data?.viewer;
+        if (typeof viewer?.login !== "string" || !viewer.login) throw new Error("no viewer in the response");
+        return { login: viewer.login, ...(Number.isSafeInteger(viewer.databaseId) ? { id: viewer.databaseId as number } : {}) };
+      } catch (err) {
+        console.error("[github] couldn't resolve the worker's own identity; nothing will count as ours by identity (set AGENT_BOT_ID to pin it):", err instanceof Error ? err.message : err);
+        return undefined;
+      }
+    })();
+    return resolved;
+  };
+}
+
+// `self` pins the worker's identity; see workerIdentity.
 export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string; self?: BotIdentity }): Tracker {
   const apiUrl = o.apiUrl ?? "https://api.github.com";
   const issue = `/issues/${o.issue}`;
@@ -104,25 +140,7 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
     return items;
   }
 
-  // Resolved once per tracker. If GitHub won't say who we are, fail closed: no comment is
-  // recognized as ours by identity (a trusted association still counts), so at worst our own
-  // history reads as untrusted, never someone else's as ours.
-  let self: Promise<BotIdentity | undefined> | undefined;
-  function workerIdentity() {
-    if (o.self && (o.self.id !== undefined || o.self.login)) return Promise.resolve(o.self);
-    self ??= (async () => {
-      try {
-        const res = await request(graphqlUrl(apiUrl), { method: "POST", body: JSON.stringify({ query: "query { viewer { login databaseId } }" }) }, "graphql viewer");
-        const viewer = (await res.json())?.data?.viewer;
-        if (typeof viewer?.login !== "string" || !viewer.login) throw new Error("no viewer in the response");
-        return { login: viewer.login, ...(Number.isSafeInteger(viewer.databaseId) ? { id: viewer.databaseId as number } : {}) };
-      } catch (err) {
-        console.error("[github] couldn't resolve the worker's own identity; no comment will count as ours by identity (set AGENT_BOT_ID to pin it):", err instanceof Error ? err.message : err);
-        return undefined;
-      }
-    })();
-    return self;
-  }
+  const identity = workerIdentity(o);
 
   return {
     platform: "github",
@@ -133,14 +151,14 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
     },
 
     async getTicket() {
-      const [i, comments, me] = await Promise.all([gh(issue), ghAll(`${issue}/comments?per_page=100`), workerIdentity()]);
+      const [i, comments, me] = await Promise.all([gh(issue), ghAll(`${issue}/comments?per_page=100`), identity()]);
       return {
         number: i.number,
         url: i.html_url,
         title: i.title,
         body: i.body ?? "",
         author: i.user.login,
-        trust: trustFromGithubAssociation(i.author_association),
+        trust: githubAuthorTrust(i.user, i.author_association, me),
         labels: i.labels.map((l: any) => l.name),
         comments: comments.map((c: any) =>
           toComment(c.user.login, c.body ?? "", c.created_at, trustFromGithubAssociation(c.author_association), isWorker(c.user, me)),
@@ -224,6 +242,7 @@ export function githubChain(o: { token: string; repo: string; apiUrl?: string; s
     if (!res.ok && !okStatus.includes(res.status)) throw new Error(`GitHub ${init.method ?? "GET"} ${path}: ${res.status} ${await res.text()}`);
     return res.status === 204 || !res.ok ? undefined : res.json();
   }
+  const identity = workerIdentity(o);
   return {
     tracker: (issue) => githubTracker({ ...o, issue }),
 
@@ -234,9 +253,10 @@ export function githubChain(o: { token: string; repo: string; apiUrl?: string; s
         issues.push(...batch);
         if (batch.length < 100) break;
       }
+      const me = await identity();
       return issues
         .filter((i) => !i.pull_request)
-        .map((i) => ({ number: i.number, url: i.html_url, body: i.body ?? "", trust: trustFromGithubAssociation(i.author_association) }));
+        .map((i) => ({ number: i.number, url: i.html_url, body: i.body ?? "", trust: githubAuthorTrust(i.user, i.author_association, me) }));
     },
 
     // Remove first, then add: adding `agent` fires the `labeled` event that starts the run.

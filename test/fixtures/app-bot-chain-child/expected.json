@@ -1,0 +1,15 @@
+{
+  "prompt": {
+    "includes": ["Add the v2 storage layer.", "agent/issue-56"],
+    "excludes": []
+  },
+  "branch": "agent/issue-57",
+  "base": "agent/issue-56",
+  "outcome": "ready_for_review",
+  "exitCodes": [0, 0, 0],
+  "labels": ["agent", "agent/review"],
+  "comments": ["Storage layer added\\."],
+  "reviews": 1,
+  "relays": 0,
+  "pushes": 1
+}
