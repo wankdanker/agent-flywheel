@@ -1,3 +1,4 @@
+// Platform-specific adapter behavior only; what both adapters must do alike is in tracker-contract.test.ts.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { gitlabChain, gitlabTracker } from "../src/gitlab.ts";
@@ -115,65 +116,6 @@ function issueResponse(iid: number) {
   });
 }
 
-test("gitlab getTicket: follows x-next-page across 250+ human notes, drops system notes, keeps order", async (t) => {
-  // 3 pages of 100 notes each, every 5th one a system note, plus an empty final page.
-  const all = Array.from({ length: 300 }, (_, k) => ({
-    system: k % 5 === 4,
-    author: { id: 10, username: "maintainer" },
-    body: `note ${k}`,
-    created_at: `t${String(k).padStart(3, "0")}`,
-  }));
-  const noteUrls: string[] = [];
-  let membershipCalls = 0;
-  t.mock.method(globalThis, "fetch", async (url: string) => {
-    if (url.includes("/issues/3/notes")) {
-      noteUrls.push(url);
-      const page = Number(new URL(url).searchParams.get("page"));
-      const next = page < 4 ? String(page + 1) : "";
-      return notesPage(all.slice((page - 1) * 100, page * 100), next);
-    }
-    if (url.endsWith("/issues/3")) return issueResponse(3);
-    if (url.includes("/members/all/")) {
-      membershipCalls++;
-      return jsonResponse({ access_level: 40 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  });
-
-  const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 });
-  const ticket = await tracker.getTicket();
-
-  assert.equal(noteUrls.length, 4, "three full pages and one empty final page");
-  for (const u of noteUrls) {
-    const q = new URL(u).searchParams;
-    assert.equal(q.get("sort"), "asc");
-    assert.equal(q.get("order_by"), "created_at");
-    assert.equal(q.getAll("page").length, 1, "page must not be duplicated");
-    assert.equal(q.getAll("per_page").length, 1);
-  }
-  const expected = all.filter((n) => !n.system).map((n) => n.body);
-  assert.equal(expected.length, 240);
-  assert.deepEqual(ticket.comments.map((c) => c.text), expected);
-  assert.equal(ticket.comments.at(-1)!.text, "note 298", "the newest human note must be present");
-  assert.equal(membershipCalls, 1, "membership stays cached per user across pages");
-});
-
-test("gitlab getTicket: a failing later page throws instead of returning a partial thread", async (t) => {
-  t.mock.method(globalThis, "fetch", async (url: string) => {
-    if (url.includes("/issues/3/notes")) {
-      const page = new URL(url).searchParams.get("page");
-      if (page === "1") return notesPage([{ system: false, author: { id: 10, username: "m" }, body: "a", created_at: "t1" }], "2");
-      return new Response("boom", { status: 502 });
-    }
-    if (url.endsWith("/issues/3")) return issueResponse(3);
-    if (url.includes("/members/all/")) return jsonResponse({ access_level: 40 });
-    throw new Error(`unexpected fetch ${url}`);
-  });
-
-  const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 });
-  await assert.rejects(tracker.getTicket(), /GitLab GET .*notes.*: 502 boom/);
-});
-
 test("gitlab getTicket: a notes response without pagination headers is an error, not page 1 of ?", async (t) => {
   t.mock.method(globalThis, "fetch", async (url: string) => {
     if (url.includes("/issues/3/notes")) return jsonResponse([]);
@@ -183,29 +125,6 @@ test("gitlab getTicket: a notes response without pagination headers is an error,
 
   const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 });
   await assert.rejects(tracker.getTicket(), /no x-next-page header/);
-});
-
-test("gitlab openReview: reuses the MR already open for the branch, otherwise opens one", async (t) => {
-  const posts: any[] = [];
-  let open: any[] = [];
-  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
-    if (url.includes("/merge_requests?")) {
-      assert.match(url, /state=opened&source_branch=agent%2Fissue-3$/);
-      return jsonResponse(open);
-    }
-    if (url.endsWith("/merge_requests") && init.method === "POST") {
-      posts.push(JSON.parse(String(init.body)));
-      open = [{ web_url: "https://gitlab.example/g/p/-/merge_requests/4" }];
-      return jsonResponse(open[0]);
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  });
-
-  const tracker = gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 });
-  const req = { branch: "agent/issue-3", base: "main", title: "Fix it", body: "Done.\n\nCloses #3" };
-  assert.deepEqual(await tracker.openReview(req), { url: "https://gitlab.example/g/p/-/merge_requests/4", created: true });
-  assert.deepEqual(await tracker.openReview(req), { url: "https://gitlab.example/g/p/-/merge_requests/4", created: false });
-  assert.deepEqual(posts, [{ source_branch: "agent/issue-3", target_branch: "main", title: "Fix it", description: "Done.\n\nCloses #3" }]);
 });
 
 test("gitlab ensureBranch: creates the branch from `from` only when it's missing", async (t) => {
@@ -239,21 +158,4 @@ test("gitlab chain: release is one label update, getReview maps the MR, merge pi
   assert.deepEqual(await chain.getReview(5), { number: 5, open: false, merged: true, head: "agent/issue-21", base: "agent/issue-12", sha: "aaa", sameRepo: true });
   await chain.mergeReview(5, "aaa");
   assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa" });
-});
-
-test("gitlab dispatchRelay: a default-branch pipeline with ISSUE and AGENT_TRIGGER=relay", async (t) => {
-  const posts: unknown[] = [];
-  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
-    if (url === "https://gitlab.example/api/v4/projects/g%2Fp") return jsonResponse({ default_branch: "trunk" });
-    if (url === "https://gitlab.example/api/v4/projects/g%2Fp/pipeline" && init.method === "POST") {
-      posts.push(JSON.parse(String(init.body)));
-      return jsonResponse({ id: 1 }, 201);
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  });
-  await gitlabTracker({ token: "x", apiUrl: "https://gitlab.example/api/v4", project: "g/p", issue: 3 }).dispatchRelay();
-  assert.deepEqual(posts, [{
-    ref: "trunk",
-    variables: [{ key: "ISSUE", value: "3" }, { key: "AGENT_TRIGGER", value: "relay" }],
-  }]);
 });

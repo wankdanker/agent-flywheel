@@ -1,7 +1,7 @@
+// Platform-specific adapter behavior only; what both adapters must do alike is in tracker-contract.test.ts.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { githubChain, githubTracker, nextLink } from "../src/github.ts";
-import { buildPrompt } from "../src/worker.ts";
 
 function jsonResponse(body: unknown, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
@@ -138,56 +138,6 @@ test("nextLink: picks rel=next out of a GitHub Link header", () => {
   assert.equal(nextLink(null), undefined);
 });
 
-test("github getTicket: follows Link rel=next across 250 comments in chronological order", async (t) => {
-  const all = Array.from({ length: 250 }, (_, k) => ({
-    user: { login: "maintainer", type: "User" },
-    author_association: "OWNER",
-    body: `comment ${k}`,
-    created_at: `t${String(k).padStart(3, "0")}`,
-  }));
-  const commentUrls: string[] = [];
-  t.mock.method(globalThis, "fetch", async (url: string) => {
-    if (url.includes("/issues/3/comments")) {
-      commentUrls.push(url);
-      const page = Number(new URL(url).searchParams.get("page") ?? "1");
-      const base = "https://api.github.com/repos/o/r/issues/3/comments?per_page=100";
-      // Page 3 still advertises a next page, which turns out empty.
-      const link = page <= 3 ? `<${base}&page=${page + 1}>; rel="next", <${base}&page=4>; rel="last"` : "";
-      return jsonResponse(all.slice((page - 1) * 100, page * 100), link ? { link } : {});
-    }
-    if (url.endsWith("/issues/3")) return issueResponse(3);
-    throw new Error(`unexpected fetch ${url}`);
-  });
-
-  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
-  const ticket = await tracker.getTicket();
-
-  assert.equal(commentUrls.length, 4, "three pages of comments plus an empty final page");
-  assert.equal(commentUrls[0], "https://api.github.com/repos/o/r/issues/3/comments?per_page=100");
-  assert.deepEqual(ticket.comments.map((c) => c.text), all.map((c) => c.body));
-  assert.equal(ticket.comments.at(-1)!.text, "comment 249", "the newest comment must be present");
-
-  const prompt = buildPrompt(ticket, { platform: tracker.platform, repo: { cloneUrl: "", webUrl: "", defaultBranch: "main" } });
-  assert.match(prompt, /comment 249\b/, "the triggering (newest) comment must reach the prompt");
-  assert.ok(prompt.indexOf("comment 0\n") < prompt.indexOf("comment 249"), "thread stays oldest-first");
-});
-
-test("github getTicket: a failing later page throws instead of returning a partial thread", async (t) => {
-  t.mock.method(globalThis, "fetch", async (url: string) => {
-    if (url.includes("/issues/3/comments")) {
-      if (url.includes("page=2")) return new Response("secondary rate limit", { status: 403 });
-      return jsonResponse([{ user: { login: "m", type: "User" }, author_association: "OWNER", body: "a", created_at: "t1" }], {
-        link: `<https://api.github.com/repos/o/r/issues/3/comments?per_page=100&page=2>; rel="next"`,
-      });
-    }
-    if (url.endsWith("/issues/3")) return issueResponse(3);
-    throw new Error(`unexpected fetch ${url}`);
-  });
-
-  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
-  await assert.rejects(tracker.getTicket(), /GitHub GET .*comments.*page 2.*: 403 secondary rate limit/);
-});
-
 test("github getTicket: refuses to send the token to a next link off the API host", async (t) => {
   const calls: string[] = [];
   t.mock.method(globalThis, "fetch", async (url: string) => {
@@ -200,29 +150,6 @@ test("github getTicket: refuses to send the token to a next link off the API hos
   const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
   await assert.rejects(tracker.getTicket(), /outside https:\/\/api\.github\.com/);
   assert.ok(!calls.some((u) => u.startsWith("https://evil.example")));
-});
-
-test("github openReview: reuses the PR already open for the branch, otherwise opens one", async (t) => {
-  const posts: any[] = [];
-  let open: any[] = [];
-  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
-    if (url.startsWith("https://api.github.com/repos/o/r/pulls?")) {
-      assert.match(url, /state=open&head=o%3Aagent%2Fissue-3$/);
-      return jsonResponse(open);
-    }
-    if (url === "https://api.github.com/repos/o/r/pulls" && init.method === "POST") {
-      posts.push(JSON.parse(String(init.body)));
-      open = [{ html_url: "https://github.com/o/r/pull/9" }];
-      return jsonResponse(open[0]);
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  });
-
-  const tracker = githubTracker({ token: "x", repo: "o/r", issue: 3 });
-  const req = { branch: "agent/issue-3", base: "main", title: "Fix it", body: "Done.\n\nCloses #3" };
-  assert.deepEqual(await tracker.openReview(req), { url: "https://github.com/o/r/pull/9", created: true });
-  assert.deepEqual(await tracker.openReview(req), { url: "https://github.com/o/r/pull/9", created: false });
-  assert.deepEqual(posts, [{ title: "Fix it", head: "agent/issue-3", base: "main", body: "Done.\n\nCloses #3" }]);
 });
 
 test("github ensureBranch: creates the branch from the base's tip only when it's missing", async (t) => {
@@ -275,21 +202,4 @@ test("github chain: listQueued skips PRs, release swaps queued for agent (remova
   assert.equal(await chain.findReview("agent/issue-21", "zzz"), undefined);
   await chain.mergeReview(5, "aaa");
   assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa", merge_method: "merge" });
-});
-
-test("github dispatchRelay: dispatches agent.yml on the default branch with trigger=relay", async (t) => {
-  const posts: { url: string; body: unknown }[] = [];
-  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
-    if (url === "https://api.github.com/repos/o/r") return jsonResponse({ default_branch: "trunk" });
-    if (url.endsWith("/actions/workflows/agent.yml/dispatches") && init.method === "POST") {
-      posts.push({ url, body: JSON.parse(String(init.body)) });
-      return new Response(null, { status: 204 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  });
-  await githubTracker({ token: "x", repo: "o/r", issue: 3 }).dispatchRelay();
-  assert.deepEqual(posts, [{
-    url: "https://api.github.com/repos/o/r/actions/workflows/agent.yml/dispatches",
-    body: { ref: "trunk", inputs: { issue: "3", trigger: "relay" } },
-  }]);
 });
