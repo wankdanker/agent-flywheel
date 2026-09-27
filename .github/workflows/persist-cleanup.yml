@@ -1,0 +1,40 @@
+# Deletes a closed issue's workspace image (and its .prev) from PERSISTENCE_BUCKET, when opt-in
+# workspace persistence is on (bin/persist.sh, README "Persistent workspace images"). Holds only
+# the bucket credential: no model key, no forge token beyond this workflow's read-only checkout.
+# A bucket lifecycle rule on issues/ is the backstop for anything this misses.
+name: persist-cleanup
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+
+# The agent workflow's per-issue group, so this never deletes an image a run still has mounted
+# or is uploading.
+concurrency:
+  group: agent-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  delete:
+    if: vars.PERSISTENCE_BUCKET != '' && contains(github.event.issue.labels.*.name, 'agent')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: bin/persist.sh
+          sparse-checkout-cone-mode: false
+      - name: Delete the workspace image
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          PERSISTENCE_BUCKET: ${{ vars.PERSISTENCE_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.PERSISTENCE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.PERSISTENCE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
+          PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
+        run: bash bin/persist.sh delete

@@ -38,7 +38,8 @@ The same repo works on GitHub (`.github/workflows/`) and GitLab (`.gitlab-ci.yml
   existing clone instead of starting over, but that cache isn't guaranteed to survive. On
   resume, a cached `agent/issue-<n>` that's ahead of the remote branch (or of the default
   branch, if there's none yet) keeps its unpushed commits; one that's behind or has diverged
-  is reset to it, and the prepare log says which.
+  is reset to it, and the prepare log says which. Opt-in, the work dir can instead live in
+  your own S3/GCS bucket as a per-issue disk image; see "Persistent workspace images".
 
 Only trusted people can start a run:
 - **Labels:** GitHub needs triage access and GitLab needs Reporter+.
@@ -397,6 +398,112 @@ Limits of this:
   grows past it (e.g. with installed dependencies) fails the artifact upload; raise the limit
   under *Settings → CI/CD → General pipelines*.
 
+## Persistent workspace images (opt-in)
+
+By default the work dir travels between jobs and runs through the CI cache (see "Credential
+separation"), which has size and eviction limits and loses file ownership. Set the
+`PERSISTENCE_BUCKET` variable (`s3://bucket[/prefix]` or `gs://bucket[/prefix]`) and each issue's
+work dir becomes one sparse ext4 image, `<bucket>/issues/issue-<n>.img.zst`, which every job
+loop-mounts around its `docker run` (`bin/persist.sh`). A run that fails partway, a model API
+error included, leaves the next run the identical tree, uncommitted edits and all. Unset (the
+default), nothing changes: the persistence steps are skipped, and no new tool or dependency is
+used.
+
+Each of the `prepare`, `agent` and `publish` jobs, on the runner host:
+1. **Restore:** downloads and decompresses the image and runs `e2fsck -p` on it, or on an
+   issue's first run creates a fresh one (`truncate` + `mkfs.ext4`, `PERSISTENCE_SIZE`, default
+   `5G`, owned by the runner user). Mounts it `loop,nosuid,nodev` on the work dir (`publish`,
+   which only reads the work dir, mounts it read-only). `nosuid,nodev` because the agent writes
+   that filesystem with permissions bypassed and the host mounts it again later.
+2. Runs its stage, with the container as the runner's own uid (`--user "$(id -u):$(id -g)"`), so
+   nothing needs a `chown`. `entrypoint.sh` gives that uid, which has no passwd entry in the
+   image, a writable `HOME` seeded from the image's `~/.claude`. With persistence off, the jobs
+   keep chowning the work dir to the image's user, as before.
+3. **Save,** even after a failure or cancel (`if: always()`; on GitLab, before `exit` plus an
+   `after_script` backstop), strictly in order: `sync`, `fstrim`, `umount`, and only then
+   `zstd -1 -T0` (trimmed free space compresses to almost nothing). It uploads to a temp key,
+   copies the current image to `issue-<n>.img.zst.prev`, and copies the temp key into place, so
+   the real key only ever holds a complete image. `publish` only unmounts.
+
+Safety:
+- **The bucket credential stays on the host.** Only the restore/save steps get it; no
+  `docker run` is ever handed it, and in particular never next to the model key.
+  `test/ci-config.test.ts` checks both CIs for it.
+- **A failed restore saves nothing.** If the existence check fails for any reason other than
+  "not found" (say a 403), `persist.sh` fails instead of starting a fresh image that would then
+  be uploaded over the real one, and the save after a failed restore is a no-op. A failed
+  `umount` fails the save rather than compressing a mounted filesystem.
+- **One run at a time.** All of this happens inside the per-issue concurrency group (GitHub)
+  or `resource_group` (GitLab), so two runs never mount or upload the same image. The publish
+  job only mounts the image when the agent job ran, so it can't read a stale `outcome.json`
+  from an earlier run whose image a failed prepare job didn't replace.
+- **Anyone who can write the bucket can hand the runner a filesystem to mount.** The host
+  kernel parses the image, so treat write access to the bucket like access to the runners.
+  Only the host (not the agent's container) ever writes the image file itself.
+
+### S3
+
+Set the variable `PERSISTENCE_BUCKET=s3://<bucket>[/<prefix>]` and, on GitHub, the secrets
+`PERSISTENCE_AWS_ACCESS_KEY_ID`/`PERSISTENCE_AWS_SECRET_ACCESS_KEY` and the variable
+`PERSISTENCE_AWS_REGION` (on GitLab: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_REGION` as masked CI/CD variables). For an S3-compatible store (MinIO, R2, …), also set
+`PERSISTENCE_S3_ENDPOINT` (GitLab: `AWS_ENDPOINT_URL`). It uses the `aws` CLI, which GitHub's
+hosted runners already have. The IAM user needs:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/issues/*" },
+    { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": { "StringLike": { "s3:prefix": "<prefix>/issues/*" } } }
+  ]
+}
+```
+
+`s3:ListBucket` matters: without it S3 answers a missing image with 403 instead of 404, and
+`persist.sh` refuses to treat a 403 as "first run".
+
+### GCS
+
+Set `PERSISTENCE_BUCKET=gs://<bucket>[/<prefix>]` and the secret `PERSISTENCE_GCS_KEY` to a
+service account key's JSON (`persist.sh` activates it in a throwaway gcloud config dir, removed
+when it exits). Grant that account `roles/storage.objectUser` on the bucket (get, create, delete
+and list objects). It uses the `gcloud` CLI on the runner; if your runner image doesn't have it,
+use GCS's S3-compatible API instead: an HMAC key for the service account as the AWS key pair,
+`PERSISTENCE_S3_ENDPOINT=https://storage.googleapis.com`, and an `s3://` bucket URL. That's also
+the way to use GCS on GitLab, whose jobs install the `aws` CLI but not `gcloud`.
+
+### GitLab
+
+Loop mounts need a privileged runner (which the dind these jobs use already requires) or a
+shell executor. The jobs install `e2fsprogs`, `util-linux`, `zstd` and `aws-cli` with `apk`
+when `PERSISTENCE_BUCKET` is set. A runner that can't loop-mount logs `PERSISTENCE_BUCKET is
+set, but this runner can't loop-mount …` and that job carries on with the native cache and
+artifacts as if persistence were off. The work dir still goes into each container as a tar and
+comes back with `docker cp`, as the containers run on dind; the image replaces only the cache
+and artifacts (and so the artifact size limit stops mattering).
+
+### Lifecycle, sizing and cost
+
+- **Closed issues:** on GitHub, `.github/workflows/persist-cleanup.yml` deletes a closed `agent`
+  issue's image and `.prev`, holding only the bucket credential. On GitLab, or as a backstop,
+  add a bucket lifecycle rule that expires objects under `<prefix>/issues/` some days after
+  their last write (every run rewrites an active issue's image, so only idle ones expire), which
+  also catches a `.tmp-*` key left by an upload that died between its steps.
+- **Rollback:** copy `issue-<n>.img.zst.prev` over `issue-<n>.img.zst`, or delete both to start
+  the issue from a fresh clone (its branch on the remote is still the durable state).
+- **Size:** `PERSISTENCE_SIZE` (default `5G`) only applies when an image is created. The image
+  is sparse, so the runner's disk only holds what's written. To grow an issue's image, delete it
+  or resize it by hand (`truncate -s 10G`, `e2fsck -f`, `resize2fs`).
+- **Cost:** storage is about the size of the used data, compressed, times two for `.prev`. Each
+  run downloads the image three times and uploads it twice, so a runner outside the bucket's
+  region pays that in egress; GitHub-hosted runners aren't in your cloud account, so expect
+  internet egress rates.
+- **Changing the runner user:** the image's root is owned by the uid that created it. If the
+  runner uid changes (e.g. moving to self-hosted runners), delete the images.
+
 ## Threat model
 
 The Trust model above answers *whose words the agent treats as instructions*. This
@@ -568,6 +675,8 @@ Optional settings:
 - **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MAX_BUDGET_USD`,
   `MAX_CHAINED_RUNS`, `MODEL_PROXY_MAX_REQUESTS`,
   `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
+- **Workspace persistence:** `PERSISTENCE_BUCKET` and its credentials; see "Persistent
+  workspace images". It also adds a second smoke test, as an arbitrary uid, to the image build.
 - **`AGENT_GH_TOKEN` secret:** a PAT or GitHub App token. The built-in `GITHUB_TOKEN` can't
   change `.github/workflows/`, and PRs it opens don't start CI. Merging still builds the image,
   because the merge is yours.
@@ -585,7 +694,8 @@ that way if you edit the workflow; `test/ci-config.test.ts` checks it.
    - `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`.
    - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MAX_BUDGET_USD`,
      `MAX_CHAINED_RUNS`, `MODEL_PROXY_MAX_REQUESTS`,
-     `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
+     `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`, and for workspace
+     persistence `PERSISTENCE_BUCKET` with its credentials (see "Persistent workspace images").
 4. *Settings → CI/CD → Pipeline trigger tokens*: create a token.
 5. *Settings → Webhooks*: add
    `https://<host>/api/v4/projects/<id>/trigger/pipeline?token=<trigger token>&ref=<default branch>`,

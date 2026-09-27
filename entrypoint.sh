@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Run as an arbitrary uid (`docker run --user "$(id -u):$(id -g)"`, which CI does with workspace
+# persistence, see bin/persist.sh), there's no passwd entry, so HOME is `/`, which that uid can't
+# write. Claude Code needs a writable ~/.claude, so start a fresh HOME from the image's own one
+# (our CLAUDE.md house rules).
+if [ ! -w "${HOME:-/}" ]; then
+  HOME="$(mktemp -d)"
+  export HOME
+  cp -R /home/node/.claude "$HOME/.claude"
+fi
+
 # No global git credential is set up here on purpose: the same process that later runs the
 # model's bash tool calls (bypassPermissions) would be able to read a token embedded in
 # git config just as easily as from an env var. run-ticket.ts clones the repo itself, before
