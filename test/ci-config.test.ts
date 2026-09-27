@@ -4,7 +4,7 @@
 // deps; they only need to find each job's block and the variable names in it.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { MODEL_CREDENTIAL_VARS } from "../src/stages.ts";
 import { FORGE_TOKEN_VARS } from "../src/model-proxy.ts";
 
@@ -115,4 +115,14 @@ test("GitLab chain-stages.yml: the MR's code runs in a container handed no varia
   }
   assert.match(jobs.get("chain-merge")!, /MERGE_SHA="\$MR_SHA" node bin\/advance-chain\.ts/);
   assert.doesNotMatch(jobs.get("chain-advance")!, /MERGE_SHA/);
+});
+
+test("no CI pipeline runs the live model eval (npm run eval:live is manual, and refuses in PR/MR pipelines)", () => {
+  const files = [
+    ...readdirSync("./.github/workflows").map((f) => `./.github/workflows/${f}`),
+    "./.gitlab-ci.yml",
+    ...readdirSync("./.gitlab", { recursive: true, encoding: "utf8" }).filter((f) => f.endsWith(".yml")).map((f) => `./.gitlab/${f}`),
+  ];
+  assert.ok(files.length > 5);
+  for (const f of files) assert.doesNotMatch(readFileSync(f, "utf8"), /eval:live|eval-live|src\/eval/, f);
 });

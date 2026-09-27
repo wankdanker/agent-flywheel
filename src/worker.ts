@@ -45,7 +45,12 @@ export type Outcome = { kind: "blocked" | "ready_for_review" | "split" | "failed
 // out of MAX_BUDGET_USD (`budgetHit`) with something committed. `error` is a crash (already
 // scrubbed for the issue thread, see run.ts's sanitizeError) that ended it before the agent
 // recorded anything.
-export type SessionEnd = { maxTurnsHit: boolean; budgetHit?: boolean; error?: string };
+export type SessionEnd = { maxTurnsHit: boolean; budgetHit?: boolean; error?: string; stats?: SessionStats };
+
+// What the SDK's result message says the session used: for the log, and for `npm run eval:live`'s
+// report (src/eval.ts). `models` is per model id, subagents and compaction included.
+export type ModelStats = { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUsd: number };
+export type SessionStats = { turns: number; costUsd: number; durationMs: number; models: Record<string, ModelStats> };
 
 export const branchFor = (t: Ticket) => `agent/issue-${t.number}`;
 
@@ -550,6 +555,13 @@ export async function drain(messages: AsyncIterable<SDKMessage>, gauge: TurnGaug
         if (b.type === "tool_use") console.log(`[tool] ${b.name} ${JSON.stringify(b.input).slice(0, 200)}`);
       }
     }
-    if (msg.type === "result") console.log(`[result] ${msg.subtype} turns=${msg.num_turns} cost=$${msg.total_cost_usd.toFixed(2)}`);
+    if (msg.type === "result") {
+      console.log(`[result] ${msg.subtype} turns=${msg.num_turns} cost=$${msg.total_cost_usd.toFixed(2)}`);
+      const models = Object.fromEntries(Object.entries(msg.modelUsage ?? {}).map(([id, u]) => [id, {
+        inputTokens: u.inputTokens, outputTokens: u.outputTokens, cacheReadInputTokens: u.cacheReadInputTokens,
+        cacheCreationInputTokens: u.cacheCreationInputTokens, costUsd: u.costUSD,
+      }]));
+      end.stats = { turns: msg.num_turns, costUsd: msg.total_cost_usd, durationMs: msg.duration_ms ?? 0, models };
+    }
   }
 }
