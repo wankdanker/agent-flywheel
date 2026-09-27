@@ -166,6 +166,16 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
 
   Keep `bin/dispatch-gitlab.ts`, `bin/advance-chain.ts` and what they import (`src/tracker.ts`,
   `src/trust.ts`, `src/dispatch.ts`, `src/chain.ts`, `src/github.ts`, `src/gitlab.ts`) free of npm dependencies.
+- `bin/persist.sh` (bash, no npm deps) is opt-in workspace persistence (README's "Persistent
+  workspace images"): with `PERSISTENCE_BUCKET` set, each of the three jobs `restore`s the issue's
+  ext4 image from S3/GCS and loop-mounts it (`nosuid,nodev`; `publish` read-only) on the work dir
+  instead of using the cache, and `save`s it (`sync`, `fstrim`, `umount`, `zstd`, temp key, `.prev`)
+  after, `if: always()`. It runs on the host, fetched from the pinned image with `docker create`/`cp`;
+  the bucket credential is only in those steps' env, never `-e`'d to a container. With it on, the
+  containers run as the runner uid (`--user`, no `chown`; `entrypoint.sh` gives that uid a `HOME`).
+  Unset, every persistence step is skipped. `test/persist.test.ts` drives the script with fakes on
+  `PATH`; `test/ci-config.test.ts` checks the wiring. `.github/workflows/persist-cleanup.yml`
+  deletes a closed issue's image.
 - `.gitlab-ci.yml` only declares stages and includes `.gitlab/ci/*.yml`. Put new GitLab jobs in their own file there.
 - `labels.json` at the repo root is the platform-neutral source of truth for issue labels (name,
   color, description). `bin/sync-labels.ts` applies it via each platform's REST API: the `labels`
