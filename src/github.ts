@@ -17,7 +17,36 @@ export function nextLink(link: string | null): string | undefined {
 // The workflow a relay dispatches (see dispatchRelay); its `trigger` input becomes AGENT_TRIGGER.
 export const AGENT_WORKFLOW = "agent.yml";
 
-export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string }): Tracker {
+// The account our own comments are posted as. `id` is GitHub's immutable numeric user id and
+// wins when known; `login` alone is only a fallback, since a login can be renamed.
+export type BotIdentity = { id?: number; login?: string };
+
+// Does this comment's `user` object belong to the worker's own identity? Never true without one.
+export const isWorker = (user: { id?: unknown; login?: unknown } | undefined, self: BotIdentity | undefined): boolean => {
+  if (!user || !self) return false;
+  if (self.id !== undefined) return user.id === self.id;
+  return self.login !== undefined && typeof user.login === "string" && user.login.toLowerCase() === self.login.toLowerCase();
+};
+
+// AGENT_BOT_ID (the numeric user id, preferred) and/or AGENT_BOT_LOGIN (e.g. `my-app[bot]`),
+// or undefined to discover it from the token. Throws on a malformed id.
+export function botIdentityFromEnv(env: Record<string, string | undefined>): BotIdentity | undefined {
+  const rawId = env.AGENT_BOT_ID?.trim(), login = env.AGENT_BOT_LOGIN?.trim();
+  if (rawId && !(/^\d+$/.test(rawId) && Number.isSafeInteger(Number(rawId)) && Number(rawId) > 0)) {
+    throw new Error(`AGENT_BOT_ID must be a GitHub user id (a positive integer), got ${JSON.stringify(env.AGENT_BOT_ID)}`);
+  }
+  if (!rawId && !login) return undefined;
+  return { ...(rawId ? { id: Number(rawId) } : {}), ...(login ? { login } : {}) };
+}
+
+// GitHub.com serves GraphQL at `<api>/graphql`; GitHub Enterprise Server at `/api/graphql`
+// next to its `/api/v3` REST root.
+export const graphqlUrl = (apiUrl: string) => (/\/api\/v3\/?$/.test(apiUrl) ? apiUrl.replace(/\/v3\/?$/, "/graphql") : `${apiUrl}/graphql`);
+
+// `self` pins the worker's identity (AGENT_BOT_ID / AGENT_BOT_LOGIN); without it, getTicket
+// asks GitHub who the token is (GraphQL `viewer`, which answers for PATs and for app
+// installation tokens such as GITHUB_TOKEN alike, unlike REST `/user`).
+export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string; self?: BotIdentity }): Tracker {
   const apiUrl = o.apiUrl ?? "https://api.github.com";
   const issue = `/issues/${o.issue}`;
 
@@ -75,6 +104,26 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
     return items;
   }
 
+  // Resolved once per tracker. If GitHub won't say who we are, fail closed: no comment is
+  // recognized as ours by identity (a trusted association still counts), so at worst our own
+  // history reads as untrusted, never someone else's as ours.
+  let self: Promise<BotIdentity | undefined> | undefined;
+  function workerIdentity() {
+    if (o.self && (o.self.id !== undefined || o.self.login)) return Promise.resolve(o.self);
+    self ??= (async () => {
+      try {
+        const res = await request(graphqlUrl(apiUrl), { method: "POST", body: JSON.stringify({ query: "query { viewer { login databaseId } }" }) }, "graphql viewer");
+        const viewer = (await res.json())?.data?.viewer;
+        if (typeof viewer?.login !== "string" || !viewer.login) throw new Error("no viewer in the response");
+        return { login: viewer.login, ...(Number.isSafeInteger(viewer.databaseId) ? { id: viewer.databaseId as number } : {}) };
+      } catch (err) {
+        console.error("[github] couldn't resolve the worker's own identity; no comment will count as ours by identity (set AGENT_BOT_ID to pin it):", err instanceof Error ? err.message : err);
+        return undefined;
+      }
+    })();
+    return self;
+  }
+
   return {
     platform: "github",
 
@@ -84,7 +133,7 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
     },
 
     async getTicket() {
-      const [i, comments] = await Promise.all([gh(issue), ghAll(`${issue}/comments?per_page=100`)]);
+      const [i, comments, me] = await Promise.all([gh(issue), ghAll(`${issue}/comments?per_page=100`), workerIdentity()]);
       return {
         number: i.number,
         url: i.html_url,
@@ -94,7 +143,7 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
         trust: trustFromGithubAssociation(i.author_association),
         labels: i.labels.map((l: any) => l.name),
         comments: comments.map((c: any) =>
-          toComment(c.user.login, c.body ?? "", c.created_at, trustFromGithubAssociation(c.author_association), c.user?.type === "Bot"),
+          toComment(c.user.login, c.body ?? "", c.created_at, trustFromGithubAssociation(c.author_association), isWorker(c.user, me)),
         ),
       };
     },
@@ -160,7 +209,7 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
   };
 }
 
-export function githubChain(o: { token: string; repo: string; apiUrl?: string }): ChainForge {
+export function githubChain(o: { token: string; repo: string; apiUrl?: string; self?: BotIdentity }): ChainForge {
   const apiUrl = o.apiUrl ?? "https://api.github.com";
   async function gh(path: string, init: RequestInit = {}, okStatus: number[] = []) {
     const res = await fetch(`${apiUrl}/repos/${o.repo}${path}`, {

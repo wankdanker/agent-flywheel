@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { RESUME_HINT, REVIEW_HINT } from "../src/dispatch.ts";
 import { PublishRejected } from "../src/publish.ts";
-import { EXIT_SKIPPED, MAX_CHAINED_RUNS_LIMIT, MAX_TURNS_LIMIT, main, parseMaxBudgetUsd, parseMaxChainedRuns, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
+import { ConfigError, detectTracker, EXIT_SKIPPED, MAX_CHAINED_RUNS_LIMIT, MAX_TURNS_LIMIT, main, parseMaxBudgetUsd, parseMaxChainedRuns, parseMaxTurns, sanitizeError, type RunDeps } from "../src/run.ts";
 import type { Comment, Ticket, TicketState, Tracker } from "../src/tracker.ts";
 import { applyOutcome, type AgentOutcome, type Outcome, type SessionEnd, type WorkerConfig } from "../src/worker.ts";
 
@@ -431,4 +431,10 @@ test("sanitizeError scrubs secret env values, token shapes, auth headers and URL
   assert.doesNotMatch(s, /abcdefghijklmnop|AbC123xyz|0123456789abcdef|hunter2|s3cr3tvalue|second line/);
   assert.match(s, /^Error: boom/);
   assert.ok(sanitizeError(new Error("x".repeat(5000))).length < 400);
+});
+
+test("detectTracker: a malformed AGENT_BOT_ID is a config error, not a silently unpinned identity", () => {
+  const env = { AGENT_PLATFORM: "github", ISSUE: "1", GH_TOKEN: "x", GITHUB_REPOSITORY: "o/r" };
+  assert.equal(detectTracker({ ...env, AGENT_BOT_ID: "41898282" }).platform, "github");
+  assert.throws(() => detectTracker({ ...env, AGENT_BOT_ID: "github-actions[bot]" }), (e) => e instanceof ConfigError && /AGENT_BOT_ID/.test(e.message));
 });
