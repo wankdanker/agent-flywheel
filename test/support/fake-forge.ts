@@ -12,7 +12,9 @@ import type { Trust } from "../../src/trust.ts";
 export type Platform = Tracker["platform"];
 export type Person = { name: string; trust: Trust };
 // `bot: true` is a comment our own tracker posted earlier (badge + marker, from the bot account).
-export type SeedComment = { author: string; trust?: Trust; bot?: boolean; text: string; at: string };
+// `app: true` is a comment from some other bot account (on GitHub, a different `type: "Bot"`
+// user, e.g. another installed GitHub App), posted as `author` with the body as given.
+export type SeedComment = { author: string; trust?: Trust; bot?: boolean; app?: boolean; text: string; at: string };
 export type Seed = {
   number: number;
   title: string;
@@ -28,11 +30,13 @@ export type Seed = {
 export type Recorded = { method: string; url: string; headers: Record<string, string>; body?: unknown };
 export type Review = { branch: string; base: string; title: string; body: string; url: string };
 export type Relay = { ref: string; issue: string; trigger: string };
-type Stored = { author: Person & { bot?: boolean }; body: string; at: string; system?: boolean };
+type Stored = { author: Person & { bot?: boolean; app?: boolean }; body: string; at: string; system?: boolean };
 type Failure = { method: string; path: RegExp; status: number; body: string; times: number; skip: number };
 
 export const TOKEN = { github: "ghs_contractTOKEN0123456789", gitlab: "glpat-contractTOKEN0123456789" };
 export const BOT = { github: "github-actions[bot]", gitlab: "project_1_bot" };
+// github-actions[bot]'s real user id, which GraphQL `viewer` reports for a GITHUB_TOKEN.
+export const GITHUB_BOT_ID = 41898282;
 export const REPO = "acme/widgets";
 export const GITHUB_API = "https://api.github.com";
 export const GITLAB_API = "https://gitlab.example/api/v4";
@@ -57,7 +61,7 @@ export class FakeForge {
     this.token = TOKEN[platform];
     this.labels = [...seed.labels];
     this.comments = (seed.comments ?? []).map((c) => ({
-      author: c.bot ? { name: BOT[platform], trust: "trusted", bot: true } : { name: c.author, trust: c.trust ?? "untrusted" },
+      author: c.bot ? { name: BOT[platform], trust: "trusted", bot: true } : { name: c.author, trust: c.trust ?? "untrusted", app: c.app },
       body: c.bot ? withMarker(c.text) : c.text,
       at: c.at,
     }));
@@ -103,9 +107,11 @@ export class FakeForge {
     return this.platform === "github" ? this.github(method, url, body) : this.gitlab(method, url, body);
   };
 
-  // GitLab identifies authors by id: the bot is 1, everyone else gets the next one on first sight.
+  // Authors are identified by id: the bot is 1 (GitLab) or GITHUB_BOT_ID, everyone else gets
+  // the next one on first sight.
   private userId(name: string) {
     if (name === BOT.gitlab) return 1;
+    if (name === BOT.github) return GITHUB_BOT_ID;
     if (!this.userIds.has(name)) this.userIds.set(name, 100 + this.userIds.size);
     return this.userIds.get(name)!;
   }
@@ -135,6 +141,9 @@ export class FakeForge {
       author_association: association(this.seed.trust),
       labels: this.labels.map((name) => ({ name })),
     });
+    if (method === "POST" && p === "/graphql" && /viewer/.test(body?.query ?? "")) {
+      return json({ data: { viewer: { login: BOT.github, databaseId: GITHUB_BOT_ID } } });
+    }
     if (method === "GET" && p === base) {
       return json({ clone_url: CLONE_URL.github, html_url: `https://github.com/${REPO}`, default_branch: this.seed.defaultBranch ?? "main" });
     }
@@ -147,9 +156,10 @@ export class FakeForge {
       const { items, next } = this.page(this.comments, url);
       const link: Record<string, string> = next ? { link: `<${GITHUB_API}${p}?per_page=${url.searchParams.get("per_page") ?? 20}&page=${next}>; rel="next"` } : {};
       return json(items.map((c) => ({
-        user: { login: c.author.name, type: c.author.bot ? "Bot" : "User" },
-        // A GitHub App / Actions bot posts with association NONE; `type: "Bot"` is what marks it.
-        author_association: c.author.bot ? "NONE" : association(c.author.trust),
+        user: { login: c.author.name, id: this.userId(c.author.name), type: c.author.bot || c.author.app ? "Bot" : "User" },
+        // A GitHub App / Actions bot posts with association NONE; only its user id tells ours
+        // apart from any other app's.
+        author_association: c.author.bot || c.author.app ? "NONE" : association(c.author.trust),
         body: c.body,
         created_at: c.at,
       })), 200, link);

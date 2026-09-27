@@ -86,11 +86,13 @@ export const withMarker = (text: string) => `${BOT_BADGE}\n\n${text}\n\n${BOT_MA
 // `trust` is the poster's own trust (association / project membership), independent of
 // what the comment body claims. The marker text alone is never enough to call a comment
 // ours: anyone can paste it into a comment body, so `fromBot` only fires when the poster
-// is also independently trusted-ish (our bot posts through a trusted token, or, on GitHub,
-// the platform's own `Bot` account type — see isBotAccount in github.ts). A comment that
-// fools this check is, by definition, from a poster we already trust or recognize as us.
-export const toComment = (author: string, body: string, at: string, trust: Trust, isBotAccount = false): Comment => {
-  const fromBot = (trust === "trusted" || isBotAccount) && body.includes(BOT_MARKER);
+// is also independently trusted (our bot posts through a trusted token) or is `isSelf`: the
+// exact account our own forge token authenticates as (on GitHub, the worker's resolved bot
+// identity — see workerIdentity in github.ts; never "any account of type Bot", which any
+// other installed app also is). A comment that fools this check is, by definition, from a
+// poster we already trust or from us.
+export const toComment = (author: string, body: string, at: string, trust: Trust, isSelf = false): Comment => {
+  const fromBot = (trust === "trusted" || isSelf) && body.includes(BOT_MARKER);
   return {
     author,
     trust: fromBot ? "trusted" : trust,

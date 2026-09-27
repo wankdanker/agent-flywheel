@@ -16,10 +16,16 @@ test("toComment does not let an untrusted user spoof bot history by pasting the 
   assert.equal(c.trust, "untrusted");
 });
 
-test("toComment recognizes a GitHub Bot-type account as bot history even without trusted association", () => {
+test("toComment recognizes the worker's own identity as bot history even without trusted association", () => {
   const c = toComment("github-actions[bot]", withMarker("status update"), "2026-01-01T00:00:00Z", "untrusted", true);
   assert.equal(c.fromBot, true);
   assert.equal(c.trust, "trusted");
+});
+
+test("toComment: the worker's own identity still needs the marker", () => {
+  const c = toComment("github-actions[bot]", "unmarked", "2026-01-01T00:00:00Z", "untrusted", true);
+  assert.equal(c.fromBot, false);
+  assert.equal(c.trust, "untrusted");
 });
 
 test("toComment leaves an untrusted plain comment untrusted", () => {

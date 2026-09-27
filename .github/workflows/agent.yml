@@ -175,6 +175,9 @@ jobs:
           AGENT_TRIGGER: ${{ github.event_name == 'workflow_dispatch' && (inputs.trigger == 'relay' && 'relay' || 'manual') || github.event_name == 'issues' && 'label' || 'comment' }}
           AGENT_COMMENT: ${{ github.event.comment.body }}
           MAX_CHAINED_RUNS: ${{ vars.MAX_CHAINED_RUNS }}
+          # Optional: pin the worker's own bot identity (README's "Worker bot identity").
+          AGENT_BOT_ID: ${{ vars.AGENT_BOT_ID }}
+          AGENT_BOT_LOGIN: ${{ vars.AGENT_BOT_LOGIN }}
         run: |
           # docker run rather than `container:`: same as a local run. The one bind mount (the
           # work dir) needs its owner matched to the image's user at run time (never
@@ -190,7 +193,7 @@ jobs:
           fi
           set +e
           docker run --rm "${as[@]}" -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e AGENT_TRIGGER -e AGENT_COMMENT -e MAX_CHAINED_RUNS \
-            -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
+            -e AGENT_BOT_ID -e AGENT_BOT_LOGIN -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
             -v "$PWD/agent-work:/work" \
             "$IMAGE" --stage prepare
           code=$?
@@ -367,6 +370,8 @@ jobs:
           GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
           MAX_TURNS: ${{ vars.MAX_TURNS }}
           MAX_CHAINED_RUNS: ${{ vars.MAX_CHAINED_RUNS }}
+          AGENT_BOT_ID: ${{ vars.AGENT_BOT_ID }}
+          AGENT_BOT_LOGIN: ${{ vars.AGENT_BOT_LOGIN }}
         run: |
           docker pull "$IMAGE"
           mkdir -p agent-work
@@ -379,7 +384,7 @@ jobs:
           fi
           set +e
           docker run --rm "${as[@]}" -e AGENT_PLATFORM=github -e ISSUE -e GH_TOKEN -e MAX_TURNS -e MAX_CHAINED_RUNS \
-            -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
+            -e AGENT_BOT_ID -e AGENT_BOT_LOGIN -e GITHUB_REPOSITORY -e GITHUB_SERVER_URL -e GITHUB_API_URL \
             -v "$PWD/agent-work:/work" \
             "$IMAGE" --stage publish
           code=$?

@@ -56,6 +56,8 @@ jobs:
         env:
           AGENT_PLATFORM: github
           GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          AGENT_BOT_ID: ${{ vars.AGENT_BOT_ID }}
+          AGENT_BOT_LOGIN: ${{ vars.AGENT_BOT_LOGIN }}
           REVIEW: ${{ inputs.review }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}

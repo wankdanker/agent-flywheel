@@ -9,7 +9,7 @@ import { isAllowedRepo, parseAllowlist } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
 import { DEFAULT_MAX_CHAINED_RUNS, recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
-import { githubTracker } from "./github.ts";
+import { botIdentityFromEnv, githubTracker } from "./github.ts";
 import { gitlabTracker } from "./gitlab.ts";
 import { resetHandoff } from "./handoff.ts";
 import { gitPublisher } from "./publish.ts";
@@ -140,7 +140,13 @@ export function detectTracker(env: NodeJS.ProcessEnv): Tracker {
   const platform = env.AGENT_PLATFORM || (env.GITLAB_CI ? "gitlab" : env.GITHUB_ACTIONS ? "github" : "");
   const issue = Number(req(env, "ISSUE"));
   if (platform === "github") {
-    return githubTracker({ token: req(env, "GH_TOKEN"), repo: req(env, "GITHUB_REPOSITORY"), issue, apiUrl: env.GITHUB_API_URL });
+    let self;
+    try {
+      self = botIdentityFromEnv(env);
+    } catch (err) {
+      throw new ConfigError((err as Error).message);
+    }
+    return githubTracker({ token: req(env, "GH_TOKEN"), repo: req(env, "GITHUB_REPOSITORY"), issue, apiUrl: env.GITHUB_API_URL, self });
   }
   if (platform === "gitlab") {
     return gitlabTracker({

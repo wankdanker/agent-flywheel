@@ -8,7 +8,7 @@
 // CI_PROJECT_ID on GitLab. Never the model credential. Runs on stock node with no npm install,
 // so it (and what it imports) stays dependency-free.
 import { advanceChain } from "../src/chain.ts";
-import { githubChain } from "../src/github.ts";
+import { botIdentityFromEnv, githubChain } from "../src/github.ts";
 import { gitlabChain } from "../src/gitlab.ts";
 import { need } from "../src/tracker.ts";
 
@@ -16,7 +16,7 @@ const env = process.env;
 const platform = env.AGENT_PLATFORM || (env.GITLAB_CI ? "gitlab" : env.GITHUB_ACTIONS ? "github" : "");
 const forge =
   platform === "github"
-    ? githubChain({ token: need("GH_TOKEN"), repo: need("GITHUB_REPOSITORY"), apiUrl: env.GITHUB_API_URL || undefined })
+    ? githubChain({ token: need("GH_TOKEN"), repo: need("GITHUB_REPOSITORY"), apiUrl: env.GITHUB_API_URL || undefined, self: botIdentityFromEnv(env) })
     : platform === "gitlab"
       ? gitlabChain({ token: need("AGENT_GITLAB_TOKEN"), apiUrl: need("CI_API_V4_URL"), project: need("CI_PROJECT_ID") })
       : (console.error("can't tell the platform; set AGENT_PLATFORM to github or gitlab"), process.exit(2));

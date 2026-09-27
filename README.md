@@ -234,8 +234,10 @@ actor** as instructions:
 - **GitLab:** the issue or note author is a project member with role Developer or higher.
 - **Our own comments** (the ones carrying the hidden `<!-- agent-flywheel -->` marker)
   count as trusted system history, but only when the poster is *also* independently
-  trusted (or, on GitHub, the platform's own bot account type) — pasting that marker
-  into a comment doesn't make it ours.
+  trusted, or (on GitHub) is the exact account the worker's own token posts as — see
+  "Worker bot identity" below. Pasting that marker into a comment doesn't make it ours,
+  and neither does being *some* bot: any other installed GitHub App is a `Bot`-type
+  account too.
 
 This is the same Developer+/OWNER-MEMBER-COLLABORATOR floor the trigger rules above
 already use, kept in one place (`src/trust.ts`) so "who can start a run" and "whose words
@@ -266,6 +268,33 @@ What this means per issue:
   With no trusted directive on file, the run sets `agent/blocked` and comments explaining
   that a maintainer needs to approve or restate the task; a later trusted comment resumes
   it.
+
+### Worker bot identity
+
+The marker is public, so on GitHub it only proves a comment's *format*; its *sender* has to
+be the worker itself. A comment from `github-actions[bot]` or a GitHub App posts with
+association `NONE`, so it's recognized as ours only when both hold:
+
+- it carries the marker, and
+- its author is the worker's own identity, compared by GitHub's immutable numeric user id
+  (by login only when no id is known).
+
+That identity is, in order:
+
+1. **Configured:** the `AGENT_BOT_ID` repository variable (the numeric user id, preferred)
+   and/or `AGENT_BOT_LOGIN` (e.g. `my-app[bot]`). A bot's id is in
+   `https://api.github.com/users/<login>` (for `GITHUB_TOKEN`, `github-actions[bot]` is
+   `41898282`). A malformed `AGENT_BOT_ID` fails config validation (exit 2).
+2. **Discovered:** otherwise the tracker asks GitHub who `GH_TOKEN` is, once per run, with
+   the GraphQL `viewer { login databaseId }` query, which answers for a PAT, a GitHub App
+   installation token, and `GITHUB_TOKEN` alike.
+3. **Unknown:** if that fails, no comment counts as ours by identity (it's logged). Marked
+   comments from a trusted association (a PAT owned by a maintainer) still count; a bot's
+   don't, so at worst our own history is dropped from the prompt and a pending auto-relay is
+   skipped — never another account's comment read as ours. Set `AGENT_BOT_ID` to fix it.
+
+Never by the `[bot]` login suffix or the `Bot` account type alone. GitLab has no such case: our
+comments there count only from a Developer+ member, like everyone else's.
 
 **Limitations.** This is a first cut at an input boundary, not a full sandbox:
 - Trust is checked at fetch time, live against the platform API, not persisted from when
@@ -674,7 +703,8 @@ To try an image change before merging, run a single issue on the branch's image:
 Optional settings:
 - **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MAX_BUDGET_USD`,
   `MAX_CHAINED_RUNS`, `MODEL_PROXY_MAX_REQUESTS`,
-  `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
+  `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`, `AGENT_BOT_ID`,
+  `AGENT_BOT_LOGIN` (see "Worker bot identity").
 - **Workspace persistence:** `PERSISTENCE_BUCKET` and its credentials; see "Persistent
   workspace images". It also adds a second smoke test, as an arbitrary uid, to the image build.
 - **`AGENT_GH_TOKEN` secret:** a PAT or GitHub App token. The built-in `GITHUB_TOKEN` can't
