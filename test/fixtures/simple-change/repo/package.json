@@ -1,0 +1,8 @@
+{
+  "name": "widgets",
+  "version": "1.4.2",
+  "private": true,
+  "type": "module",
+  "bin": { "widgets": "cli.js" },
+  "scripts": { "test": "node --test" }
+}

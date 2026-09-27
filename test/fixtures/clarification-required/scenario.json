@@ -1,0 +1,26 @@
+{
+  "description": "The task is ambiguous; the agent asks one question and the issue waits on a human.",
+  "platform": "gitlab",
+  "mode": "stages",
+  "issue": {
+    "number": 21,
+    "title": "Make the export faster",
+    "body": "It's slow.",
+    "author": "maintainer",
+    "trust": "trusted",
+    "labels": [
+      "agent"
+    ],
+    "comments": []
+  },
+  "engine": {
+    "calls": [
+      {
+        "tool": "ask_question",
+        "input": {
+          "question": "Which export, CSV or PDF? And what time should it hit?"
+        }
+      }
+    ]
+  }
+}

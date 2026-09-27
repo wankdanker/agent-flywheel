@@ -1,0 +1,28 @@
+{
+  "prompt": {
+    "includes": [
+      "It's slow.",
+      "`gitlab-mr` skill",
+      "open the MR"
+    ],
+    "excludes": []
+  },
+  "branch": "agent/issue-21",
+  "base": "main",
+  "outcome": "blocked",
+  "exitCodes": [
+    0,
+    0,
+    10
+  ],
+  "labels": [
+    "agent",
+    "agent/blocked"
+  ],
+  "comments": [
+    "^Which export, CSV or PDF\\? And what time should it hit\\?"
+  ],
+  "reviews": 0,
+  "relays": 0,
+  "pushes": 0
+}

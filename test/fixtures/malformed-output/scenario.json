@@ -1,0 +1,31 @@
+{
+  "description": "The engine calls finish with a malformed summary; the call is rejected, nothing is recorded or committed, and the run ends incomplete.",
+  "platform": "github",
+  "mode": "main",
+  "commits": 0,
+  "issue": {
+    "number": 90,
+    "title": "Bump the Node version",
+    "body": "To 24.",
+    "author": "maintainer",
+    "trust": "trusted",
+    "labels": [
+      "agent"
+    ],
+    "comments": []
+  },
+  "engine": {
+    "calls": [
+      {
+        "tool": "finish",
+        "input": {
+          "summary": 42
+        }
+      },
+      {
+        "tool": "publish_everything",
+        "input": {}
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "prompt": {
+    "includes": [
+      "To 24."
+    ],
+    "excludes": []
+  },
+  "branch": "agent/issue-90",
+  "base": "main",
+  "outcome": "incomplete",
+  "exitCodes": [
+    1
+  ],
+  "labels": [
+    "agent",
+    "agent/blocked"
+  ],
+  "comments": [
+    "^I stopped before finishing\\. The next run continues from branch `agent/issue-90`"
+  ],
+  "reviews": 0,
+  "relays": 0,
+  "pushes": 1,
+  "toolErrors": [
+    "finish: invalid input",
+    "no such tool: publish_everything"
+  ]
+}

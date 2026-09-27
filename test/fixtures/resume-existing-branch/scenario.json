@@ -1,0 +1,43 @@
+{
+  "description": "A maintainer replies to a checkpointed issue; the run resumes the same branch with the whole trusted thread.",
+  "platform": "github",
+  "mode": "stages",
+  "env": {
+    "AGENT_TRIGGER": "comment"
+  },
+  "issue": {
+    "number": 30,
+    "title": "Replace the config parser",
+    "body": "Use the new TOML parser everywhere.",
+    "author": "maintainer",
+    "trust": "trusted",
+    "labels": [
+      "agent",
+      "agent/blocked"
+    ],
+    "comments": [
+      {
+        "author": "agent",
+        "bot": true,
+        "text": "I'm pausing at a checkpoint before running out of turns. My work so far is committed and published to branch `agent/issue-30`.\n\n**Done:**\nRewrote the config parser.\n\n**Next:**\nWire the new parser into the CLI flags.",
+        "at": "2026-09-20T10:00:00Z"
+      },
+      {
+        "author": "maintainer",
+        "trust": "trusted",
+        "text": "/agent continue\nKeep `--cfg` as an alias for `--config`.",
+        "at": "2026-09-21T09:00:00Z"
+      }
+    ]
+  },
+  "engine": {
+    "calls": [
+      {
+        "tool": "finish",
+        "input": {
+          "summary": "Parser wired into the CLI; `--cfg` kept as an alias."
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "prompt": {
+    "includes": [
+      "All of it."
+    ],
+    "excludes": []
+  },
+  "branch": "agent/issue-70",
+  "base": "main",
+  "outcome": "checkpoint",
+  "exitCodes": [
+    0,
+    0,
+    20
+  ],
+  "labels": [
+    "agent",
+    "agent/blocked"
+  ],
+  "comments": [
+    "^I hit this run's spend cap \\(`MAX_BUDGET_USD`\\)[\\s\\S]*published to branch `agent/issue-70`",
+    "^Continuing from branch `agent/issue-70` on my own: this is chained run 1 of at most 3"
+  ],
+  "reviews": 0,
+  "relays": 1,
+  "pushes": 1
+}

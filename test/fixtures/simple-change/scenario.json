@@ -1,0 +1,26 @@
+{
+  "description": "A trusted maintainer asks for a small change; the agent finishes and the PR opens.",
+  "platform": "github",
+  "mode": "main",
+  "issue": {
+    "number": 12,
+    "title": "Add a --version flag",
+    "body": "Print package.json's version and exit 0.",
+    "author": "maintainer",
+    "trust": "trusted",
+    "labels": [
+      "agent"
+    ],
+    "comments": []
+  },
+  "engine": {
+    "calls": [
+      {
+        "tool": "finish",
+        "input": {
+          "summary": "Added `--version`; `npm test` passes."
+        }
+      }
+    ]
+  }
+}

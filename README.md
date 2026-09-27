@@ -461,6 +461,68 @@ The *input*-trust boundary in Trust model above (`src/trust.ts`) still decides w
 the agent treats as instructions; the job split limits what a compromised agent, or the
 repository code it runs, can reach.
 
+## Testing
+
+### Locally
+
+    npm ci
+    npm run typecheck
+    npm test
+
+`npm test` is Node 24's built-in runner over `test/**/*.test.ts`, with no extra dependencies. It
+needs no network, Docker daemon, forge token or model key: the SDK, the forge and the model
+upstream are all faked. It does need `git` on `PATH`, because the clone and publisher tests run
+real git against local repos. Beyond the unit tests of each module, it has three shared layers
+that new work should extend rather than copy:
+
+- **Tracker contract** (`test/tracker-contract.test.ts`): one set of cases run against both
+  `githubTracker` and `gitlabTracker`, each talking to an in-memory forge
+  (`test/support/fake-forge.ts`) through a mocked `fetch`. The cases cover repo metadata, a
+  paginated thread, marked bot comments, state transitions that keep unrelated labels,
+  `openReview` reuse, `dispatchRelay`, and API errors that never carry the token. Behavior both
+  platforms must share goes here. Platform-only details go in `github.test.ts`/`gitlab.test.ts`.
+- **Scenario fixtures** (`test/fixtures/<name>/`, run by `test/fixtures.test.ts`): each is a
+  representative issue as data (`scenario.json`: platform, issue, thread, env, what the fake
+  model does) plus its expected result (`expected.json`: the trusted prompt input, branch,
+  outcome, exit codes, labels and comments). Each one runs end to end through the real
+  `main()` or the real prepare → agent → publish stages, over the fake forge, with a scripted
+  stand-in for the SDK's `query()` that calls the worker's real tool handlers. To add a scenario,
+  add a directory. `test/fixtures/README.md` documents the format.
+- **Lifecycle** (`test/lifecycle.test.ts`): forge failures while a run settles, and the retry
+  that follows, on both platforms and in both modes. It checks that the final labels are right,
+  that no comment is posted twice, and that a PR/MR opened once is reused.
+
+### In CI
+
+Both CIs run `npm run typecheck` and `npm test` before building the image: the `test` job in
+`.github/workflows/build.yml`, and `test` in `.gitlab/ci/test.yml`. The image job `needs` it, so
+a failing test publishes no image. A default-branch image also has to pass the smoke test
+(below) before it becomes `:latest`. No CI job has, or needs, a model key for the suite.
+
+### Live model evaluation (opt-in)
+
+    ANTHROPIC_API_KEY=... npm run eval:live
+
+This runs the fixtures that include a `repo/` directory (`simple-change`,
+`clarification-required` and `malicious-comment`) through the real SDK and the real model. It
+uses the same session path an issue run takes: the model proxy, `sandboxEnv`, the worker's
+tools, hooks and plugin. Each fixture runs in a throwaway local git repo with no remote. It never
+touches a tracker and never pushes. It spends real money, so:
+
+- it refuses to start without `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`;
+- it refuses in any pull/merge request pipeline (`GITHUB_EVENT_NAME=pull_request*`,
+  `CI_MERGE_REQUEST_IID`, `CI_PIPELINE_SOURCE=merge_request_event`);
+- no CI job runs it, and `test/ci-config.test.ts` checks that stays true;
+- each fixture is capped at `EVAL_MAX_TURNS` (default 25) and `EVAL_MAX_BUDGET_USD` (default 1).
+
+`EVAL_MODEL` (falling back to `CLAUDE_MODEL`) picks the model. `EVAL_FIXTURES=a,b` runs a subset.
+The JSON report goes to `EVAL_REPORT`, by default `eval-reports/eval-<time>.json`, which git
+ignores. It records the agent-flywheel commit, the SDK version, the provider, the model and the
+limits. For each fixture it records the expected and actual outcome, the duration, turns, cost,
+per-model token counts, requests through the proxy, commits and changed files. Compare two
+reports to see whether a change made the agent better or worse. The command exits 0 when every
+fixture reached its expected outcome, 1 when some didn't, and 2 on bad config.
+
 ## Image versions and rollback
 
 | Push to | Tags |

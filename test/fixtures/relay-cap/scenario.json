@@ -1,0 +1,74 @@
+{
+  "description": "The third chained run checkpoints again; MAX_CHAINED_RUNS is reached, so no fourth run starts and a maintainer is asked.",
+  "platform": "github",
+  "mode": "stages",
+  "env": {
+    "AGENT_TRIGGER": "relay"
+  },
+  "issue": {
+    "number": 80,
+    "title": "Migrate handlers to the new router",
+    "body": "Every handler under src/routes.",
+    "author": "maintainer",
+    "trust": "trusted",
+    "labels": [
+      "agent",
+      "agent/blocked"
+    ],
+    "comments": [
+      {
+        "author": "maintainer",
+        "trust": "trusted",
+        "text": "Please migrate every handler.",
+        "at": "2026-09-23T00:00:00Z"
+      },
+      {
+        "author": "agent",
+        "bot": true,
+        "text": "I'm pausing at a checkpoint before running out of turns. **Done:** batch 1.",
+        "at": "2026-09-24T00:00:00Z"
+      },
+      {
+        "author": "agent",
+        "bot": true,
+        "text": "Continuing from branch `agent/issue-80` on my own: this is chained run 1 of at most 3 (`MAX_CHAINED_RUNS`) before I stop for a maintainer. A comment from a maintainer resets the count.\n\n<!-- agent-flywheel:chain=1 -->",
+        "at": "2026-09-24T00:01:00Z"
+      },
+      {
+        "author": "agent",
+        "bot": true,
+        "text": "I'm pausing at a checkpoint before running out of turns. **Done:** batch 2.",
+        "at": "2026-09-25T00:00:00Z"
+      },
+      {
+        "author": "agent",
+        "bot": true,
+        "text": "Continuing from branch `agent/issue-80` on my own: this is chained run 2 of at most 3 (`MAX_CHAINED_RUNS`) before I stop for a maintainer. A comment from a maintainer resets the count.\n\n<!-- agent-flywheel:chain=2 -->",
+        "at": "2026-09-25T00:01:00Z"
+      },
+      {
+        "author": "agent",
+        "bot": true,
+        "text": "I'm pausing at a checkpoint before running out of turns. **Done:** batch 3.",
+        "at": "2026-09-26T00:00:00Z"
+      },
+      {
+        "author": "agent",
+        "bot": true,
+        "text": "Continuing from branch `agent/issue-80` on my own: this is chained run 3 of at most 3 (`MAX_CHAINED_RUNS`) before I stop for a maintainer. A comment from a maintainer resets the count.\n\n<!-- agent-flywheel:chain=3 -->",
+        "at": "2026-09-26T00:01:00Z"
+      }
+    ]
+  },
+  "engine": {
+    "calls": [
+      {
+        "tool": "checkpoint",
+        "input": {
+          "summary": "Batch 4 migrated.",
+          "next_steps": "Batch 5."
+        }
+      }
+    ]
+  }
+}

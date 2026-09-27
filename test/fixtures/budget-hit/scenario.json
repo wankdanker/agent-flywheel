@@ -1,0 +1,23 @@
+{
+  "description": "The run hits MAX_BUDGET_USD after committing; its work is published as a checkpoint and the next run is relayed.",
+  "platform": "gitlab",
+  "mode": "stages",
+  "commits": 2,
+  "env": {
+    "MAX_BUDGET_USD": "2.50"
+  },
+  "issue": {
+    "number": 70,
+    "title": "Port the test suite to node:test",
+    "body": "All of it.",
+    "author": "maintainer",
+    "trust": "trusted",
+    "labels": [
+      "agent"
+    ],
+    "comments": []
+  },
+  "engine": {
+    "result": "error_max_budget_usd"
+  }
+}

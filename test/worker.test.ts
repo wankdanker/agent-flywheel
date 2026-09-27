@@ -419,9 +419,12 @@ test("applyOutcome: no recorded outcome after a crash, with commits: publishes t
   assert.match(tracker.comments[0]!, /stopped by an error[\s\S]*> Error: 429 rate limited[\s\S]*committed work is on branch `agent\/issue-42`/);
 });
 
-test("drain: an error_max_budget_usd result marks the session budgetHit; error_max_turns marks maxTurnsHit", async () => {
+test("drain: an error_max_budget_usd result marks the session budgetHit; error_max_turns marks maxTurnsHit; usage is recorded", async () => {
   async function* results(subtype: string) {
-    yield { type: "result", subtype, num_turns: 3, total_cost_usd: 1.5 } as any;
+    yield {
+      type: "result", subtype, num_turns: 3, total_cost_usd: 1.5, duration_ms: 900,
+      modelUsage: { "claude-x": { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 30, cacheCreationInputTokens: 40, costUSD: 1.5, webSearchRequests: 0 } },
+    } as any;
   }
   for (const [subtype, want] of [
     ["error_max_budget_usd", { maxTurnsHit: false, budgetHit: true }],
@@ -436,6 +439,11 @@ test("drain: an error_max_budget_usd result marks the session budgetHit; error_m
     } finally {
       console.log = log;
     }
-    assert.deepEqual(end, want, subtype);
+    const { stats, ...flags } = end;
+    assert.deepEqual(flags, want, subtype);
+    assert.deepEqual(stats, {
+      turns: 3, costUsd: 1.5, durationMs: 900,
+      models: { "claude-x": { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 30, cacheCreationInputTokens: 40, costUsd: 1.5 } },
+    });
   }
 });

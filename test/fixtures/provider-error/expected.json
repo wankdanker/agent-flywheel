@@ -1,0 +1,27 @@
+{
+  "prompt": {
+    "includes": [
+      "Drop the duplicate timestamp."
+    ],
+    "excludes": []
+  },
+  "branch": "agent/issue-61",
+  "base": "main",
+  "outcome": "none",
+  "exitCodes": [
+    1
+  ],
+  "labels": [
+    "agent",
+    "agent/blocked"
+  ],
+  "comments": [
+    "^I hit an error and stopped[\\s\\S]*529[\\s\\S]*branch `agent/issue-61`"
+  ],
+  "reviews": 0,
+  "relays": 0,
+  "pushes": 1,
+  "commentsExclude": [
+    "sk-ant-api03-leakedkey"
+  ]
+}
