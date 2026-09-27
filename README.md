@@ -56,6 +56,7 @@ a run. On both platforms (`src/dispatch.ts` has the one policy):
 | `agent` label added (or the issue opened/reopened with it) | yes: the initial run |
 | trusted comment on an `agent/blocked` issue | yes: resumes |
 | trusted comment whose first nonblank line is `/agent continue` | yes, from any state |
+| our own auto-relay after a checkpoint (`AGENT_TRIGGER=relay`) | yes, up to `MAX_CHAINED_RUNS` in a row; see "Chained runs and spend caps" |
 | any other comment on an unstarted, `agent/working`, `agent/review` or `agent/queued` issue | no |
 | a comment from an untrusted user, or carrying our bot marker | no |
 | manual run (GitHub *Run workflow*, GitLab *Run pipeline* with `ISSUE`) | yes, whatever the state |
@@ -86,7 +87,7 @@ one issue from overlapping. `test/dispatch.test.ts` runs one fixture matrix of s
 commands and commenters through both gates.
 
 Exit codes are 0 ready for review, 10 blocked (asked a question or split into sub-issues),
-20 checkpoint (paused at the turn limit with its work published), 30 skipped (the trigger no
+20 checkpoint (paused at the turn or spend limit with its work published), 30 skipped (the trigger no
 longer applies), 1 incomplete or failed, 2 bad config. CI treats 10, 20 and 30 as success.
 
 ### Split issues
@@ -150,17 +151,50 @@ How that's enforced (`src/worker.ts`):
   outcome tools is denied, with instructions to commit and call `checkpoint`
   (what's done, what's next).
 - **Checkpoint outcome.** The publisher pushes the branch, then a checkpoint comments what's done and what's next, sets
-  `agent/blocked`, and exits 20. Reply on the issue to resume from the branch. If the SDK still
-  hits `MAX_TURNS` with nothing recorded, that's treated as an implicit checkpoint rather than a
-  crash.
+  `agent/blocked`, and exits 20. In CI the publish stage then relays it to a fresh run by itself,
+  up to `MAX_CHAINED_RUNS` times in a row (see "Chained runs and spend caps" below); past that, or
+  in a local run, reply on the issue to resume from the branch. If the SDK still hits `MAX_TURNS`
+  (or `MAX_BUDGET_USD`) with nothing recorded, that's treated as an implicit checkpoint rather
+  than a crash.
 - **Crash with commits.** If the session ends without an outcome for any other reason (a model
   API error, a killed agent job, or the agent just stopping), but the branch has commits over
   the default branch, the publisher still validates and pushes it. The issue gets a comment
   saying it stopped with its committed work on the branch, goes `agent/blocked`, and the run
   still exits 1 so CI shows the failure.
 
-Not yet: CI re-dispatching a run on exit 20 by itself (auto-relay). That waits on a cap on
-chained autonomous runs, so for now a human reply continues a checkpointed issue.
+### Chained runs and spend caps
+
+A self-hosting agent that restarts itself needs brakes, so nothing it starts on its own runs
+unbounded (`src/dispatch.ts`, `src/stages.ts`'s `relayCheckpoint`):
+
+- **Auto-relay.** After a checkpoint (exit 20) is published, the **publish** stage (forge token
+  only) starts the next run on the same issue: GitHub `workflow_dispatch`es `agent.yml` with
+  `trigger: relay` (so the publish job has `actions: write`); GitLab creates a default-branch
+  pipeline with `ISSUE` and `AGENT_TRIGGER=relay`, which `.gitlab/ci/agent.yml` hands to the
+  dispatcher like a manual run. Before dispatching it posts an announcement carrying a hidden
+  `<!-- agent-flywheel:chain=N -->`.
+- **Chained-run ceiling.** `MAX_CHAINED_RUNS` (default 3, at most 20, `0` turns relaying off)
+  caps relays in a row. The count is read from the thread, not stored: the newest chain marker in
+  our own marker-tagged comments (only honored where `toComment` already trusts the bot marker, so
+  pasting one does nothing), reset to 0 by any trusted human comment. When a checkpoint lands with
+  the count already at the cap, the issue stays `agent/blocked` with a comment asking a maintainer
+  to review the branch and comment `/agent continue`, and no 4th run starts.
+- **A relay can't be forged.** The prepare stage runs an `AGENT_TRIGGER=relay` run only if the
+  issue is `agent/blocked`, the newest trusted comment is a relay announcement, and its position
+  is within `MAX_CHAINED_RUNS`; otherwise it exits 30 without touching the issue. A hand-dispatched
+  "relay" with no announcement, or one a maintainer has since replied to (that reply starts its
+  own run), does nothing.
+- **Sub-issue chains** have their own, separate cap: a split releases at most `MAX_SUBTASKS` (4)
+  sub-issues, one at a time and only after the previous one's PR/MR passed its tests and merged,
+  and a sub-issue can't split again. Each sub-issue is its own issue with its own relay budget, so
+  a whole split runs at most 4 × (1 + `MAX_CHAINED_RUNS`) runs before a human has to step in, and
+  its final integration PR/MR always waits for human review.
+- **Per-run spend cap.** `MAX_BUDGET_USD` (a positive number of dollars, e.g. `5` or `2.50`) is
+  passed to the SDK as `maxBudgetUsd`. A session that hits it (`error_max_budget_usd`) settles as
+  a checkpoint if it committed anything (published, exit 20, and relayed like any checkpoint), or
+  blocked (exit 10) if not; never a crash or a stuck `agent/working`. Unset means no cap beyond
+  `MAX_TURNS`. An org-level spend limit surfacing as a model API error is a crash like any other
+  and also ends `agent/blocked` (see below).
 
 ### Stuck on `agent/working`
 
@@ -171,8 +205,9 @@ config). That comment only carries the error's first line, capped and with secre
 values (env secrets, tokens, auth headers, URL credentials) scrubbed; the full error is in the
 CI log. If even the label update fails, the log says so and what to fix by hand.
 
-Bad config (missing credential, `MAX_TURNS` that isn't an integer from 1 to 500, an unknown
-`AGENT_TRIGGER`, repo outside the allowlist) is caught before the issue is touched at all.
+Bad config (missing credential, `MAX_TURNS` that isn't an integer from 1 to 500, a
+`MAX_BUDGET_USD` that isn't a positive number, a `MAX_CHAINED_RUNS` that isn't an integer from 0
+to 20, an unknown `AGENT_TRIGGER`, repo outside the allowlist) is caught before the issue is touched at all.
 
 What a process can't do is clean up after being killed. In CI the publish job still runs after
 a failed or timed-out agent job, finds no `outcome.json`, publishes whatever the agent committed
@@ -468,7 +503,8 @@ To try an image change before merging, run a single issue on the branch's image:
 4. Open an issue and apply the `agent` label.
 
 Optional settings:
-- **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
+- **Variables:** `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MAX_BUDGET_USD`,
+  `MAX_CHAINED_RUNS`, `MODEL_PROXY_MAX_REQUESTS`,
   `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
 - **`AGENT_GH_TOKEN` secret:** a PAT or GitHub App token. The built-in `GITHUB_TOKEN` can't
   change `.github/workflows/`, and PRs it opens don't start CI. Merging still builds the image,
@@ -485,7 +521,8 @@ that way if you edit the workflow; `test/ci-config.test.ts` checks it.
 3. Add CI/CD variables, masked:
    - `AGENT_GITLAB_TOKEN`: the token from step 2.
    - `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`.
-   - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MODEL_PROXY_MAX_REQUESTS`,
+   - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MAX_BUDGET_USD`,
+     `MAX_CHAINED_RUNS`, `MODEL_PROXY_MAX_REQUESTS`,
      `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`.
 4. *Settings → CI/CD → Pipeline trigger tokens*: create a token.
 5. *Settings → Webhooks*: add
