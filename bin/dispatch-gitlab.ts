@@ -70,8 +70,11 @@ function chainEvent(p: any): { mr: number; sha: string; action: "test" | "advanc
 const payloadFile = process.env.TRIGGER_PAYLOAD;
 const payload = payloadFile && !process.env.ISSUE ? JSON.parse(readFileSync(payloadFile, "utf8")) : undefined;
 const chain = payload ? chainEvent(payload) : undefined;
+// ISSUE is a manual pipeline, or (AGENT_TRIGGER=relay) the publish stage's auto-relay, which the
+// prepare stage re-checks against the thread; a person setting it by hand only gets a stricter run.
+const relay = process.env.AGENT_TRIGGER === "relay";
 const decided = process.env.ISSUE
-  ? { iid: Number(process.env.ISSUE), trigger: "manual" as const, reason: "manual run" }
+  ? { iid: Number(process.env.ISSUE), trigger: relay ? ("relay" as const) : ("manual" as const), reason: relay ? "auto-relay after a checkpoint" : "manual run" }
   : payload && !chain ? await actionableIssue(payload) : undefined;
 const issue = decided && "iid" in decided ? decided : undefined;
 const iid = issue?.iid;

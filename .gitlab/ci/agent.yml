@@ -2,11 +2,14 @@
 #   trigger → a project webhook (issue + comment events) pointed at the pipeline trigger API;
 #             GitLab hands us the event as the TRIGGER_PAYLOAD file.
 #   web     → "Run pipeline" with ISSUE=<iid> (and optionally AGENT_IMAGE) to run one issue by hand.
+#   api     → the publish stage's auto-relay after a checkpoint (src/gitlab.ts dispatchRelay): a
+#             pipeline with ISSUE and AGENT_TRIGGER=relay, capped by MAX_CHAINED_RUNS.
 
 .agent-rules:
   rules:
     - if: $CI_PIPELINE_SOURCE == "trigger"
     - if: $CI_PIPELINE_SOURCE == "web" && $ISSUE
+    - if: $CI_PIPELINE_SOURCE == "api" && $ISSUE && $AGENT_TRIGGER == "relay"
 
 agent-dispatch:
   extends: .agent-rules

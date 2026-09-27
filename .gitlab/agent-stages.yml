@@ -54,7 +54,7 @@ agent-prepare:
   script:
     - echo "AGENT_IMAGE_PINNED=$(docker inspect --format '{{index .RepoDigests 0}}' "$AGENT_IMAGE" 2>/dev/null || echo "$AGENT_IMAGE")" > image.env
     - |
-      run_stage prepare -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e AGENT_TRIGGER \
+      run_stage prepare -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e AGENT_TRIGGER -e MAX_CHAINED_RUNS \
         -e CI_API_V4_URL -e CI_SERVER_HOST -e CI_PROJECT_ID -e CI_PROJECT_PATH
       copy_out prepare || [ "$code" != 0 ]
       exit "$code"
@@ -87,7 +87,7 @@ agent-agent:
     # No AGENT_GITLAB_TOKEN, no CI_JOB_TOKEN: the agent runs Bash with permissions bypassed.
     # `--stage agent` also refuses to start if a forge credential reaches it.
     - |
-      run_stage agent -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS \
+      run_stage agent -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS -e MAX_BUDGET_USD \
         -e MODEL_PROXY_MAX_REQUESTS -e MODEL_PROXY_MAX_LIFETIME_MS -e MODEL_PROXY_REQUEST_TIMEOUT_MS
       copy_out agent || [ "$code" != 0 ]
       exit "$code"
@@ -111,7 +111,8 @@ agent-publish:
     # The work dir (the agent's commits and its outcome.json) is only read as data: see
     # src/handoff.ts and src/publish.ts.
     - |
-      run_stage publish -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e MAX_TURNS \
+      run_stage publish -e AGENT_PLATFORM=gitlab -e AGENT_GITLAB_TOKEN -e AGENT_REPO_ALLOWLIST -e MAX_TURNS -e MAX_CHAINED_RUNS \
         -e CI_API_V4_URL -e CI_SERVER_HOST -e CI_PROJECT_ID -e CI_PROJECT_PATH
       exit "$code"
-  allow_failure: { exit_codes: [10, 20] }   # 10 = asked a question, 20 = checkpointed; not failures for us
+  # 10 = asked a question, 20 = checkpointed (and, below MAX_CHAINED_RUNS, relayed to a new pipeline); not failures for us
+  allow_failure: { exit_codes: [10, 20] }
