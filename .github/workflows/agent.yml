@@ -182,7 +182,7 @@ jobs:
           # the mounted image is owned by the runner user instead, so the container runs as that.
           mkdir -p agent-work
           if [ -n "$PERSISTENCE_BUCKET" ]; then
-            as=(--user "$(id -u):$(id -g)")
+            as=(--user "$(id -u):$(id -g)" --name "agent-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB")
           else
             uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
             sudo chown -R "$uid:$uid" agent-work
@@ -215,7 +215,10 @@ jobs:
           AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
           AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
           PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
-        run: '[ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work'
+        run: |
+          # A cancel can leave the stage's container running, holding the mount busy.
+          docker rm -f "agent-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >/dev/null 2>&1 || true
+          [ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work
 
   agent:
     needs: prepare
@@ -276,7 +279,7 @@ jobs:
         run: |
           docker pull "$IMAGE"
           if [ -n "$PERSISTENCE_BUCKET" ]; then
-            as=(--user "$(id -u):$(id -g)")
+            as=(--user "$(id -u):$(id -g)" --name "agent-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB")
           else
             uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
             sudo chown -R "$uid:$uid" agent-work
@@ -305,7 +308,10 @@ jobs:
           AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
           AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
           PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
-        run: '[ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work'
+        run: |
+          # A cancel can leave the stage's container running, holding the mount busy.
+          docker rm -f "agent-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >/dev/null 2>&1 || true
+          [ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work
 
   publish:
     needs: [prepare, agent]
@@ -365,7 +371,7 @@ jobs:
           docker pull "$IMAGE"
           mkdir -p agent-work
           if [ -n "$PERSISTENCE_BUCKET" ]; then
-            as=(--user "$(id -u):$(id -g)")
+            as=(--user "$(id -u):$(id -g)" --name "agent-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB")
           else
             uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
             sudo chown -R "$uid:$uid" agent-work
@@ -391,7 +397,10 @@ jobs:
           AWS_REGION: ${{ vars.PERSISTENCE_AWS_REGION }}
           AWS_ENDPOINT_URL: ${{ vars.PERSISTENCE_S3_ENDPOINT }}
           PERSISTENCE_GCS_KEY: ${{ secrets.PERSISTENCE_GCS_KEY }}
-        run: '[ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work'
+        run: |
+          # A cancel can leave the stage's container running, holding the mount busy.
+          docker rm -f "agent-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >/dev/null 2>&1 || true
+          [ ! -f "$RUNNER_TEMP/persist.sh" ] || bash "$RUNNER_TEMP/persist.sh" save agent-work
 
   # The stages already leave a terminal label on every failure they can catch. This covers
   # what they can't: a container killed by a job timeout or a cancel before it could clean up.

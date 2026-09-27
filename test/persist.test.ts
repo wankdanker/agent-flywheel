@@ -78,6 +78,7 @@ function fixture(fn: (f: { root: string; mnt: string; store: string; run: (args:
             PERSISTENCE_TMP: join(root, "tmp"),
             PERSISTENCE_SIZE: "64M",
             GITHUB_RUN_ID: "99",
+            PERSISTENCE_UMOUNT_TRIES: "1",
             ...env,
           },
         });

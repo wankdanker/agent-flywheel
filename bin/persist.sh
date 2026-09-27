@@ -20,8 +20,9 @@
 #
 # Env: PERSISTENCE_BUCKET (s3://bucket[/prefix] or gs://bucket[/prefix]; unset = do nothing),
 # ISSUE, PERSISTENCE_SIZE (default 5G), PERSISTENCE_TMP (where the image file lives; default
-# $RUNNER_TEMP, then $TMPDIR, then /tmp). S3 uses the aws CLI and its usual AWS_* env;
-# GCS uses gcloud, with PERSISTENCE_GCS_KEY (a service account key's JSON) if set.
+# $RUNNER_TEMP, then $TMPDIR, then /tmp), PERSISTENCE_UMOUNT_TRIES (default 5, 2s apart). S3
+# uses the aws CLI and its usual AWS_* env; GCS uses gcloud, with PERSISTENCE_GCS_KEY (a service
+# account key's JSON) if set.
 #
 # Exit codes: 0 ok (or persistence off), 1 error, 2 usage/config, 3 restore couldn't loop-mount
 # on this host (GitLab falls back to its native cache on 3; README "Set up on GitLab").
@@ -137,7 +138,12 @@ save() {
   if mountpoint -q "$mnt"; then
     sync
     [ "$mode" = ro ] || $SUDO fstrim "$mnt" || true
-    $SUDO umount "$mnt" || die "couldn't unmount $mnt; not uploading a mounted filesystem"
+    local tries=0
+    until $SUDO umount "$mnt"; do
+      tries=$((tries + 1))
+      [ "$tries" -lt "${PERSISTENCE_UMOUNT_TRIES:-5}" ] || die "couldn't unmount $mnt; not uploading a mounted filesystem"
+      sleep 2
+    done
   fi
   if [ "$mode" = ro ]; then
     rm -f "$img" "$state"

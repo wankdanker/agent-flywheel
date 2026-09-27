@@ -201,9 +201,12 @@ test("GitHub agent.yml: persistence off chowns agent-work to the image's user as
     assert.match(run, /^docker run --rm -e /, `${stage}: nothing added to the docker run when off`);
     assert.doesNotMatch(run, /--user/);
 
-    const on = runStageStep(jobs.get(stage)!, stage, { PERSISTENCE_BUCKET: "s3://bucket" });
+    const on = runStageStep(jobs.get(stage)!, stage, { PERSISTENCE_BUCKET: "s3://bucket", GITHUB_RUN_ID: "5", GITHUB_RUN_ATTEMPT: "1", GITHUB_JOB: stage });
     assert.ok(!on.some((l) => l.startsWith("sudo")), `${stage}: no sudo with persistence`);
-    assert.match(on.find((l) => l.includes("--stage"))!, new RegExp(`^docker run --rm --user ${me} -e `));
+    // Named, so the save step can stop a container a cancel left holding the mount.
+    assert.match(on.find((l) => l.includes("--stage"))!, new RegExp(`^docker run --rm --user ${me} --name agent-5-1-${stage} -e `));
+    const save = steps(jobs.get(stage)!).find((s) => /persist\.sh" save/.test(s))!;
+    assert.match(save, /docker rm -f "agent-\$GITHUB_RUN_ID-\$GITHUB_RUN_ATTEMPT-\$GITHUB_JOB"[^\n]*\n\s+\[ ! -f [^\n]*persist\.sh" save/);
   }
 });
 
