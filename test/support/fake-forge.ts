@@ -47,6 +47,7 @@ export class FakeForge {
   requests: Recorded[] = [];
   private failures: Failure[] = [];
   private clock = 0;
+  private userIds = new Map<string, number>();
   readonly platform: Platform;
   readonly seed: Seed;
 
@@ -101,6 +102,13 @@ export class FakeForge {
     }
     return this.platform === "github" ? this.github(method, url, body) : this.gitlab(method, url, body);
   };
+
+  // GitLab identifies authors by id: the bot is 1, everyone else gets the next one on first sight.
+  private userId(name: string) {
+    if (name === BOT.gitlab) return 1;
+    if (!this.userIds.has(name)) this.userIds.set(name, 100 + this.userIds.size);
+    return this.userIds.get(name)!;
+  }
 
   private now() {
     return `2026-09-27T12:${String(Math.floor(this.clock / 60) % 60).padStart(2, "0")}:${String(this.clock++ % 60).padStart(2, "0")}Z`;
@@ -171,7 +179,7 @@ export class FakeForge {
     const base = `/api/v4/projects/${encodeURIComponent(REPO)}`;
     const p = url.pathname;
     const n = this.seed.number;
-    const idOf = (name: string) => (name === BOT.gitlab ? 1 : 100 + [...name].reduce((a, ch) => a + ch.charCodeAt(0), 0));
+    const idOf = (name: string) => this.userId(name);
     const issue = () => ({
       iid: n,
       web_url: `https://gitlab.example/${REPO}/-/issues/${n}`,
