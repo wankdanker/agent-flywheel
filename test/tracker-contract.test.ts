@@ -130,6 +130,51 @@ for (const platform of PLATFORMS) {
     assert.deepEqual(forge.labels.sort(), ["agent", "agent/review"]);
   });
 
+  test(`[${platform}] setState(): labels someone else adds or removes between our calls survive every transition`, async (t) => {
+    const { forge, tracker } = setup(t, platform, { labels: ["agent", "priority::high", ...Array.from({ length: 40 }, (_, k) => `triage-${k}`)] });
+    // Before each request is served, a maintainer adds one label and removes another.
+    let k = 0;
+    forge.onRequest = () => {
+      forge.labels = [...forge.labels.filter((l) => l !== `triage-${k}`), `release-${k}`];
+      k++;
+    };
+    for (const state of ["working", "blocked", "working", "review"] as const) {
+      await tracker.setState(state);
+      assert.deepEqual(stateLabels(forge.labels), [STATE_LABELS[state]], state);
+    }
+    forge.onRequest = undefined;
+    assert.ok(k > 1, "the forge saw requests to interleave with");
+    for (let j = 0; j < k; j++) {
+      assert.ok(forge.labels.includes(`release-${j}`), `concurrently added release-${j} survives`);
+      assert.ok(!forge.labels.includes(`triage-${j}`), `concurrently removed triage-${j} stays removed`);
+    }
+    for (const l of ["agent", "priority::high", `triage-${k}`]) assert.ok(forge.labels.includes(l), `${l} survives`);
+  });
+
+  test(`[${platform}] setState(): a state label hand-added mid-transition is still cleared`, async (t) => {
+    const { forge, tracker } = setup(t, platform, { labels: ["agent", "agent/working"] });
+    let added = false;
+    forge.onRequest = () => {
+      if (!added) forge.labels.push("agent/queued", "agent/blocked");
+      added = true;
+    };
+    await tracker.setState("review");
+    assert.deepEqual(forge.labels.sort(), ["agent", "agent/review"]);
+  });
+
+  test(`[${platform}] setState(): retrying a transition, even after it failed partway, is idempotent`, async (t) => {
+    const { forge, tracker } = setup(t, platform, { labels: ["agent", "bug", "agent/working", "agent/blocked"] });
+    // GitHub: the add lands, then removing a stale state fails. GitLab's one PUT just fails.
+    if (platform === "github") forge.failNext("DELETE", /\/issues\/7\/labels\/agent%2Fworking$/, 502);
+    else forge.failNext("PUT", /\/issues\/7$/, 502);
+    await assert.rejects(tracker.setState("review"), /502/);
+    await tracker.setState("review");
+    const after = [...forge.labels].sort();
+    assert.deepEqual(after, ["agent", "agent/review", "bug"]);
+    await tracker.setState("review");
+    assert.deepEqual([...forge.labels].sort(), after);
+  });
+
   test(`[${platform}] openReview(): opens once, then reuses the open ${platform === "github" ? "PR" : "MR"} for the branch`, async (t) => {
     const { forge, tracker } = setup(t, platform);
     const req = { branch: "agent/issue-7", base: "main", title: "Add pagination", body: "Done.\n\nCloses #7" };
@@ -152,7 +197,7 @@ for (const platform of PLATFORMS) {
       ["GET", /\/(widgets|acme%2Fwidgets)$/, (tr) => tr.repo()],
       ["GET", /\/issues\/7$/, (tr) => tr.getTicket()],
       ["POST", /\/(comments|notes)$/, (tr) => tr.comment("hi")],
-      [platform === "github" ? "PATCH" : "PUT", /\/issues\/7$/, (tr) => tr.setState("blocked")],
+      [platform === "github" ? "POST" : "PUT", platform === "github" ? /\/issues\/7\/labels$/ : /\/issues\/7$/, (tr) => tr.setState("blocked")],
       ["POST", /\/(pulls|merge_requests)$/, (tr) => tr.openReview({ branch: "agent/issue-7", base: "main", title: "t", body: "b" })],
       ["POST", /\/(dispatches|pipeline)$/, (tr) => tr.dispatchRelay()],
     ];
