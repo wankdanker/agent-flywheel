@@ -529,12 +529,21 @@ async function splitRun(tracker: Tracker, origin?: string) {
   const { prepareStage, agentStage, publishStage } = await import("../src/stages.ts");
   const e = stageEnvs();
   const { deps, seen } = stageDeps(tracker, origin);
-  const { result: codes, logs } = await quietly(async () => [
-    await prepareStage({ ...deps, env: e.prepare }),
-    await agentStage({ ...deps, env: e.agent }),
-    await publishStage({ ...deps, env: e.publish }),
-  ]);
-  return { codes, logs, seen, e };
+  // The agent stage's leak check runs git in the work dir, or in the process cwd when there is
+  // none (the rejected case). Run from the scratch root, not this checkout, whose .git/config may
+  // hold a credential (actions/checkout's http.extraheader in CI) that it would rightly refuse.
+  const cwd = process.cwd();
+  process.chdir(e.root);
+  try {
+    const { result: codes, logs } = await quietly(async () => [
+      await prepareStage({ ...deps, env: e.prepare }),
+      await agentStage({ ...deps, env: e.agent }),
+      await publishStage({ ...deps, env: e.publish }),
+    ]);
+    return { codes, logs, seen, e };
+  } finally {
+    process.chdir(cwd);
+  }
 }
 
 async function combinedRun(tracker: Tracker, origin?: string) {
