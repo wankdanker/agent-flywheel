@@ -59,6 +59,9 @@ function fakeTracker(over: Partial<Ticket> = {}) {
     async dispatchRelay() {
       t.relays++;
     },
+    retarget(): Tracker {
+      throw new Error("no Target: header here");
+    },
   };
   return t satisfies Tracker;
 }

@@ -22,9 +22,11 @@ function projectApi(o: Project) {
   return { request, gl };
 }
 
-export function gitlabTracker(o: Project & { issue: number }): Tracker {
+// `code` is the project the code-host calls act on (see Tracker#retarget); the issue's own by default.
+export function gitlabTracker(o: Project & { issue: number; code?: string }): Tracker {
   const issue = `/issues/${o.issue}`;
   const { request, gl } = projectApi(o);
+  const codeApi = o.code === undefined ? { request, gl } : projectApi({ ...o, project: o.code });
 
   // Every page of a list endpoint, in the API's order, following `x-next-page` (blank on
   // the last page). `path` keeps its own query (sort, per_page); only `page` is added.
@@ -63,7 +65,7 @@ export function gitlabTracker(o: Project & { issue: number }): Tracker {
     platform: "gitlab",
 
     async repo() {
-      const p = await gl("");
+      const p = await codeApi.gl("");
       return { cloneUrl: p.http_url_to_repo, webUrl: p.web_url, defaultBranch: p.default_branch };
     },
 
@@ -119,17 +121,17 @@ export function gitlabTracker(o: Project & { issue: number }): Tracker {
     },
 
     async ensureBranch(branch, from) {
-      const res = await request(`/repository/branches/${encodeURIComponent(branch)}`, {}, [404]);
+      const res = await codeApi.request(`/repository/branches/${encodeURIComponent(branch)}`, {}, [404]);
       if (res.ok) return false;
-      await gl(`/repository/branches?branch=${encodeURIComponent(branch)}&ref=${encodeURIComponent(from)}`, { method: "POST" });
+      await codeApi.gl(`/repository/branches?branch=${encodeURIComponent(branch)}&ref=${encodeURIComponent(from)}`, { method: "POST" });
       return true;
     },
 
     // Pushing the branch already updated an open MR; only open one if there isn't one yet.
     async openReview({ branch, base, title, body }) {
-      const open = await gl(`/merge_requests?state=opened&source_branch=${encodeURIComponent(branch)}`);
+      const open = await codeApi.gl(`/merge_requests?state=opened&source_branch=${encodeURIComponent(branch)}`);
       if (Array.isArray(open) && open.length) return { url: open[0].web_url, created: false };
-      const mr = await gl("/merge_requests", {
+      const mr = await codeApi.gl("/merge_requests", {
         method: "POST",
         body: JSON.stringify({ source_branch: branch, target_branch: base, title, description: body }),
       });
@@ -148,6 +150,8 @@ export function gitlabTracker(o: Project & { issue: number }): Tracker {
         }),
       });
     },
+
+    retarget: (path) => gitlabTracker({ ...o, code: path }),
   };
 }
 

@@ -82,9 +82,11 @@ export function workerIdentity(o: { token: string; apiUrl?: string; self?: BotId
 }
 
 // `self` pins the worker's identity; see workerIdentity.
-export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string; self?: BotIdentity }): Tracker {
+// `code` is the repo the code-host calls act on (see Tracker#retarget); the issue's own by default.
+export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string; self?: BotIdentity; code?: string }): Tracker {
   const apiUrl = o.apiUrl ?? "https://api.github.com";
   const issue = `/issues/${o.issue}`;
+  const code = o.code ?? o.repo;
 
   async function request(url: string, init: RequestInit, label: string, okStatus: number[] = []) {
     const res = await fetch(url, {
@@ -100,13 +102,13 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
     return res;
   }
 
-  async function gh(path: string, init: RequestInit = {}) {
-    return (await request(`${apiUrl}/repos/${o.repo}${path}`, init, path)).json();
+  async function gh(path: string, init: RequestInit = {}, repo = o.repo) {
+    return (await request(`${apiUrl}/repos/${repo}${path}`, init, path)).json();
   }
 
   // Like gh(), but undefined for a 404 instead of throwing.
-  async function ghMaybe(path: string) {
-    const res = await fetch(`${apiUrl}/repos/${o.repo}${path}`, { headers: { Authorization: `Bearer ${o.token}`, Accept: "application/vnd.github+json" } });
+  async function ghMaybe(path: string, repo = o.repo) {
+    const res = await fetch(`${apiUrl}/repos/${repo}${path}`, { headers: { Authorization: `Bearer ${o.token}`, Accept: "application/vnd.github+json" } });
     if (res.status === 404) return undefined;
     if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status} ${await res.text()}`);
     return res.json();
@@ -146,7 +148,7 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
     platform: "github",
 
     async repo() {
-      const r = await gh("");
+      const r = await gh("", {}, code);
       return { cloneUrl: r.clone_url, webUrl: r.html_url, defaultBranch: r.default_branch };
     },
 
@@ -206,18 +208,18 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
     },
 
     async ensureBranch(branch, from) {
-      if (await ghMaybe(`/git/ref/heads/${branch}`)) return false;
-      const base = await gh(`/git/ref/heads/${from}`);
-      await gh("/git/refs", { method: "POST", body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: base.object.sha }) });
+      if (await ghMaybe(`/git/ref/heads/${branch}`, code)) return false;
+      const base = await gh(`/git/ref/heads/${from}`, {}, code);
+      await gh("/git/refs", { method: "POST", body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: base.object.sha }) }, code);
       return true;
     },
 
     // Pushing the branch already updated an open PR; only open one if there isn't one yet.
     async openReview({ branch, base, title, body }) {
-      const owner = o.repo.split("/")[0]!;
-      const open = await gh(`/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`);
+      const owner = code.split("/")[0]!;
+      const open = await gh(`/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`, {}, code);
       if (Array.isArray(open) && open.length) return { url: open[0].html_url, created: false };
-      const pr = await gh("/pulls", { method: "POST", body: JSON.stringify({ title, head: branch, base, body }) });
+      const pr = await gh("/pulls", { method: "POST", body: JSON.stringify({ title, head: branch, base, body }) }, code);
       return { url: pr.html_url, created: true };
     },
 
@@ -230,6 +232,8 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
         body: JSON.stringify({ ref: r.default_branch, inputs: { issue: String(o.issue), trigger: "relay" } }),
       }, path);
     },
+
+    retarget: (path) => githubTracker({ ...o, code: path }),
   };
 }
 

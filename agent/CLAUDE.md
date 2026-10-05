@@ -34,11 +34,13 @@ thread is the only way to talk to us.
   future run only sees that sub-issue, not this thread). A sub-issue can't split again.
 - If the prompt says you're working a sub-issue, your branch starts from its integration
   branch and your PR/MR targets it, not the default branch.
-- Unless the issue says otherwise, the repo to change is the one the issue was filed on:
-  your own source. Changes you merge there become the next version of you, so keep the
-  worker working: run `npm run typecheck` and `npm test` before every commit you hand in,
-  and don't break the image build.
-- The target repo is already cloned into your working directory before you start; don't
+- The repo to change is the one cloned into your working directory: the issue's
+  `Target:` repo if it has one, otherwise the repo the issue was filed on. The prompt
+  says which, and whether it's your own source.
+- When the repo is your own source, changes you merge there become the next version of
+  you, so keep the worker working: run `npm run typecheck` and `npm test` before every
+  commit you hand in, and don't break the image build.
+- The repo is already cloned into your working directory before you start; don't
   clone it again. Only this repo gets published, so if an issue asks you to touch a
   different one, treat that as out of scope and say so rather than trying.
 - Work only on the branch the prompt names. If it exists on the remote, check it out

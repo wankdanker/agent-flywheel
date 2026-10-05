@@ -347,3 +347,46 @@ test("github chain: listQueued skips PRs, release swaps queued for agent (remova
   await chain.mergeReview(5, "aaa");
   assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa", merge_method: "merge" });
 });
+
+test("github retarget: repo/ensureBranch/openReview act on the target; getTicket/comment/setState stay on the hub issue", async (t) => {
+  const calls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    const method = init.method ?? "GET";
+    calls.push(`${method} ${url}`);
+    const path = url.replace("https://api.github.com", "");
+    if (path === "/repos/acme/api") return jsonResponse({ clone_url: "https://github.com/acme/api.git", html_url: "https://github.com/acme/api", default_branch: "trunk" });
+    if (path.endsWith("/git/ref/heads/agent/issue-42")) return new Response("", { status: 404 });
+    if (path.endsWith("/git/ref/heads/trunk")) return jsonResponse({ object: { sha: "abc" } });
+    if (path.endsWith("/git/refs")) return jsonResponse({});
+    if (path.includes("/pulls?")) return jsonResponse([]);
+    if (path.endsWith("/pulls")) return jsonResponse({ html_url: "https://github.com/acme/api/pull/5" });
+    if (path.endsWith("/issues/42")) {
+      return jsonResponse({
+        number: 42, html_url: "https://github.com/acme/hub/issues/42", title: "t", body: "Target: acme/api\n\nb",
+        author_association: "OWNER", user: { login: "maintainer", id: 1, type: "User" }, labels: [],
+      });
+    }
+    if (path.includes("/issues/42/comments") && method === "GET") return jsonResponse([]);
+    if (path.includes("/issues/42/")) return jsonResponse({});
+    throw new Error(`unexpected fetch ${method} ${url}`);
+  });
+  const hub = githubTracker({ token: "x", repo: "acme/hub", issue: 42, self: { id: 9, login: "bot" } });
+  const target = hub.retarget("acme/api");
+  assert.equal(target.platform, "github");
+
+  assert.deepEqual(await target.repo(), { cloneUrl: "https://github.com/acme/api.git", webUrl: "https://github.com/acme/api", defaultBranch: "trunk" });
+  assert.equal(await target.ensureBranch("agent/issue-42", "trunk"), true);
+  assert.deepEqual(await target.openReview({ branch: "agent/issue-42", base: "trunk", title: "t", body: "Closes acme/hub#42" }), {
+    url: "https://github.com/acme/api/pull/5", created: true,
+  });
+  const code = calls.splice(0);
+  assert.ok(code.length >= 5);
+  for (const c of code) assert.match(c, /^\w+ https:\/\/api\.github\.com\/repos\/acme\/api(\/|$)/);
+  assert.ok(code.includes("GET https://api.github.com/repos/acme/api/pulls?state=open&head=acme%3Aagent%2Fissue-42"));
+
+  assert.equal((await target.getTicket()).url, "https://github.com/acme/hub/issues/42");
+  await target.comment("hi");
+  await target.setState("review");
+  assert.ok(calls.length >= 4);
+  for (const c of calls) assert.match(c, /^\w+ https:\/\/api\.github\.com\/repos\/acme\/hub\/issues\/42(\/|$)/);
+});
