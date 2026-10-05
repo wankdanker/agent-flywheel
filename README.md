@@ -208,7 +208,7 @@ CI log. If even the label update fails, the log says so and what to fix by hand.
 
 Bad config (missing credential, `MAX_TURNS` that isn't an integer from 1 to 500, a
 `MAX_BUDGET_USD` that isn't a positive number, a `MAX_CHAINED_RUNS` that isn't an integer from 0
-to 20, an unknown `AGENT_TRIGGER`, repo outside the allowlist) is caught before the issue is touched at all.
+to 20, an unknown `AGENT_TRIGGER`, a malformed `AGENT_REPO_ALLOWLIST` entry, repo outside the allowlist) is caught before the issue is touched at all.
 
 What a process can't do is clean up after being killed. In CI the publish job still runs after
 a failed or timed-out agent job, finds no `outcome.json`, publishes whatever the agent committed
@@ -268,6 +268,33 @@ What this means per issue:
   With no trusted directive on file, the run sets `agent/blocked` and comments explaining
   that a maintainer needs to approve or restate the task; a later trusted comment resumes
   it.
+
+### Repository allowlist
+
+Which repo a run clones and pushes to comes from the forge project the issue lives on, never
+from the issue's text, and it must match `AGENT_REPO_ALLOWLIST` (`src/allowlist.ts`): a
+comma-separated list that defaults to just `GITHUB_REPOSITORY`/`CI_PROJECT_PATH`. Matching is
+case-insensitive, against the `owner/repo` (or `group/sub/project`) path of the clone URL, https
+or ssh alike. Each entry is one of:
+
+| Entry | Matches |
+|---|---|
+| `owner/repo` | exactly that repo |
+| `owner/*` | any repo **directly** under `owner` (one path segment) |
+| `group/**` | any project at **any depth** under `group` (GitLab nested groups), not `group` itself |
+| `owner/whisper-*` | `*` inside a segment matches any run of characters except `/` |
+
+Everything except `*` is literal (`owner/my.repo` doesn't match `owner/myxrepo`). The first
+segment must be literal, and `**` is only allowed as the final whole segment, so `*`, `**`,
+`*/repo` and `**/x` are rejected rather than allowing everything the token can reach. So is any
+malformed entry: an empty segment, a single segment, a URL, scheme or host, `.` or `..`, or a
+character outside `A-Z a-z 0-9 _ . - *`. A rejected entry is a config error (exit 2, the issue
+untouched), never an entry that silently matches nothing or too much.
+
+**A pattern is a standing grant.** `myorg/*` allows every repo in `myorg` the forge token can
+reach, including any created later, by anyone who can create repos there. An issue filed on such
+a repo, by anyone the Trust model above trusts there, can start a run with your secrets. List
+repos exactly unless you mean that.
 
 ### Worker bot identity
 
@@ -731,7 +758,7 @@ that way if you edit the workflow; `test/ci-config.test.ts` checks it.
    - `AGENT_GITLAB_TOKEN`: the token from step 2.
    - `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`.
    - Optional: `AGENT_IMAGE`, `CLAUDE_MODEL`, `SMOKE_MODEL`, `MAX_TURNS`, `MAX_BUDGET_USD`,
-     `MAX_CHAINED_RUNS`, `MODEL_PROXY_MAX_REQUESTS`,
+     `MAX_CHAINED_RUNS`, `AGENT_REPO_ALLOWLIST` (see "Repository allowlist"), `MODEL_PROXY_MAX_REQUESTS`,
      `MODEL_PROXY_MAX_LIFETIME_MS`, `MODEL_PROXY_REQUEST_TIMEOUT_MS`, and for workspace
      persistence `PERSISTENCE_BUCKET` with its credentials (see "Persistent workspace images").
 4. *Settings → CI/CD → Pipeline trigger tokens*: create a token.

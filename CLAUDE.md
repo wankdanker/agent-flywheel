@@ -36,7 +36,9 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - detects the platform from `AGENT_PLATFORM`, `GITLAB_CI` or `GITHUB_ACTIONS`;
   - builds a `Tracker`;
   - checks the ticket's repo against the allowlist (`src/allowlist.ts`, `AGENT_REPO_ALLOWLIST`,
-    defaulting to just `GITHUB_REPOSITORY`/`CI_PROJECT_PATH`) and refuses (exit 2, no clone) if
+    defaulting to just `GITHUB_REPOSITORY`/`CI_PROJECT_PATH`; entries may be `owner/*`, `group/**` or
+    in-segment `*` patterns, matched segment by segment, and a malformed one is a `ConfigError` —
+    `src/config-error.ts`, dependency-free so `allowlist.ts` can throw it — checked with the other config) and refuses (exit 2, no clone) if
     it isn't listed;
   - sets `agent/working`, and from there on guarantees a terminal label: everything up to the
     settled outcome runs in a `try/catch`, and if no `review`/`blocked` label landed (tracked by
