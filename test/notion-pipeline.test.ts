@@ -18,10 +18,15 @@ const MR_ISSUE = "https://gitlab.example/acme/widgets/-/issues/12";
 
 function world(t: { mock: { method: Function } }, seed: NotionSeed) {
   const notion = new FakeNotion(seed);
+  const relays: { url: string; body?: any }[] = [];
   const forge = new FakeForge("gitlab", { number: 1, title: "", body: "", author: "x", trust: "trusted", labels: [] });
   // Any other project on the fake GitLab exists too (so the allowlist, not a 404, is what refuses it).
   notion.next = async (input, init) => {
     const url = String(input);
+    if (url.startsWith("https://api.github.com/")) {
+      relays.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      return url.endsWith("/repos/acme/flywheel") ? new Response(JSON.stringify({ default_branch: "main" })) : new Response(null, { status: 204 });
+    }
     const other = /\/projects\/((?!acme%2Fwidgets)[^/]+)$/.exec(new URL(url).pathname);
     if (other) {
       const path = decodeURIComponent(other[1]!);
@@ -38,6 +43,8 @@ function world(t: { mock: { method: Function } }, seed: NotionSeed) {
   const forgeSide = {
     ...common, AGENT_TRIGGER: "pickup", NOTION_TOKEN, NOTION_CODE_PLATFORM: "gitlab", AGENT_GITLAB_TOKEN: TOKEN.gitlab, CI_API_V4_URL: GITLAB_API,
     NOTION_TRUSTED_USERS: `${USERS.dan}, ${USERS.otherBot}`, NOTION_AGENT_USER_ID: USERS.agent,
+    // The relay's workflow_dispatch goes to the flywheel's own repo.
+    GH_TOKEN: "ghs_relaytoken1234567890", GITHUB_REPOSITORY: "acme/flywheel",
   };
   const env = {
     prepare: forgeSide,
@@ -69,7 +76,7 @@ function world(t: { mock: { method: Function } }, seed: NotionSeed) {
       return { pushBranch: () => (seen.pushes++, { pushed: true, head: "abc123", commits: 1 }) };
     },
   };
-  return { notion, forge, env, deps, seen, root };
+  return { notion, forge, env, deps, seen, root, relays };
 }
 
 async function quietly<T>(fn: () => Promise<T>): Promise<T> {
@@ -190,4 +197,39 @@ test("notion: NOTION_TOKEN never reaches the agent stage, and the stage refuses 
   } finally {
     process.chdir(cwd);
   }
+});
+
+test("notion: a checkpoint publishes the branch, blocks the ticket, and relays a new run for the same page", async (t) => {
+  const w = world(t, { repo: "acme/widgets" });
+  w.deps.runSession = async (_t: Ticket, cfg: SessionConfig) => {
+    w.seen.sessions.push(cfg);
+    return { recorded: { status: "checkpoint", summary: "Half done.", nextSteps: "The rest." }, end: { maxTurnsHit: false } } as any;
+  };
+  assert.deepEqual(await stages(w), [0, 0, 20]);
+  assert.equal(w.seen.pushes, 1);
+  assert.deepEqual(statuses(w.notion), ["Doing", "Blocked"]);
+  assert.deepEqual(w.relays.at(-1), {
+    url: "https://api.github.com/repos/acme/flywheel/actions/workflows/notion-poll.yml/dispatches",
+    body: { ref: "main", inputs: { page: PAGE, trigger: "relay" } },
+  });
+  const [checkpoint, relay] = w.notion.posted();
+  assert.match(checkpoint!, /branch `agent\/notion-pro-3801`/);
+  assert.match(relay!, /chained run 1 of at most 3/);
+  assert.match(relay!, /‹agent-flywheel:chain=1›/);
+
+  // And the relayed run's prepare stage sees it as the pending relay on a Blocked ticket.
+  const again = await quietly(() => prepareStage({ ...w.deps, env: { ...w.env.prepare, AGENT_TRIGGER: "relay" } }));
+  assert.equal(again, 0);
+  assert.equal(statuses(w.notion).at(-1), "Doing");
+});
+
+test("notion: at MAX_CHAINED_RUNS the ticket says how to restart it, not `/agent continue`", async (t) => {
+  const w = world(t, { repo: "acme/widgets", status: "Blocked" });
+  const { chainLimitComment } = await import("../src/stages.ts");
+  const tracker = w.notion.tracker();
+  const ticket = await tracker.getTicket();
+  await tracker.comment(chainLimitComment(ticket, 3, 3));
+  const shown = w.notion.posted().at(-1)!;
+  assert.doesNotMatch(shown, /\/agent continue/);
+  assert.match(shown, /move it back to To Do/);
 });

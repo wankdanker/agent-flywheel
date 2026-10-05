@@ -250,10 +250,13 @@ export const relayComment = (t: Ticket, n: number, max: number) =>
   `Continuing from branch \`${branchFor(t)}\` on my own: this is chained run ${n} of at most ${max} ` +
   `(\`MAX_CHAINED_RUNS\`) before I stop for a maintainer. A comment from a maintainer resets the count.\n\n${chainMarker(n)}`;
 
+// A Notion ticket has no `/agent continue` (nothing reads its comments until it's picked up again):
+// its RESUME_HINT, as the Notion tracker posts it, says how to restart it instead.
 export const chainLimitComment = (t: Ticket, runs: number, max: number) =>
   `I've already continued ${runs} time(s) in a row on my own, which is the limit (\`MAX_CHAINED_RUNS\`=${max}), so I'm not ` +
-  `starting another run by myself. Please review branch \`${branchFor(t)}\` and its \`git log\`, then comment ` +
-  `\`${CONTINUE_COMMAND}\` (with any directions on the lines after it) to have me keep going.\n\n${RESUME_HINT}`;
+  `starting another run by myself. Please review branch \`${branchFor(t)}\` and its \`git log\`` +
+  (t.key === undefined ? `, then comment \`${CONTINUE_COMMAND}\` (with any directions on the lines after it) to have me keep going.` : ".") +
+  `\n\n${RESUME_HINT}`;
 
 // The auto-relay after a checkpoint (the issue is already `blocked`, the work pushed): start the
 // next run ourselves, with AGENT_TRIGGER=relay, unless MAX_CHAINED_RUNS of them have already run

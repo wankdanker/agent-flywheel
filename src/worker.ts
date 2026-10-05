@@ -65,8 +65,8 @@ export const trustedDirectives = (t: Ticket): Comment[] => t.comments.filter((c)
 export const blockedNoDirectiveMessage = (t: Ticket) => t.key !== undefined
   ? `This ticket was created by ${t.author}, who isn't one of the trusted Notion users (NOTION_TRUSTED_USERS), so I won't ` +
     `act on its title, body, or comments automatically — that content could be an attempt to steer me while I run with ` +
-    `your credentials and permissions bypassed.\n\nA trusted user can approve or restate the task in a comment here (that ` +
-    `comment, not the ticket's own text, becomes my task), then move the ticket back to To Do. ${RESUME_HINT}`
+    `your credentials and permissions bypassed.\n\nA trusted user can approve or restate the task in a comment here; that ` +
+    `comment, not the ticket's own text, becomes my task. ${RESUME_HINT}`
   : `This issue was opened by @${t.author}, who isn't a trusted maintainer (owner, member, or collaborator ` +
   `on GitHub; Developer or higher on GitLab), so I won't act on its title, body, or comments automatically — ` +
   `that content could be an attempt to steer me while I run with your credentials and permissions bypassed.\n\n` +
