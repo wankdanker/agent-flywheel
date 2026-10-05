@@ -4,12 +4,12 @@
 // githubTracker/gitlabTracker run against it unchanged, so test/tracker-contract.test.ts can
 // hold both adapters to one contract and test/fixtures.test.ts can run whole scenarios with
 // no network. Seeds are platform-neutral; each platform renders them in its own wire format.
-import { BOT_BADGE, BOT_MARKER, withMarker, type Tracker } from "../../src/tracker.ts";
+import { BOT_BADGE, BOT_MARKER, withMarker, type CodePlatform, type Tracker } from "../../src/tracker.ts";
 import { githubTracker } from "../../src/github.ts";
 import { gitlabTracker } from "../../src/gitlab.ts";
 import type { Trust } from "../../src/trust.ts";
 
-export type Platform = Tracker["platform"];
+export type Platform = CodePlatform;
 export type Person = { name: string; trust: Trust };
 // `bot: true` is a comment our own tracker posted earlier (badge + marker, from the bot account).
 // `app: true` is a comment from some other bot account (on GitHub, a different `type: "Bot"`

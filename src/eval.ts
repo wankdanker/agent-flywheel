@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DEFAULT_UPSTREAM, sandboxEnv } from "./model-proxy.ts";
 import { ConfigError, parseMaxBudgetUsd, parseMaxTurns, requireModelCredential, startProxyFromEnv, type RunDeps } from "./run.ts";
-import type { Comment, Ticket, Tracker } from "./tracker.ts";
+import type { CodePlatform, Comment, Ticket } from "./tracker.ts";
 import type { Trust } from "./trust.ts";
 import { branchFor, runSession as realRunSession, type AgentOutcome, type SessionEnd, type SessionStats } from "./worker.ts";
 
@@ -28,7 +28,7 @@ export const DEFAULT_EVAL_MAX_BUDGET_USD = "1";
 type SeedComment = { author: string; trust?: Trust; bot?: boolean; text: string; at: string };
 export type EvalFixture = {
   name: string;
-  platform: Tracker["platform"];
+  platform: CodePlatform;
   issue: { number: number; title: string; body: string; author: string; trust: Trust; labels: string[]; comments?: SeedComment[]; defaultBranch?: string };
   expectedOutcome: string;
   repoDir: string;

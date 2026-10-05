@@ -12,10 +12,11 @@ import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Creden
 import { DEFAULT_MAX_CHAINED_RUNS, recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
 import { botIdentityFromEnv, githubTracker } from "./github.ts";
 import { gitlabTracker } from "./gitlab.ts";
+import { normalizeId, notionTrackerFromEnv } from "./notion.ts";
 import { resetHandoff } from "./handoff.ts";
 import { gitPublisher } from "./publish.ts";
 import { credentialFromEnv, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
-import type { Repo, Ticket, TicketState, Tracker } from "./tracker.ts";
+import { codePlatformOf, type CodePlatform, type Repo, type Ticket, type TicketState, type Tracker } from "./tracker.ts";
 import {
   applyOutcome, branchFor, needsDirective, runSession as realRunSession, runTicket as realRunTicket, settle, SettlementError,
   type Outcome, type WorkerConfig,
@@ -133,6 +134,8 @@ export function startProxyFromEnv(env: NodeJS.ProcessEnv, startModelProxy: NonNu
 
 export function detectTracker(env: NodeJS.ProcessEnv): Tracker {
   const platform = env.AGENT_PLATFORM || (env.GITLAB_CI ? "gitlab" : env.GITHUB_ACTIONS ? "github" : "");
+  // A Notion ticket (NOTION_PAGE_ID), its code on NOTION_CODE_PLATFORM: see src/notion.ts.
+  if (platform === "notion") return notionTrackerFromEnv(env);
   const issue = Number(req(env, "ISSUE"));
   if (platform === "github") {
     let self;
@@ -151,12 +154,13 @@ export function detectTracker(env: NodeJS.ProcessEnv): Tracker {
       issue,
     });
   }
-  throw new ConfigError("can't tell the platform; set AGENT_PLATFORM to github or gitlab");
+  throw new ConfigError("can't tell the platform; set AGENT_PLATFORM to github, gitlab or notion");
 }
 
 // The only credential a `git` subprocess we spawn ever sees; never written to git config,
 // so it can't be read back out of it once prepareRepo() returns. See src/clone.ts.
-export function credentialFor(platform: Tracker["platform"], env: NodeJS.ProcessEnv): Credential {
+// `platform` is the code host's (codePlatformOf), which for a Notion ticket isn't the tracker's.
+export function credentialFor(platform: CodePlatform, env: NodeJS.ProcessEnv): Credential {
   return platform === "github"
     ? { username: "x-access-token", token: req(env, "GH_TOKEN") }
     : { username: "oauth2", token: req(env, "AGENT_GITLAB_TOKEN") };
@@ -170,7 +174,7 @@ const SECRET_ENV_NAME = /TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|COOKIE|CREDENTIAL
 const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b(bearer|basic|token)\s+[\w.~+/=-]{8,}/gi, "$1 [redacted]"],
   [/\b(authorization|x-api-key|private-token|cookie)(["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, "$1$2[redacted]"],
-  [/\b(sk-ant-|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|glpat-|gldt-|glrt-)[\w-]+/g, "[redacted]"],
+  [/\b(sk-ant-|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|glpat-|gldt-|glrt-|secret_|ntn_)[\w-]+/g, "[redacted]"],
   [/\/\/[^/\s:@]+:[^/\s@]+@/g, "//[redacted]@"],
 ];
 const MAX_ISSUE_ERROR_LENGTH = 300;
@@ -201,6 +205,7 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
   // A retargeted tracker is wrapped the same way, sharing the state and the posted comments.
   const wrap = (tracker: Tracker): Tracker => ({
     platform: tracker.platform,
+    ...(tracker.codePlatform ? { codePlatform: tracker.codePlatform } : {}),
     repo: () => tracker.repo(),
     getTicket: () => tracker.getTicket(),
     createSubIssue: (input) => tracker.createSubIssue(input),
@@ -249,15 +254,24 @@ export type AllowedTicket = { tracker: Tracker; ticket: Ticket } & (
 // exception is a trusted author's `Target:` header (src/chain.ts's targetOf), which points the
 // code-host side of the run at another repo on the same forge (`Tracker#retarget`); the
 // returned tracker is that retargeted one, and the allowlist applies to the target.
+//
+// A Notion ticket has no repo of its own: its repo property (`ticket.target`, src/notion.ts) is
+// always the target, and a missing, unparseable or non-allowlisted one blocks it with a comment
+// (an unanswered refusal would only have the poller dispatch it again and again).
 export async function fetchAllowedTicket(hub: Tracker, env: NodeJS.ProcessEnv): Promise<AllowedTicket | undefined> {
   const ticket = await hub.getTicket();
-  console.log(`[ticket] #${ticket.number} ${ticket.title}, ${ticket.comments.length} comments`);
-  const header = targetOf(ticket, hub.platform);
+  console.log(`[ticket] ${ticketName(ticket)} ${ticket.title}, ${ticket.comments.length} comments`);
+  const notion = hub.platform === "notion";
+  const header = notion ? ticket.target ?? { invalid: "it names no repo" } : targetOf(ticket, codePlatformOf(hub));
   if (header && "invalid" in header) return { tracker: hub, ticket, invalidTarget: header.invalid };
   const tracker = header ? hub.retarget(header.path) : hub;
   const repo = await tracker.repo();
-  if (header) console.log(`[target] #${ticket.number} (${ticket.url}) works in ${header.path} (${repo.cloneUrl}), named by its Target: header`);
+  if (header) console.log(`[target] ${ticketName(ticket)} (${ticket.url}) works in ${header.path} (${repo.cloneUrl}), named by its ${notion ? "repo property" : "Target: header"}`);
   const allowlist = parseAllowlist(env);
+  if (notion && !isAllowedRepo(repo.cloneUrl, allowlist)) {
+    console.error(`refusing to clone ${repo.cloneUrl} for ${ticketName(ticket)}: not in the repo allowlist (${allowlist.join(", ") || "<empty>"})`);
+    return { tracker: hub, ticket, invalidTarget: `\`${header!.path}\` isn't a repo I'm allowed to work in (AGENT_REPO_ALLOWLIST); a maintainer has to allow it first` };
+  }
   if (!isAllowedRepo(repo.cloneUrl, allowlist)) {
     console.error(
       `refusing to clone ${repo.cloneUrl}: not in the repo allowlist (${allowlist.join(", ") || "<empty>"})` +
@@ -271,15 +285,19 @@ export async function fetchAllowedTicket(hub: Tracker, env: NodeJS.ProcessEnv): 
 
 // An invalid `Target:` header is a config error, but one only the issue's author can fix, so
 // (unlike a refusal) it's said on the issue: blocked, with a comment, exit 2.
+// A Notion ticket's repo property is held to the same rules, with its own wording.
 export function refuseInvalidTarget(tracker: Tracker, ticket: Ticket, env: NodeJS.ProcessEnv, problem: string): Promise<number> {
-  console.error(`[target] #${ticket.number} has an invalid Target: header: ${problem}`);
+  const notion = tracker.platform === "notion";
+  console.error(`[target] ${ticketName(ticket)} has an invalid ${notion ? "repo property" : "Target: header"}: ${problem}`);
   const guard = guardTracker(tracker, ticket);
+  const text = notion
+    ? `I didn't start: this ticket's repo property can't be used: ${problem}.\n\nIt has to name one project, as its path ` +
+      `(group/project) or its URL, that the flywheel is allowed to work in.\n\n${RESUME_HINT}`
+    : `I didn't start: this issue has an invalid \`Target:\` header. ${problem}.\n\n` +
+      `Fix or remove it in the issue body: one \`Target: owner/repo\` line, a repo path on this forge, in the first paragraph.\n\n${RESUME_HINT}`;
   return guarded(guard, ticket, env, async () => {
     await settle({ kind: "blocked", detail: problem }, [
-      () => guard.tracker.comment(
-        `I didn't start: this issue has an invalid \`Target:\` header. ${problem}.\n\n` +
-          `Fix or remove it in the issue body: one \`Target: owner/repo\` line, a repo path on this forge, in the first paragraph.\n\n${RESUME_HINT}`,
-      ),
+      () => guard.tracker.comment(text),
       () => guard.tracker.setState("blocked"),
     ]);
     return 2;
@@ -300,8 +318,18 @@ export function checkOrigin(origin: string, repo: Repo, allowlist: string[], wor
 }
 
 // Namespaced per issue: if WORK_DIR is cached/persisted across runs (so a failed
-// run doesn't lose its clone), two issues sharing that cache must not collide.
-export const workDirFor = (env: NodeJS.ProcessEnv, issue: number) => join(env.WORK_DIR ?? "/work", `issue-${issue}`);
+// run doesn't lose its clone), two issues sharing that cache must not collide. A Notion ticket's
+// is keyed by its page id instead (`notion-<id>`), which every stage has from NOTION_PAGE_ID, and
+// which can't collide with a forge issue's number.
+export function workDirFor(env: NodeJS.ProcessEnv, issue: number): string {
+  if (env.AGENT_PLATFORM !== "notion") return join(env.WORK_DIR ?? "/work", `issue-${issue}`);
+  const page = normalizeId(env.NOTION_PAGE_ID);
+  if (!page) throw new ConfigError(`NOTION_PAGE_ID must be a Notion page id, got ${JSON.stringify(env.NOTION_PAGE_ID ?? "")}`);
+  return join(env.WORK_DIR ?? "/work", `notion-${page.replace(/-/g, "")}`);
+}
+
+// How the log names a ticket: `#7`, or a Notion ticket's `PRO-3801`.
+export const ticketName = (t: Pick<Ticket, "number" | "key">) => t.key ?? `#${t.number}`;
 
 // Runs `work` (which owes the issue its labels from here on) and makes sure no failure
 // strands `agent/working`: if it throws, or with `mustSettle` returns without a terminal
@@ -403,7 +431,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
     // Cloning happens here, before the agent's own (permission-bypassed) shell ever starts, so
     // it never needs or sees forge credentials to get the repo it's meant to work on.
     const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: baseBranchFor(ticket, repo.defaultBranch) };
-    const credential = credentialFor(tracker.platform, env);
+    const credential = credentialFor(codePlatformOf(tracker), env);
     prepareRepo({ ...target, credential });
 
     // A cached work dir from a previous run could in principle predate today's allowlist or

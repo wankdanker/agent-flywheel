@@ -26,7 +26,7 @@ import {
   guardTracker, parseMaxBudgetUsd, parseMaxChainedRuns, parseMaxTurns, parseTrigger, publishAfterCrash, refuseInvalidTarget, requireModelCredential, settleIncomplete, startProxyFromEnv, triggerStillApplies,
   workDirFor, type RunDeps,
 } from "./run.ts";
-import { STATE_LABELS, type Ticket, type Tracker } from "./tracker.ts";
+import { codePlatformOf, STATE_LABELS, type Ticket, type Tracker } from "./tracker.ts";
 import {
   applyOutcome, blockForDirective, branchFor, needsDirective, runSession as realRunSession, type AgentOutcome, type Outcome, type SessionEnd,
   type WorkerConfig,
@@ -111,9 +111,9 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
     if (needsDirective(ticket)) return EXIT_CODES[(await blockForDirective(ticket, guard.tracker)).kind];
 
     const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: baseBranchFor(ticket, repo.defaultBranch) };
-    prepareRepo({ ...target, credential: credentialFor(tracker.platform, env) });
+    prepareRepo({ ...target, credential: credentialFor(codePlatformOf(tracker), env) });
     checkOrigin(originUrl(workDir), repo, allowlist, workDir);
-    writePrepared(workDir, { platform: tracker.platform, ticket, repo });
+    writePrepared(workDir, { platform: codePlatformOf(tracker), ticket, repo });
     console.log(`[prepare] ${workDir} is on ${branchFor(ticket)}; ready for the agent stage`);
     return 0;
   }, { mustSettle: false });
@@ -126,16 +126,19 @@ export async function agentStage(deps: RunDeps = {}): Promise<number> {
   const startModelProxy = deps.startModelProxy ?? realStartModelProxy;
   const runSession = deps.runSession ?? realRunSession;
 
-  let maxTurns: number, maxBudgetUsd: number | undefined, issue: number;
+  // A Notion ticket's work dir is keyed by NOTION_PAGE_ID (workDirFor), and its number comes from
+  // prepared.json, which the prepare stage wrote from the ticket itself.
+  const notion = env.AGENT_PLATFORM === "notion";
+  let maxTurns: number, maxBudgetUsd: number | undefined, issue: number, workDir: string;
   try {
     requireModelCredential(env);
     maxTurns = parseMaxTurns(env.MAX_TURNS);
     maxBudgetUsd = parseMaxBudgetUsd(env.MAX_BUDGET_USD);
-    issue = parseIssue(env);
+    issue = notion ? 0 : parseIssue(env);
+    workDir = workDirFor(env, issue);
   } catch (err) {
     return configExit(err);
   }
-  const workDir = workDirFor(env, issue);
   const leaks = forgeCredentialLeaks(env, workDir);
   if (leaks.length) {
     console.error(`refusing to run the agent stage with a forge credential in reach: ${leaks.join(", ")}`);
@@ -145,9 +148,10 @@ export async function agentStage(deps: RunDeps = {}): Promise<number> {
   clearOutcome(workDir);
   const prepared = readPrepared(workDir);
   if (!prepared) {
-    console.log(`[agent] nothing prepared for #${issue} (the prepare stage settled it, or didn't run); nothing to do`);
+    console.log(`[agent] nothing prepared for ${notion ? env.NOTION_PAGE_ID : `#${issue}`} (the prepare stage settled it, or didn't run); nothing to do`);
     return 0;
   }
+  if (notion) issue = prepared.ticket.number;
 
   const proxy = await startProxyFromEnv(env, startModelProxy);
   let result: { recorded: AgentOutcome | undefined; end: SessionEnd };
@@ -223,7 +227,7 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
       workDir,
       pluginDir: env.PLUGIN_DIR ?? DEFAULT_PLUGIN_DIR,
       maxTurns,
-      publisher: createPublisher({ ...target, credential: credentialFor(tracker.platform, env) }),
+      publisher: createPublisher({ ...target, credential: credentialFor(codePlatformOf(tracker), env) }),
     };
     let outcome: Outcome;
     try {

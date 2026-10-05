@@ -11,7 +11,7 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSy
 import { join } from "node:path";
 import { z } from "zod";
 import { MAX_SUBTASKS } from "./chain.ts";
-import type { Repo, Ticket, Tracker } from "./tracker.ts";
+import type { CodePlatform, Repo, Ticket } from "./tracker.ts";
 import type { AgentOutcome } from "./worker.ts";
 
 export const HANDOFF_VERSION = 1;
@@ -29,7 +29,8 @@ export class HandoffError extends Error {
   }
 }
 
-export type Prepared = { version: number; platform: Tracker["platform"]; ticket: Ticket; repo: Repo };
+// `platform` is the code host the agent publishes to (its skill, PR vs MR), whatever tracks the issue.
+export type Prepared = { version: number; platform: CodePlatform; ticket: Ticket; repo: Repo };
 export type HandedOutcome = { version: number; issue: number; recorded: AgentOutcome | null; maxTurnsHit: boolean; budgetHit?: boolean };
 
 // Well under GitHub's 65,536-character comment limit, even with a checkpoint's two fields

@@ -10,7 +10,7 @@
 // The header is the platform-neutral source of truth for the chain, and it's only believed on an
 // issue whose author is trusted (our own token, or a maintainer). No npm deps: CI runs
 // bin/advance-chain.ts on stock node.
-import { STATE_LABELS, type ChainForge, type Ticket } from "./tracker.ts";
+import { STATE_LABELS, type ChainForge, type CodePlatform, type Ticket } from "./tracker.ts";
 
 export const MAX_SUBTASKS = 4;
 
@@ -55,35 +55,42 @@ export type TargetHeader = { path: string } | { invalid: string };
 
 const SEGMENT = /^[A-Za-z0-9_.-]+$/;
 
-export function parseTarget(body: string, platform?: "github" | "gitlab"): TargetHeader | undefined {
+export function parseTarget(body: string, platform?: CodePlatform): TargetHeader | undefined {
   const head = body.replace(/\r\n/g, "\n").split("\n\n")[0]!;
   const lines = head.split("\n").filter((l) => /^\s*target\s*:/i.test(l));
   if (!lines.length) return undefined;
   if (lines.length > 1) return { invalid: `There are ${lines.length} \`Target:\` lines; give exactly one` };
   const m = /^Target: (.*)$/.exec(lines[0]!.replace(/\s+$/, ""));
-  const value = m?.[1] ?? "";
   const bad = (why: string) => ({ invalid: `\`${lines[0]!.trim().replace(/`/g, "'").slice(0, 200)}\` isn't a valid target: ${why}` });
   if (!m) return bad("write it as `Target: owner/repo`");
-  if (!value) return bad("it names no repo");
-  if (/\s/.test(value)) return bad("a repo path can't contain whitespace");
-  if (/:\/\/|^[^/]*:|@/.test(value)) return bad("give a repo path on this forge (owner/repo), not a URL or a host");
-  if (/\.git$/i.test(value)) return bad("drop the trailing .git");
-  const segments = value.split("/");
-  if (segments.some((s) => !s)) return bad("a repo path can't have empty segments or a leading/trailing slash");
-  if (segments.some((s) => s === "." || s === "..")) return bad("a repo path can't contain `.` or `..`");
-  if (!segments.every((s) => SEGMENT.test(s))) return bad("a repo path may only contain letters, digits, `_`, `-` and `.`");
-  if (segments.length < 2) return bad("give the full path, owner/repo");
-  if (segments[0]!.includes(".")) return bad("that looks like a host; give a repo path on this forge (owner/repo)");
-  if (platform === "github" && segments.length !== 2) return bad("a GitHub repo is exactly owner/repo");
-  return { path: value };
+  const problem = repoPathProblem(m[1] ?? "", platform);
+  return problem ? bad(problem) : { path: m[1]! };
 }
 
-// A ticket's target header, believed only from a trusted author (same rule as chainOf).
-export const targetOf = (t: Pick<Ticket, "body" | "trust">, platform?: "github" | "gitlab"): TargetHeader | undefined =>
-  t.trust === "trusted" ? parseTarget(t.body, platform) : undefined;
+// Why `value` isn't a repo path on the forge (`owner/repo`, or a GitLab `group/sub/project`), or
+// undefined if it is. Also what a Notion ticket's repo property is held to (src/notion.ts).
+export function repoPathProblem(value: string, platform?: CodePlatform): string | undefined {
+  if (!value) return "it names no repo";
+  if (/\s/.test(value)) return "a repo path can't contain whitespace";
+  if (/:\/\/|^[^/]*:|@/.test(value)) return "give a repo path on this forge (owner/repo), not a URL or a host";
+  if (/\.git$/i.test(value)) return "drop the trailing .git";
+  const segments = value.split("/");
+  if (segments.some((s) => !s)) return "a repo path can't have empty segments or a leading/trailing slash";
+  if (segments.some((s) => s === "." || s === "..")) return "a repo path can't contain `.` or `..`";
+  if (!segments.every((s) => SEGMENT.test(s))) return "a repo path may only contain letters, digits, `_`, `-` and `.`";
+  if (segments.length < 2) return "give the full path, owner/repo";
+  if (segments[0]!.includes(".")) return "that looks like a host; give a repo path on this forge (owner/repo)";
+  if (platform === "github" && segments.length !== 2) return "a GitHub repo is exactly owner/repo";
+  return undefined;
+}
 
-// The valid target repo path, if the ticket has one.
-export const targetRepo = (t: Pick<Ticket, "body" | "trust">): string | undefined => {
+// A ticket's target header, believed only from a trusted author (same rule as chainOf). A Notion
+// ticket (one with a `key`) has no header: its repo property is its `target` (src/notion.ts).
+export const targetOf = (t: Pick<Ticket, "body" | "trust" | "key">, platform?: CodePlatform): TargetHeader | undefined =>
+  t.trust === "trusted" && t.key === undefined ? parseTarget(t.body, platform) : undefined;
+
+// The valid target repo path, if the ticket has a `Target:` header.
+export const targetRepo = (t: Pick<Ticket, "body" | "trust" | "key">): string | undefined => {
   const h = targetOf(t);
   return h && "path" in h ? h.path : undefined;
 };

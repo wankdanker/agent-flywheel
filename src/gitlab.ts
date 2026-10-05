@@ -1,5 +1,5 @@
 // Our thin GitLab REST client for one issue.
-import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type ChainForge, type Tracker } from "./tracker.ts";
+import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type ChainForge, type CodeHost, type Tracker } from "./tracker.ts";
 import { gitlabMemberTrust, type Trust } from "./trust.ts";
 
 // A runaway-loop guard, not a thread-size limit: 1000 pages of 100 is far past any real issue.
@@ -22,11 +22,41 @@ function projectApi(o: Project) {
   return { request, gl };
 }
 
+// The code-host calls on one project, which need no issue: a gitlabTracker's (its own project, or its
+// `Target:`), and a Notion tracker's (src/notion.ts), whose tickets aren't GitLab issues at all.
+export function gitlabCodeHost(o: Project): CodeHost {
+  const { request, gl } = projectApi(o);
+  return {
+    async repo() {
+      const p = await gl("");
+      return { cloneUrl: p.http_url_to_repo, webUrl: p.web_url, defaultBranch: p.default_branch };
+    },
+
+    async ensureBranch(branch, from) {
+      const res = await request(`/repository/branches/${encodeURIComponent(branch)}`, {}, [404]);
+      if (res.ok) return false;
+      await gl(`/repository/branches?branch=${encodeURIComponent(branch)}&ref=${encodeURIComponent(from)}`, { method: "POST" });
+      return true;
+    },
+
+    // Pushing the branch already updated an open MR; only open one if there isn't one yet.
+    async openReview({ branch, base, title, body }) {
+      const open = await gl(`/merge_requests?state=opened&source_branch=${encodeURIComponent(branch)}`);
+      if (Array.isArray(open) && open.length) return { url: open[0].web_url, created: false };
+      const mr = await gl("/merge_requests", {
+        method: "POST",
+        body: JSON.stringify({ source_branch: branch, target_branch: base, title, description: body }),
+      });
+      return { url: mr.web_url, created: true };
+    },
+  };
+}
+
 // `code` is the project the code-host calls act on (see Tracker#retarget); the issue's own by default.
 export function gitlabTracker(o: Project & { issue: number; code?: string }): Tracker {
   const issue = `/issues/${o.issue}`;
   const { request, gl } = projectApi(o);
-  const codeApi = o.code === undefined ? { request, gl } : projectApi({ ...o, project: o.code });
+  const code = gitlabCodeHost({ ...o, project: o.code ?? o.project });
 
   // Every page of a list endpoint, in the API's order, following `x-next-page` (blank on
   // the last page). `path` keeps its own query (sort, per_page); only `page` is added.
@@ -64,10 +94,9 @@ export function gitlabTracker(o: Project & { issue: number; code?: string }): Tr
   return {
     platform: "gitlab",
 
-    async repo() {
-      const p = await codeApi.gl("");
-      return { cloneUrl: p.http_url_to_repo, webUrl: p.web_url, defaultBranch: p.default_branch };
-    },
+    repo: () => code.repo(),
+    ensureBranch: (branch, from) => code.ensureBranch(branch, from),
+    openReview: (input) => code.openReview(input),
 
     async getTicket() {
       const [i, notes] = await Promise.all([gl(issue), glAll(`${issue}/notes?sort=asc&order_by=created_at&per_page=100`)]);
@@ -118,24 +147,6 @@ export function gitlabTracker(o: Project & { issue: number; code?: string }): Tr
       await link(parent, "relates_to");
       if (blockedBy) await link(blockedBy, "blocks");
       return { number: created.iid, url: created.web_url };
-    },
-
-    async ensureBranch(branch, from) {
-      const res = await codeApi.request(`/repository/branches/${encodeURIComponent(branch)}`, {}, [404]);
-      if (res.ok) return false;
-      await codeApi.gl(`/repository/branches?branch=${encodeURIComponent(branch)}&ref=${encodeURIComponent(from)}`, { method: "POST" });
-      return true;
-    },
-
-    // Pushing the branch already updated an open MR; only open one if there isn't one yet.
-    async openReview({ branch, base, title, body }) {
-      const open = await codeApi.gl(`/merge_requests?state=opened&source_branch=${encodeURIComponent(branch)}`);
-      if (Array.isArray(open) && open.length) return { url: open[0].web_url, created: false };
-      const mr = await codeApi.gl("/merge_requests", {
-        method: "POST",
-        body: JSON.stringify({ source_branch: branch, target_branch: base, title, description: body }),
-      });
-      return { url: mr.web_url, created: true };
     },
 
     // A pipeline on the default branch with ISSUE and AGENT_TRIGGER=relay set, which

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyOutcome, buildPrompt, drain, runTicket, trustedDirectives, TurnGauge, type SessionEnd, type WorkerConfig } from "../src/worker.ts";
 import { PublishRejected, type Publisher, type PushResult } from "../src/publish.ts";
-import type { Comment, CreatedIssue, ReviewRequest, SubIssueRequest, Ticket, Tracker } from "../src/tracker.ts";
+import { codePlatformOf, type Comment, type CreatedIssue, type ReviewRequest, type SubIssueRequest, type Ticket, type Tracker } from "../src/tracker.ts";
 import { chainHeader, parseChain } from "../src/chain.ts";
 import { RESUME_HINT } from "../src/dispatch.ts";
 
@@ -96,7 +96,7 @@ const cfgFor = (tracker: Tracker, publisher: Publisher = fakePublisher()): Worke
   pluginDir: "/opt/agent/agent/plugin",
   maxTurns: 80,
 });
-const promptCfg = (tracker: Tracker) => ({ ...cfgFor(tracker), platform: tracker.platform });
+const promptCfg = (tracker: Tracker) => ({ ...cfgFor(tracker), platform: codePlatformOf(tracker) });
 
 test("buildPrompt: trusted author gets title/body and the trusted thread, minus untrusted comments", () => {
   const t = ticket({

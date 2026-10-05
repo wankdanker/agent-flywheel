@@ -31,7 +31,8 @@ export function credentialFromEnv(env: NodeJS.ProcessEnv = process.env): Credent
   throw new Error("model-proxy: no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in env");
 }
 
-export const FORGE_TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "AGENT_GH_TOKEN", "AGENT_GITLAB_TOKEN", "GITLAB_TOKEN", "CI_JOB_TOKEN"];
+// NOTION_TOKEN counts: it can write the Notion ticket (and read the whole board), like a forge token the issue.
+export const FORGE_TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "AGENT_GH_TOKEN", "AGENT_GITLAB_TOKEN", "GITLAB_TOKEN", "CI_JOB_TOKEN", "NOTION_TOKEN"];
 
 // The env the sandboxed agent subprocess actually gets: real credentials stripped, a
 // placeholder key standing in for them, and requests routed through the proxy.

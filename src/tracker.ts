@@ -17,6 +17,8 @@ export type TicketState = keyof typeof STATE_LABELS;
 export type Comment = { author: string; trust: Trust; fromBot: boolean; text: string; at: string };
 
 export type Ticket = {
+  // A forge issue's number; for a Notion ticket (src/notion.ts), the number of its `ID` (PRO-3801 → 3801),
+  // which says nothing about forge issue numbers: see `key`.
   number: number;
   url: string;
   title: string;
@@ -25,6 +27,12 @@ export type Ticket = {
   trust: Trust; // trust of the issue's author; gates whether title/body are usable as instructions
   labels: string[];
   comments: Comment[];
+  // Only on a ticket that isn't a forge issue (a Notion ticket): its display id, e.g. `PRO-3801`. It
+  // names the branch and the PR/MR's reference instead of `#number` (worker.ts's branchFor, issueRef).
+  key?: string;
+  // Only on a Notion ticket: the code project its work lands in, from its repo property, or why that
+  // isn't usable. run.ts's fetchAllowedTicket retargets to it, like a forge issue's `Target:` header.
+  target?: { path: string } | { invalid: string };
 };
 
 export type Repo = { cloneUrl: string; webUrl: string; defaultBranch: string };
@@ -37,8 +45,18 @@ export type SubIssueRequest = NewSubIssue & { runnable: boolean; parent: number;
 export type CreatedIssue = { number: number; url: string };
 export type ReviewRequest = { branch: string; base: string; title: string; body: string };
 
+// Where code lives (clone, push, PR/MR). An issue tracker is one of these too, or Notion, which
+// delegates its code-host calls to one (src/notion.ts).
+export type CodePlatform = "github" | "gitlab";
+export type Platform = CodePlatform | "notion";
+
+// The code-host half of a Tracker, which needs no issue: github.ts's githubCodeHost, gitlab.ts's gitlabCodeHost.
+export type CodeHost = Pick<Tracker, "repo" | "ensureBranch" | "openReview">;
+
 export interface Tracker {
-  platform: "github" | "gitlab";
+  platform: Platform;
+  // The forge the code-host calls go to, when it isn't `platform` itself (a Notion tracker's).
+  codePlatform?: CodePlatform;
   repo(): Promise<Repo>;
   getTicket(): Promise<Ticket>;
   comment(text: string): Promise<void>;
@@ -82,6 +100,10 @@ export interface ChainForge {
   // Merges the PR/MR only if its head is still `sha` (what was tested).
   mergeReview(number: number, sha: string): Promise<void>;
 }
+
+// Which forge clones, pushes and opens the PR/MR for this tracker's runs.
+export const codePlatformOf = (t: Pick<Tracker, "platform" | "codePlatform">): CodePlatform =>
+  t.codePlatform ?? (t.platform as CodePlatform);
 
 export const need = (k: string): string => process.env[k] || (console.error(`missing env ${k}`), process.exit(2));
 
