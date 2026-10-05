@@ -114,6 +114,17 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   from the thread (`chainedRuns`: newest trusted chain marker, reset by a trusted human comment),
   never stored. `test/dispatch.test.ts` runs one fixture matrix
   through all of them (interpreting agent.yml's expression). Dependency-free, like `tracker.ts`.
+- `src/notion.ts` is the Notion ticket source (README's "Notion tickets"): `notionTracker`'s issue
+  calls hit a Notion page (status ↔ labels in `getTicket`, comments through a marker codec, trust
+  from `NOTION_TRUSTED_USERS` and `/users/me`), and its code-host calls delegate to
+  `githubCodeHost`/`gitlabCodeHost` (the issue-free half of the forge trackers) for the ticket's
+  repo property, once `fetchAllowedTicket` has parsed (`Ticket.target`), allowlisted and
+  `retarget`ed it. `Tracker#codePlatform` / `codePlatformOf` says which forge clones and publishes.
+  A Notion ticket has a `key` (`PRO-3801`): it names the branch (`agent/notion-pro-3801`) and the
+  PR/MR trailer, and turns off `Target:` parsing and splits. `bin/list-notion-tickets.ts` (no npm
+  deps) is the poller; `docs/notion-poll.yml` is the workflow a maintainer installs; a poll's
+  `pickup` trigger runs only an unstarted ticket. `test/notion*.test.ts` run it over
+  `test/support/fake-notion.ts`.
 - `src/trust.ts` is the one shared place for "who is trusted": GitHub's `OWNER`/`MEMBER`/`COLLABORATOR` associations, and GitLab's Developer+ membership check (an API call per user id — callers cache it per ticket fetch). `src/gitlab.ts` and `bin/dispatch-gitlab.ts` both call `gitlabMemberTrust` from here rather than duplicating the access-level threshold, so "who can trigger a run" and "whose content the model reads" can't drift apart. Keep it npm-dependency-free like `tracker.ts`.
 - `src/github.ts` and `src/gitlab.ts` are REST adapters built on plain `fetch`. Both attach a `Trust` to the issue (from its author) and to every comment (from that comment's author) when building a `Ticket`.
 - `src/worker.ts`'s `buildPrompt` renders the issue into a prompt, gated by trust (see README's "Trust model"): a trusted-authored issue's title/body/trusted-thread are used as before; an untrusted-authored issue's title/body are never included, and only trusted human comments (`trustedDirectives`) become the task. `runTicket` short-circuits to `agent/blocked` before ever calling the model when an untrusted-authored issue has no trusted directive yet. It then runs `query()` with:
@@ -173,7 +184,8 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - **GitLab:** an issue webhook hits the trigger API. `.gitlab/ci/agent.yml` runs `bin/dispatch-gitlab.ts` on stock `node:24-slim` with **no `npm install`**. The dispatcher filters the `TRIGGER_PAYLOAD` event and emits a child pipeline with one trigger job (holding the per-issue `resource_group`, `strategy: depend`) that runs `.gitlab/agent-stages.yml` (outside `.gitlab/ci/`, so not included by `.gitlab-ci.yml`): `agent-prepare` → `agent-agent` → `agent-publish`, each `docker run`ning the image on dind with only its stage's `-e VAR`s, the work dir tarred in on stdin and `docker cp`'d out, carried between jobs as artifacts, and saved to a native GitLab `cache:` (`when: always`) by the agent job.
 
   Keep `bin/dispatch-gitlab.ts`, `bin/advance-chain.ts` and what they import (`src/tracker.ts`,
-  `src/trust.ts`, `src/dispatch.ts`, `src/chain.ts`, `src/github.ts`, `src/gitlab.ts`) free of npm dependencies.
+  `src/trust.ts`, `src/dispatch.ts`, `src/chain.ts`, `src/github.ts`, `src/gitlab.ts`), and
+  `bin/list-notion-tickets.ts` with `src/notion.ts`, free of npm dependencies.
 - `bin/persist.sh` (bash, no npm deps) is opt-in workspace persistence (README's "Persistent
   workspace images"): with `PERSISTENCE_BUCKET` set, each of the three jobs `restore`s the issue's
   ext4 image from S3/GCS and loop-mounts it (`nosuid,nodev`; `publish` read-only) on the work dir

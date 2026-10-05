@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { dirname, join } from "node:path";
 import { chainedRuns, chainMarker, RESUME_HINT, REVIEW_HINT, recheckTrigger } from "../src/dispatch.ts";
 import {
   DEFAULT_SCHEMA, flattenProperty, fromOwnComment, listPickup, normalizeId, NOTION_RESUME_HINT, notionCodeFromEnv, notionRelay,
@@ -398,4 +402,54 @@ test("sanitizeError: Notion token shapes and NOTION_TOKEN's value are scrubbed",
   const s = sanitizeError(new Error("Notion 401 for ntn_abcdef1234567890 and secret_ABCdef1234567890xyz, also custom-tok-123456789"), { NOTION_TOKEN: "custom-tok-123456789" });
   assert.doesNotMatch(s, /ntn_abc|secret_ABC|custom-tok/);
   assert.equal((s.match(/\[redacted\]/g) ?? []).length, 3);
+});
+
+test("bin/list-notion-tickets.ts and everything it imports are dependency-free (CI runs it on stock node, no npm install)", () => {
+  const seen = new Set<string>();
+  const visit = (file: string) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    for (const m of readFileSync(file, "utf8").matchAll(/^import\s+(?!type\b)[^;]*?from\s+"([^"]+)"/gm)) {
+      const spec = m[1]!;
+      if (spec.startsWith("node:")) continue;
+      assert.ok(spec.startsWith("."), `${file} imports ${spec}`);
+      visit(join(dirname(file), spec));
+    }
+  };
+  visit("bin/list-notion-tickets.ts");
+  assert.ok(seen.has("src/notion.ts"));
+});
+
+test("bin/list-notion-tickets.ts: prints the ready page ids as JSON, at most NOTION_MAX_PICKUP of them", async () => {
+  const id = (k: number) => `${String(k).padStart(8, "0")}-0000-4000-8000-000000000000`;
+  const bodies: any[] = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      bodies.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(raw) });
+      const ready = (k: number) => ({ id: id(k), properties: { Status: { type: "status", status: { name: "To Do" } }, Assignee: { type: "people", people: [{ id: USERS.agent }] } } });
+      res.end(JSON.stringify({ results: [ready(1), ready(2), ready(3)], has_more: false, next_cursor: null }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  try {
+    const run = (extra: Record<string, string>) => new Promise<{ code: number | null; out: string }>((resolve) => {
+      const p = spawn(process.execPath, ["bin/list-notion-tickets.ts"], {
+        env: { PATH: process.env.PATH, NOTION_TOKEN, NOTION_DATA_SOURCE_ID: DATA_SOURCE, NOTION_AGENT_USER_ID: USERS.agent, NOTION_API_URL: `http://127.0.0.1:${port}/v1`, ...extra },
+      });
+      let out = "";
+      p.stdout.on("data", (c) => (out += c));
+      p.on("close", (code) => resolve({ code, out }));
+    });
+    assert.deepEqual(await run({}), { code: 0, out: `${JSON.stringify([id(1), id(2), id(3)])}\n` });
+    assert.deepEqual(await run({ NOTION_MAX_PICKUP: "2" }), { code: 0, out: `${JSON.stringify([id(1), id(2)])}\n` });
+    assert.equal(bodies[0].url, `/v1/data_sources/${DATA_SOURCE}/query`);
+    assert.equal(bodies[0].auth, `Bearer ${NOTION_TOKEN}`);
+    assert.deepEqual(bodies[0].body.filter, pickupFilter(DEFAULT_SCHEMA, USERS.agent));
+    assert.equal((await run({ NOTION_TOKEN: "" })).code, 2, "missing token is a config error");
+  } finally {
+    server.close();
+  }
 });
