@@ -454,10 +454,25 @@ function forgeTracker(cloneUrl: string, over: Partial<Ticket> = {}) {
     },
     async openReview() {
       t.reviews++;
+      t.reviewRepos.push(t.code);
       return { url: "https://example.test/pull/1", created: true };
     },
     async dispatchRelay() {
       t.relays++;
+    },
+    // Code-host calls (repo, openReview) on the GitHub project `path`; the issue's own writes
+    // still land on this same (hub) record.
+    code: cloneUrl,
+    reviewRepos: [] as string[],
+    retargets: [] as string[],
+    retarget(path: string): Tracker {
+      t.retargets.push(path);
+      const url = `https://github.com/${path}.git`;
+      return {
+        ...t,
+        repo: async () => ({ cloneUrl: url, webUrl: url.replace(/\.git$/, ""), defaultBranch: "main" }),
+        openReview: async () => (t.reviews++, t.reviewRepos.push(url), { url: `https://github.com/${path}/pull/1`, created: true }),
+      };
     },
   };
   return t satisfies Tracker;

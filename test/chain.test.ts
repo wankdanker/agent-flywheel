@@ -54,6 +54,7 @@ function fakeForge(o: { released?: number[] } = {}) {
     ensureBranch: async () => { throw new Error("unused"); },
     openReview: async (r) => (reviews.push(r), { url: "https://x/pull/99", created: reviews.length === 1 }),
     dispatchRelay: async () => { throw new Error("unused"); },
+    retarget: () => { throw new Error("unused"); },
   });
   const forge: ChainForge = {
     tracker,
