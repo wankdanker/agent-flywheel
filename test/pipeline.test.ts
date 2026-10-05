@@ -164,6 +164,25 @@ test("sub-issue: the split tool refuses a nested split, and the PR targets the i
   mocked.restore();
 });
 
+test("target: the split tool refuses a split on an issue with a Target: header", async () => {
+  const mocked = mockAgentTurn([
+    { name: "checkpoint", input: { summary: "Part one done.", next_steps: "Part two." } },
+    { name: "split_into_subtasks", input: { summary: "big", subtasks: [{ title: "a", body: "a" }, { title: "b", body: "b" }] } },
+  ]);
+  try {
+    const { runTicket } = await importWorker();
+    const tracker = fakeTracker();
+    const outcome = await runTicket(ticket({ number: 7, url: "https://github.com/acme/hub/issues/7", body: "Target: acme/api\n\nBig job." }), {
+      tracker, repo: await tracker.repo(), workDir: "/tmp/work", pluginDir: "/tmp/plugin", publisher: fakePublisher(), maxTurns: 10,
+    });
+    // Had the tool accepted the split, it would have replaced the checkpoint recorded before it.
+    assert.equal(outcome.kind, "checkpoint");
+    assert.deepEqual(tracker.states, ["blocked"]);
+  } finally {
+    mocked.restore();
+  }
+});
+
 test("blocked work: agent asks a question -> comment posted, label set to blocked", async () => {
   const mocked = mockAgentTurn([{ name: "ask_question", input: { question: "Should pagination be cursor- or offset-based?" } }]);
   const { runTicket } = await importWorker();
