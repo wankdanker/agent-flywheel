@@ -159,3 +159,48 @@ test("gitlab chain: release is one label update, getReview maps the MR, merge pi
   await chain.mergeReview(5, "aaa");
   assert.deepEqual(JSON.parse(calls.at(-1)!.body), { sha: "aaa" });
 });
+
+test("gitlab retarget: repo/ensureBranch/openReview act on the target; getTicket/comment/setState stay on the hub issue", async (t) => {
+  const calls: string[] = [];
+  const api = "https://gitlab.example/api/v4";
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit = {}) => {
+    const method = init.method ?? "GET";
+    calls.push(`${method} ${url}`);
+    const path = url.replace(api, "");
+    if (path === "/projects/group%2Fsub%2Fapi") {
+      return jsonResponse({ http_url_to_repo: "https://gitlab.example/group/sub/api.git", web_url: "https://gitlab.example/group/sub/api", default_branch: "main" });
+    }
+    if (path.endsWith("/repository/branches/agent%2Fissue-9")) return new Response("", { status: 404 });
+    if (path.includes("/repository/branches?")) return jsonResponse({});
+    if (path.includes("/merge_requests?")) return jsonResponse([]);
+    if (path.endsWith("/merge_requests")) return jsonResponse({ web_url: "https://gitlab.example/group/sub/api/-/merge_requests/3" });
+    if (path.includes("/issues/9/notes") && method === "GET") return notesPage([]);
+    if (path.includes("/issues/9/notes")) return jsonResponse({});
+    if (path.includes("/members/all/")) return jsonResponse({ access_level: 40 });
+    if (path.endsWith("/issues/9")) {
+      return jsonResponse({
+        iid: 9, web_url: "https://gitlab.example/group/hub/-/issues/9", title: "t", description: "Target: group/sub/api\n\nb",
+        author: { id: 10, username: "maintainer" }, labels: [],
+      });
+    }
+    throw new Error(`unexpected fetch ${method} ${url}`);
+  });
+  const hub = gitlabTracker({ token: "x", apiUrl: api, project: "group/hub", issue: 9 });
+  const target = hub.retarget("group/sub/api");
+  assert.equal(target.platform, "gitlab");
+
+  assert.equal((await target.repo()).cloneUrl, "https://gitlab.example/group/sub/api.git");
+  assert.equal(await target.ensureBranch("agent/issue-9", "main"), true);
+  assert.deepEqual(await target.openReview({ branch: "agent/issue-9", base: "main", title: "t", body: "Closes x" }), {
+    url: "https://gitlab.example/group/sub/api/-/merge_requests/3", created: true,
+  });
+  const code = calls.splice(0);
+  assert.ok(code.length >= 5);
+  for (const c of code) assert.match(c, /^\w+ https:\/\/gitlab\.example\/api\/v4\/projects\/group%2Fsub%2Fapi(\/|\?|$)/);
+
+  assert.equal((await target.getTicket()).url, "https://gitlab.example/group/hub/-/issues/9");
+  await target.comment("hi");
+  await target.setState("review");
+  assert.ok(calls.length >= 4);
+  for (const c of calls) assert.match(c, /^\w+ https:\/\/gitlab\.example\/api\/v4\/projects\/group%2Fhub\/(issues\/9|members)/);
+});

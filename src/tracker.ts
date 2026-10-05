@@ -58,6 +58,10 @@ export interface Tracker {
   // after a checkpoint (src/stages.ts), capped by MAX_CHAINED_RUNS (src/dispatch.ts). GitHub
   // dispatches agent.yml; GitLab creates a pipeline that bin/dispatch-gitlab.ts picks up.
   dispatchRelay(): Promise<void>;
+  // The same issue, with its code-host calls (repo, ensureBranch, openReview) acting on the
+  // project `path` on the same forge instead: a hub issue's trusted `Target:` header (src/chain.ts).
+  // Issue calls (getTicket, comment, setState, createSubIssue, dispatchRelay) stay on the hub.
+  retarget(path: string): Tracker;
 }
 
 // An open issue carrying `agent/queued`, as advanceChain needs it.

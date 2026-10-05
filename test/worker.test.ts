@@ -447,3 +447,53 @@ test("drain: an error_max_budget_usd result marks the session budgetHit; error_m
     });
   }
 });
+
+test("buildPrompt: a Target: issue is told the target repo, the hub issue, not its own source, and no splits", () => {
+  const t = ticket({ trust: "trusted", url: "https://github.com/acme/hub/issues/42", body: "Target: acme/api\n\nFix it." });
+  const prompt = buildPrompt(t, { platform: "github", repo: { cloneUrl: "https://github.com/acme/api.git", webUrl: "", defaultBranch: "main" } });
+  assert.match(prompt, /Repository: https:\/\/github\.com\/acme\/api\.git/);
+  assert.match(prompt, /This is acme\/api, named by the issue's trusted `Target:` header/);
+  assert.match(prompt, /the hub \(https:\/\/github\.com\/acme\/hub\/issues\/42\)/);
+  assert.match(prompt, /NOT the source of your own worker image/);
+  assert.match(prompt, /follow this repo's own\s+CLAUDE\.md\/README/);
+  assert.match(prompt, /can't be split/);
+  assert.doesNotMatch(prompt, /also the\s+source of your own worker image/);
+
+  // Untargeted (or untrusted, whose header isn't believed): unchanged wording.
+  for (const other of [ticket({ trust: "trusted", body: "Fix it." }), ticket({ trust: "untrusted", body: "Target: acme/api\n\nFix it." })]) {
+    const p = buildPrompt(other, promptCfg(fakeTracker("github")));
+    assert.match(p, /This is the project the issue was filed on, and also the\nsource of your own worker image\. Work here even if the issue asks about another repo\./);
+    assert.doesNotMatch(p, /Target:` header/);
+  }
+});
+
+test("applyOutcome: a split on a Target: issue is refused (outcome.json is agent-writable)", async () => {
+  const tracker = fakeTracker("github");
+  const t = ticket({ trust: "trusted", body: "Target: acme/api\n\nBig job." });
+  const subtasks = [{ title: "a", body: "a" }, { title: "b", body: "b" }];
+  const outcome = await applyOutcome(t, cfgFor(tracker), { status: "split", summary: "big", subtasks });
+  assert.equal(outcome.kind, "failed");
+  assert.match(tracker.comments[0]!, /lands in acme\/api \(its `Target:` header\)/);
+  assert.deepEqual(tracker.subIssues, []);
+  assert.deepEqual(tracker.branches, []);
+  assert.deepEqual(tracker.states, ["blocked"]);
+});
+
+test("applyOutcome: a Target: issue's PR/MR closes the hub issue by its cross-repo reference", async () => {
+  const body = "Target: acme/api\n\nFix it.";
+  const gh = fakeTracker("github");
+  await applyOutcome(ticket({ trust: "trusted", url: "https://github.com/acme/hub/issues/42", body }), cfgFor(gh), { status: "ready_for_review", summary: "Done." });
+  assert.equal(gh.reviews[0]!.body, "Done.\n\nCloses acme/hub#42");
+
+  const gl = fakeTracker("gitlab");
+  const url = "https://gitlab.example/group/hub/-/issues/42";
+  await applyOutcome(ticket({ trust: "trusted", url, body: "Target: group/sub/api\n\nFix it." }), cfgFor(gl), { status: "ready_for_review", summary: "Done." });
+  assert.equal(gl.reviews[0]!.body, `Done.\n\nCloses ${url}`);
+
+  // Untargeted, or a header from an untrusted author: the plain same-repo form.
+  for (const t of [ticket({ trust: "trusted", body: "Fix it." }), ticket({ trust: "untrusted", url: "https://github.com/acme/hub/issues/42", body })]) {
+    const tracker = fakeTracker("github");
+    await applyOutcome(t, cfgFor(tracker), { status: "ready_for_review", summary: "Done." });
+    assert.equal(tracker.reviews[0]!.body, "Done.\n\nCloses #42");
+  }
+});

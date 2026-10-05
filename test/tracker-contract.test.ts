@@ -192,6 +192,37 @@ for (const platform of PLATFORMS) {
     assert.deepEqual(forge.relays, [{ ref: "trunk", issue: "7", trigger: "relay" }]);
   });
 
+  test(`[${platform}] retarget(): code-host calls go to the target project; the issue calls stay on the hub issue`, async (t) => {
+    const { forge, tracker: hub } = setup(t, platform);
+    const tracker = hub.retarget("acme/api");
+    assert.equal(tracker.platform, platform);
+
+    const ticket = await tracker.getTicket();
+    assert.equal(ticket.number, 7);
+    assert.match(ticket.url, /acme\/widgets\/(-\/)?issues\/7$/);
+    await tracker.comment("from the target run");
+    await tracker.setState("review");
+    await tracker.dispatchRelay();
+    assert.deepEqual(forge.botComments(), ["from the target run"]);
+    assert.deepEqual(stateLabels(forge.labels), [STATE_LABELS.review]);
+    assert.equal(forge.relays.length, 1);
+    // (GitHub's GraphQL `viewer`, the worker's own identity, isn't per-repo.)
+    const issueCalls = forge.requests.filter((r) => !r.url.endsWith("/graphql"));
+    assert.ok(issueCalls.every((r) => /acme(\/|%2F)widgets/.test(r.url)), "an issue call left the hub");
+
+    // This fake forge only serves the hub project, so the target's calls fail here; what matters
+    // is where they went, and that none of them touched the hub.
+    for (const call of [() => tracker.repo(), () => tracker.ensureBranch("agent/issue-7", "main"),
+      () => tracker.openReview({ branch: "agent/issue-7", base: "main", title: "t", body: "Closes acme/widgets#7" })]) {
+      forge.requests = [];
+      await call().catch(() => undefined);
+      assert.ok(forge.requests.length > 0);
+      for (const r of forge.requests) assert.match(new URL(r.url).pathname, /\/(repos\/acme\/api|projects\/acme%2Fapi)(\/|$)/);
+    }
+    assert.equal(forge.reviews.length, 0);
+    assert.equal(forge.branches.size, 0);
+  });
+
   test(`[${platform}] every request authenticates; API failures name the call and status but never the token`, async (t) => {
     const calls: [string, RegExp, (tr: Tracker) => Promise<unknown>][] = [
       ["GET", /\/(widgets|acme%2Fwidgets)$/, (tr) => tr.repo()],

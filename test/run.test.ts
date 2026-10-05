@@ -61,6 +61,9 @@ function fakeTracker(fail: Fail = {}, comments: Comment[] = []) {
     async dispatchRelay() {
       throw new Error("main() never relays");
     },
+    retarget(): Tracker {
+      throw new Error("no Target: header here");
+    },
   };
   return t satisfies Tracker;
 }

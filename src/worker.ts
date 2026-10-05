@@ -1,13 +1,13 @@
 import { query, tool, createSdkMcpServer, type HookCallbackMatcher, type HookEvent, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { baseBranchFor, chainHeader, chainOf, integrationBranch, MAX_SUBTASKS } from "./chain.ts";
+import { baseBranchFor, chainHeader, chainOf, integrationBranch, MAX_SUBTASKS, targetRepo } from "./chain.ts";
 import { RESUME_HINT, REVIEW_HINT } from "./dispatch.ts";
 import { PublishRejected, type Publisher, type PushResult } from "./publish.ts";
 import type { Comment, CreatedIssue, NewSubIssue, Repo, Ticket, Tracker } from "./tracker.ts";
 
 export type WorkerConfig = {
   tracker: Tracker;
-  repo: Repo;            // the project the issue lives on; our own source by default
+  repo: Repo;            // the issue's `Target:` repo, else the project it lives on (our own source by default)
   workDir: string;       // the repo, already cloned here before the agent starts
   pluginDir: string;     // our baked-in skills/agents/hooks
   model?: string;
@@ -104,6 +104,16 @@ export function buildPrompt(t: Ticket, cfg: Pick<SessionConfig, "platform" | "re
       `targets ${base}, not ${cfg.repo.defaultBranch}. A sub-issue can't be split again: if it runs long, commit and \`checkpoint\`.`
     : "";
 
+  const target = targetRepo(t);
+  const where = target
+    ? `This is ${target}, named by the issue's trusted \`Target:\` header. The issue itself lives on another
+repo, the hub (${t.url}). This is NOT the source of your own worker image: follow this repo's own
+CLAUDE.md/README for build and test. Work here even if the issue asks about another repo.
+This issue can't be split into sub-issues (splits can't land in a Target: repo yet): if it runs long,
+commit and \`checkpoint\`.`
+    : `This is the project the issue was filed on, and also the
+source of your own worker image. Work here even if the issue asks about another repo.`;
+
   return `${task}
 
 <comment_thread>
@@ -111,8 +121,7 @@ ${thread}
 </comment_thread>
 
 Repository: ${cfg.repo.cloneUrl} (default branch ${cfg.repo.defaultBranch}), already cloned into your
-working directory on branch ${branchFor(t)}. This is the project the issue was filed on, and also the
-source of your own worker image. Work here even if the issue asks about another repo.
+working directory on branch ${branchFor(t)}. ${where}
 You have no forge credentials: you can't push, open the ${review}, or edit the issue yourself. Commit your
 work on ${branchFor(t)} and call an outcome tool; a trusted publisher pushes the branch and opens the
 ${review} after your session ends. See the \`${skill}\` skill.${chain}`;
@@ -257,10 +266,21 @@ export async function settle(outcome: Outcome, writes: (() => Promise<unknown>)[
   return outcome;
 }
 
+// How the PR/MR body names the issue it closes. In a `Target:` repo a bare `#N` would point at
+// that repo's own issue N, so it's the hub issue's cross-repo form, which both closing-keyword
+// parsers accept: `owner/repo#N` on GitHub, the full issue URL on GitLab.
+export function issueRef(t: Ticket, platform: Tracker["platform"]): string {
+  if (!targetRepo(t)) return `#${t.number}`;
+  const gh = platform === "github" ? /^https?:\/\/[^/]+\/([^/]+\/[^/]+)\/issues\/(\d+)$/.exec(t.url) : null;
+  return gh ? `${gh[1]}#${gh[2]}` : t.url;
+}
+
 // Why a split of `t` into `count` sub-issues isn't allowed, or undefined if it is.
 export function splitRefusal(t: Ticket, count: number): string | undefined {
   const link = chainOf(t);
   if (link) return `this is already sub-issue ${link.index} of ${link.total} of #${link.parent}, and a sub-issue can't be split again.`;
+  const target = targetRepo(t);
+  if (target) return `this issue's work lands in ${target} (its \`Target:\` header), and a split's sub-issues can't work in another repo yet.`;
   if (count > MAX_SUBTASKS) return `${count} sub-issues is over the limit of ${MAX_SUBTASKS} per split.`;
   return undefined;
 }
@@ -344,7 +364,7 @@ export async function applyOutcome(
           branch: branchFor(t),
           base: baseBranchFor(t, cfg.repo.defaultBranch),
           title: t.title,
-          body: `${recorded.summary}\n\n${link ? `Part of #${link.parent} (sub-issue ${link.index} of ${link.total}). ` : ""}Closes #${t.number}`,
+          body: `${recorded.summary}\n\n${link ? `Part of #${link.parent} (sub-issue ${link.index} of ${link.total}). ` : ""}Closes ${issueRef(t, tracker.platform)}`,
         });
       } catch (err) {
         throw new SettlementError(reached, [err]);
