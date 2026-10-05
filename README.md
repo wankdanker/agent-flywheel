@@ -133,6 +133,47 @@ PR/MR merged by hand advances the chain the same way.
 The auto-merge gate is the sub-issue's own tests, which the sub-issue's code (including its copy
 of `chain-test.yml`) could weaken; that's why the final integration PR/MR keeps the human gate.
 
+### Cross-repo work (`Target:`)
+
+An issue filed on this repo (the hub) can do its work in another repo on the same forge. A
+trusted author puts a `Target:` line in the issue body's first paragraph, the same header block a
+chain header uses (and it can sit alongside one):
+
+```text
+Target: owner/repo
+
+<the rest of the issue>
+```
+
+The value is a repo path on the hub's own forge: `owner/repo` on GitHub, `group/sub/project` on
+GitLab. A URL, a host, `..`, whitespace, a trailing `.git` or more than one `Target:` line is a
+config error: the run blocks with a comment saying what's wrong, never silently ignores it. No
+header means the issue's own repo, as before.
+
+With a valid header, the run clones, validates, pushes and opens its PR/MR in the target
+(`Tracker#retarget`), while the labels, comments and relays stay on the hub issue. The PR/MR body
+closes the hub issue by its cross-repo form (`Closes owner/hub#N` on GitHub, `Closes <issue URL>`
+on GitLab), since a bare `#N` would name the target's own issue N. A cached or persisted work dir
+must be a clone of exactly the repo the run is for, not just any allowlisted one, so editing the
+header between runs blocks rather than working in the old clone. A targeted issue can't be split
+(the chain machinery assumes the hub repo); the agent is told to checkpoint instead.
+
+What it needs:
+
+- **The forge token must reach every target.** `GH_TOKEN`/`AGENT_GH_TOKEN` and
+  `AGENT_GITLAB_TOKEN` are still the only forge credentials, now used against the target too.
+  - GitHub: a GitHub App installation token or fine-grained PAT scoped to the hub plus the target
+    repos (contents, issues and pull requests read/write). The default `GITHUB_TOKEN` can't
+    reach other repos.
+  - GitLab: a group access token covering the targets, or one project token per target.
+- **Every target must be in `AGENT_REPO_ALLOWLIST`.** Once the variable is set, the hub isn't
+  implied any more, so list it too, e.g. `AGENT_REPO_ALLOWLIST=acme/hub,acme/api,acme/web`. A
+  target outside the list is refused (exit 2) before any label, clone or model call, and the log
+  names both the hub issue and the target.
+
+Cross-forge targets, cross-repo split chains, and routing an issue to a target automatically are
+not supported yet.
+
 ### Stateless iteration, durable checkpoints
 
 The container and the model's context are ephemeral. The git remote and the issue thread are
@@ -268,6 +309,12 @@ What this means per issue:
   With no trusted directive on file, the run sets `agent/blocked` and comments explaining
   that a maintainer needs to approve or restate the task; a later trusted comment resumes
   it.
+
+Which repo a run works in is a separate, narrower question. It's the repo the issue lives on,
+unless the issue's *author* is trusted and its body starts with a `Target:` header (see
+"Cross-repo work"); that header is the only thing that can choose another repo, and it's still
+bounded by `AGENT_REPO_ALLOWLIST`. Prose in the body, comments (trusted directives included) and
+an untrusted author's header never retarget a run.
 
 ### Worker bot identity
 

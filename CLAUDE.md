@@ -37,7 +37,12 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
   - builds a `Tracker`;
   - checks the ticket's repo against the allowlist (`src/allowlist.ts`, `AGENT_REPO_ALLOWLIST`,
     defaulting to just `GITHUB_REPOSITORY`/`CI_PROJECT_PATH`) and refuses (exit 2, no clone) if
-    it isn't listed;
+    it isn't listed. `fetchAllowedTicket` first honors a trusted author's `Target:` header
+    (`src/chain.ts`'s `targetOf`; README's "Cross-repo work"): it swaps to
+    `Tracker#retarget(path)`, whose code-host calls (`repo`, `ensureBranch`, `openReview`) act on
+    that repo while the issue calls stay on the hub, and returns that tracker for the rest of the
+    run. An invalid header blocks with a comment (`refuseInvalidTarget`), and `checkOrigin`
+    requires the work dir's origin to be exactly the run's repo;
   - sets `agent/working`, and from there on guarantees a terminal label: everything up to the
     settled outcome runs in a `try/catch`, and if no `review`/`blocked` label landed (tracked by
     `guardTracker`, which also skips a comment identical to one already posted, so retries don't
