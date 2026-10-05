@@ -81,7 +81,8 @@ There is no build step: Node 24 runs the `.ts` files directly. So:
     env, credential files or any git config scope): `runSession` (`src/worker.ts`, the session
     half of `runTicket` without the tracker writes) and write `outcome.json`. No tracker at all.
   - `publishStage` (forge token; exits 2 on a model credential): re-fetch the issue, no-op
-    unless it's still `working`, `readOutcome`, then `applyOutcome` with the publisher. On a
+    unless it's still `working`, refuse if `prepared.json`'s repo isn't the one the issue
+    targets now (a `Target:` edited mid-run), `readOutcome`, then `applyOutcome` with the publisher. On a
     `checkpoint` it then auto-relays (`relayCheckpoint`): posts an announcement with a hidden
     `chainMarker(n)` and calls `Tracker#dispatchRelay` (GitHub `workflow_dispatch` of `agent.yml`
     with `trigger: relay`; GitLab an `api` pipeline with `AGENT_TRIGGER=relay`), unless

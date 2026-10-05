@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { repoIdentifier } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo } from "./clone.ts";
 import { chainedRuns, chainMarker, CONTINUE_COMMAND, RESUME_HINT, type Trigger } from "./dispatch.ts";
@@ -204,6 +205,15 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
 
   return guarded(guard, ticket, env, async () => {
     const workDir = workDirFor(env, ticket.number);
+    // A `Target:` header edited since the prepare stage would otherwise push this clone's branch
+    // into a different repo than the one it came from.
+    const prepared = readPrepared(workDir);
+    if (prepared && repoIdentifier(prepared.repo.cloneUrl) !== repoIdentifier(repo.cloneUrl)) {
+      throw new ConfigError(
+        `refusing to publish: ${workDir} was prepared for ${repoIdentifier(prepared.repo.cloneUrl)}, but this issue now works in ` +
+          `${repoIdentifier(repo.cloneUrl)} (was its Target: header edited mid-run?). Nothing was pushed.`,
+      );
+    }
     const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: baseBranchFor(ticket, repo.defaultBranch) };
     const cfg: WorkerConfig = {
       tracker: guard.tracker,

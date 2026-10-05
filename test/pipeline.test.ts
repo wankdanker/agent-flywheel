@@ -783,3 +783,29 @@ test("target: an invalid Target: header blocks with a comment, before any clone 
     }
   }
 });
+
+test("target: a Target: header edited between prepare and publish blocks the publish; nothing is pushed anywhere", async () => {
+  const { prepareStage, agentStage, publishStage } = await import("../src/stages.ts");
+  const over = { url: HUB_URL, body: "Target: acme/api\n\nFix it." };
+  const tracker = forgeTracker(REPO_A, over);
+  const e = stageEnvs(BOTH);
+  const { deps, seen } = stageDeps(tracker);
+  const cwd = process.cwd();
+  process.chdir(e.root);
+  try {
+    const { result: codes } = await quietly(async () => {
+      const prepared = await prepareStage({ ...deps, env: e.prepare });
+      const agent = await agentStage({ ...deps, env: e.agent });
+      over.body = "Fix it."; // back to the hub repo, mid-run
+      return [prepared, agent, await publishStage({ ...deps, env: e.publish })];
+    });
+    assert.deepEqual(codes, [0, 0, 2]);
+  } finally {
+    process.chdir(cwd);
+  }
+  assert.deepEqual(seen.clones, [TARGET]);
+  assert.equal(seen.pushes, 0);
+  assert.equal(tracker.reviews, 0);
+  assert.deepEqual(tracker.states, ["working", "blocked"]);
+  assert.match(tracker.comments[0]!, /was prepared for acme\/api, but this issue now works in acme\/widgets/);
+});

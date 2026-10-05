@@ -155,7 +155,8 @@ With a valid header, the run clones, validates, pushes and opens its PR/MR in th
 closes the hub issue by its cross-repo form (`Closes owner/hub#N` on GitHub, `Closes <issue URL>`
 on GitLab), since a bare `#N` would name the target's own issue N. A cached or persisted work dir
 must be a clone of exactly the repo the run is for, not just any allowlisted one, so editing the
-header between runs blocks rather than working in the old clone. A targeted issue can't be split
+header between runs blocks rather than working in the old clone; so does editing it between the
+prepare and publish jobs of one run, before anything is pushed. A targeted issue can't be split
 (the chain machinery assumes the hub repo); the agent is told to checkpoint instead.
 
 What it needs:
