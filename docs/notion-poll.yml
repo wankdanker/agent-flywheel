@@ -1,0 +1,290 @@
+# Work Notion tickets with the agent image (README "Notion tickets"). A maintainer copies this file
+# to .github/workflows/notion-poll.yml: the agent's own token can't write workflow files.
+#
+# Two kinds of run, one file:
+#   poll   (schedule, or a manual dispatch with no page): bin/list-notion-tickets.ts lists the
+#          tickets in To Do assigned to NOTION_AGENT_USER_ID, and dispatches this workflow once per
+#          ticket with `page` set and `trigger: pickup`. Notion token + this repo's GITHUB_TOKEN
+#          (actions: write) only.
+#   page   (a dispatch with `page`): prepare → agent → publish for that one ticket, exactly as
+#          agent.yml does for an issue, with AGENT_PLATFORM=notion. After a checkpoint the publish
+#          stage dispatches this workflow again for the page with `trigger: relay`, at most
+#          MAX_CHAINED_RUNS times in a row.
+# A ticket already Doing/Blocked/Needs Review is never listed, and a pickup re-checks the live status
+# (exit 30 if it's no longer To Do), so polls never pile runs onto one ticket.
+#
+# Secrets: NOTION_TOKEN (an internal integration with read content, update content, read and insert
+# comments, shared with the Tickets database only); ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN;
+# AGENT_GITLAB_TOKEN when code lands on GitLab (api + write_repository on the target projects), or
+# AGENT_GH_TOKEN when it lands on GitHub.
+# Variables: NOTION_DATA_SOURCE_ID (the Tickets data source), NOTION_AGENT_USER_ID,
+# NOTION_TRUSTED_USERS, NOTION_CODE_PLATFORM (gitlab | github), NOTION_GITLAB_API_URL (e.g.
+# https://gitlab.example.com/api/v4), AGENT_REPO_ALLOWLIST (e.g. group/**); optional NOTION_*_PROPERTY /
+# NOTION_STATUS_* overrides, NOTION_MAX_PICKUP, AGENT_IMAGE, CLAUDE_MODEL, MAX_TURNS, MAX_BUDGET_USD,
+# MAX_CHAINED_RUNS.
+name: notion
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      page:
+        description: Notion page id of one ticket (empty = poll for To Do tickets)
+        required: false
+      trigger:
+        description: manual, pickup (what the poll sends) or relay (what a checkpoint sends)
+        required: false
+        type: choice
+        options: [manual, pickup, relay]
+        default: manual
+      image:
+        description: Image to run (default vars.AGENT_IMAGE, then :latest)
+        required: false
+
+permissions:
+  contents: read
+
+# One run per ticket at a time, across its three jobs; polls queue behind each other.
+concurrency:
+  group: ${{ inputs.page && format('notion-page-{0}', inputs.page) || 'notion-poll' }}
+  cancel-in-progress: false
+
+env:
+  AGENT_PLATFORM: notion
+  NOTION_PAGE_ID: ${{ inputs.page }}
+  # The Notion schema (defaults are the Tickets database's; see README "Notion tickets").
+  NOTION_TITLE_PROPERTY: ${{ vars.NOTION_TITLE_PROPERTY }}
+  NOTION_ID_PROPERTY: ${{ vars.NOTION_ID_PROPERTY }}
+  NOTION_STATUS_PROPERTY: ${{ vars.NOTION_STATUS_PROPERTY }}
+  NOTION_ASSIGNEE_PROPERTY: ${{ vars.NOTION_ASSIGNEE_PROPERTY }}
+  NOTION_REPO_PROPERTY: ${{ vars.NOTION_REPO_PROPERTY }}
+  NOTION_REVIEW_LINK_PROPERTY: ${{ vars.NOTION_REVIEW_LINK_PROPERTY }}
+  NOTION_STATUS_TODO: ${{ vars.NOTION_STATUS_TODO }}
+  NOTION_STATUS_DOING: ${{ vars.NOTION_STATUS_DOING }}
+  NOTION_STATUS_BLOCKED: ${{ vars.NOTION_STATUS_BLOCKED }}
+  NOTION_STATUS_REVIEW: ${{ vars.NOTION_STATUS_REVIEW }}
+  NOTION_AGENT_USER_ID: ${{ vars.NOTION_AGENT_USER_ID }}
+
+jobs:
+  poll:
+    if: ${{ !inputs.page }}
+    permissions:
+      contents: read
+      actions: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Stock node, no npm install: bin/list-notion-tickets.ts is dependency-free.
+      - name: Dispatch a run per ticket ready for pickup
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
+          NOTION_MAX_PICKUP: ${{ vars.NOTION_MAX_PICKUP }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pages="$(node bin/list-notion-tickets.ts)"
+          echo "ready: $pages"
+          for page in $(jq -r '.[]' <<<"$pages"); do
+            gh workflow run notion-poll.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f page="$page" -f trigger=pickup
+          done
+
+  prepare:
+    if: ${{ inputs.page }}
+    cache-mode: write
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      proceed: ${{ steps.prepare.outputs.proceed }}
+      image: ${{ steps.image.outputs.image }}
+      work-key: ${{ steps.prepare.outputs.work-key }}
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Pull the agent image
+        id: image
+        env:
+          IMAGE: ${{ inputs.image || vars.AGENT_IMAGE }}
+        run: |
+          image="${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}:latest}"
+          docker pull "$image" || { echo "::error::No agent image $image. Run the build workflow first."; exit 2; }
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image" 2>/dev/null || true)"
+          echo "image=${digest:-$image}" >> "$GITHUB_OUTPUT"
+      - name: Restore work directory cache
+        uses: actions/cache/restore@v4
+        with:
+          path: agent-work
+          key: notion-work-${{ inputs.page }}-${{ github.run_id }}-${{ github.run_attempt }}-prepared
+          restore-keys: |
+            notion-work-${{ inputs.page }}-
+      # The Notion token and the code host's token; no model credential.
+      - name: Prepare the work directory
+        id: prepare
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_TRUSTED_USERS: ${{ vars.NOTION_TRUSTED_USERS }}
+          NOTION_CODE_PLATFORM: ${{ vars.NOTION_CODE_PLATFORM }}
+          AGENT_GITLAB_TOKEN: ${{ secrets.AGENT_GITLAB_TOKEN }}
+          CI_API_V4_URL: ${{ vars.NOTION_GITLAB_API_URL }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          AGENT_REPO_ALLOWLIST: ${{ vars.AGENT_REPO_ALLOWLIST }}
+          AGENT_TRIGGER: ${{ inputs.trigger }}
+          MAX_CHAINED_RUNS: ${{ vars.MAX_CHAINED_RUNS }}
+        run: |
+          mkdir -p agent-work
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+          sudo chown -R "$uid:$uid" agent-work
+          set +e
+          docker run --rm -e AGENT_PLATFORM -e NOTION_PAGE_ID -e NOTION_TOKEN -e NOTION_TRUSTED_USERS -e NOTION_AGENT_USER_ID \
+            -e NOTION_TITLE_PROPERTY -e NOTION_ID_PROPERTY -e NOTION_STATUS_PROPERTY -e NOTION_ASSIGNEE_PROPERTY -e NOTION_REPO_PROPERTY \
+            -e NOTION_REVIEW_LINK_PROPERTY -e NOTION_STATUS_TODO -e NOTION_STATUS_DOING -e NOTION_STATUS_BLOCKED -e NOTION_STATUS_REVIEW \
+            -e NOTION_CODE_PLATFORM -e AGENT_GITLAB_TOKEN -e CI_API_V4_URL -e GH_TOKEN -e GITHUB_API_URL -e GITHUB_REPOSITORY \
+            -e AGENT_REPO_ALLOWLIST -e AGENT_TRIGGER -e MAX_CHAINED_RUNS \
+            -v "$PWD/agent-work:/work" \
+            "$IMAGE" --stage prepare
+          code=$?
+          echo "work-key=notion-work-$NOTION_PAGE_ID-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-prepared" >> "$GITHUB_OUTPUT"
+          if [ "$code" = 0 ]; then echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # 10 = blocked before the agent started (an untrusted ticket awaiting a trusted user's go-ahead).
+          if [ "$code" = 10 ]; then echo "::notice::$NOTION_PAGE_ID is waiting on a trusted user"; exit 0; fi
+          # 30 = the trigger no longer applies (e.g. the ticket isn't To Do any more); nothing touched.
+          if [ "$code" = 30 ]; then echo "::notice::$NOTION_PAGE_ID: nothing to run ($AGENT_TRIGGER no longer applies)"; exit 0; fi
+          exit "$code"
+      - name: Hand the work directory to the agent job
+        uses: actions/cache/save@v4
+        with:
+          path: agent-work
+          key: ${{ steps.prepare.outputs.work-key }}
+
+  agent:
+    needs: prepare
+    if: needs.prepare.outputs.proceed == 'true'
+    cache-mode: write
+    # No contents/issues scopes, and no Notion or forge token: nothing here can write anywhere.
+    permissions:
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      work-key: ${{ steps.key.outputs.work-key }}
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Restore the prepared work directory
+        uses: actions/cache/restore@v4
+        with:
+          path: agent-work
+          key: ${{ needs.prepare.outputs.work-key }}
+          fail-on-cache-miss: true
+      - name: Name this job's work directory save
+        id: key
+        run: echo "work-key=notion-work-$NOTION_PAGE_ID-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-agent" >> "$GITHUB_OUTPUT"
+      # The model credential and nothing else secret. `--stage agent` refuses to start if a forge
+      # or Notion token reaches it anyway (env, credential files or git config).
+      - name: Run the agent
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          MAX_TURNS: ${{ vars.MAX_TURNS }}
+          MAX_BUDGET_USD: ${{ vars.MAX_BUDGET_USD }}
+        run: |
+          docker pull "$IMAGE"
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+          sudo chown -R "$uid:$uid" agent-work
+          docker run --rm -e AGENT_PLATFORM -e NOTION_PAGE_ID \
+            -e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN -e CLAUDE_MODEL -e MAX_TURNS -e MAX_BUDGET_USD \
+            -v "$PWD/agent-work:/work" \
+            "$IMAGE" --stage agent
+      - name: Save work directory cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: agent-work
+          key: ${{ steps.key.outputs.work-key }}
+
+  publish:
+    needs: [prepare, agent]
+    if: always() && needs.prepare.outputs.proceed == 'true'
+    permissions:
+      # actions: write is for the auto-relay's workflow_dispatch of this workflow (GH_TOKEN below).
+      actions: write
+      contents: read
+      packages: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Restore the agent's work directory
+        uses: actions/cache/restore@v4
+        with:
+          path: agent-work
+          key: ${{ needs.agent.outputs.work-key || 'none' }}
+      # The Notion token and the code host's token; no model credential. The work dir is only
+      # read as data (src/handoff.ts, src/publish.ts).
+      - name: Publish the outcome
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_TRUSTED_USERS: ${{ vars.NOTION_TRUSTED_USERS }}
+          NOTION_CODE_PLATFORM: ${{ vars.NOTION_CODE_PLATFORM }}
+          AGENT_GITLAB_TOKEN: ${{ secrets.AGENT_GITLAB_TOKEN }}
+          CI_API_V4_URL: ${{ vars.NOTION_GITLAB_API_URL }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          AGENT_REPO_ALLOWLIST: ${{ vars.AGENT_REPO_ALLOWLIST }}
+          MAX_TURNS: ${{ vars.MAX_TURNS }}
+          MAX_CHAINED_RUNS: ${{ vars.MAX_CHAINED_RUNS }}
+        run: |
+          docker pull "$IMAGE"
+          mkdir -p agent-work
+          uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
+          sudo chown -R "$uid:$uid" agent-work
+          set +e
+          docker run --rm -e AGENT_PLATFORM -e NOTION_PAGE_ID -e NOTION_TOKEN -e NOTION_TRUSTED_USERS -e NOTION_AGENT_USER_ID \
+            -e NOTION_TITLE_PROPERTY -e NOTION_ID_PROPERTY -e NOTION_STATUS_PROPERTY -e NOTION_ASSIGNEE_PROPERTY -e NOTION_REPO_PROPERTY \
+            -e NOTION_REVIEW_LINK_PROPERTY -e NOTION_STATUS_TODO -e NOTION_STATUS_DOING -e NOTION_STATUS_BLOCKED -e NOTION_STATUS_REVIEW \
+            -e NOTION_CODE_PLATFORM -e AGENT_GITLAB_TOKEN -e CI_API_V4_URL -e GH_TOKEN -e GITHUB_API_URL -e GITHUB_REPOSITORY \
+            -e AGENT_REPO_ALLOWLIST -e MAX_TURNS -e MAX_CHAINED_RUNS \
+            -v "$PWD/agent-work:/work" \
+            "$IMAGE" --stage publish
+          code=$?
+          if [ "$code" = 10 ]; then echo "::notice::Asked a question on $NOTION_PAGE_ID"; exit 0; fi
+          if [ "$code" = 20 ]; then echo "::notice::Checkpointed $NOTION_PAGE_ID (see the ticket for whether it relayed)"; exit 0; fi
+          exit "$code"
+
+  # What the stages can't catch themselves (a container killed by a timeout or a cancel): a ticket
+  # left Doing goes to Blocked with a comment, as agent.yml's unstick does for agent/working.
+  unstick:
+    needs: [prepare, agent, publish]
+    if: (failure() || cancelled()) && needs.prepare.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Unstick Doing
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: |
+          api=https://api.notion.com/v1
+          h=(-H "Authorization: Bearer $NOTION_TOKEN" -H "Notion-Version: 2025-09-03" -H "Content-Type: application/json")
+          status_prop="${NOTION_STATUS_PROPERTY:-Status}"
+          doing="${NOTION_STATUS_DOING:-Doing}"
+          now="$(curl -fsS "${h[@]}" "$api/pages/$NOTION_PAGE_ID" | jq -r --arg p "$status_prop" '.properties[$p].status.name // ""')"
+          if [ "$now" = "$doing" ]; then
+            jq -n --arg p "$status_prop" --arg s "${NOTION_STATUS_BLOCKED:-Blocked}" '{properties: {($p): {status: {name: $s}}}}' |
+              curl -fsS -X PATCH "${h[@]}" "$api/pages/$NOTION_PAGE_ID" -d @- >/dev/null
+            jq -n --arg page "$NOTION_PAGE_ID" --arg logs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              '{parent: {page_id: $page}, rich_text: [{text: {content: "🤖 Agent Flywheel"}, annotations: {bold: true}},
+                {text: {content: "\n\nThe run was stopped (timed out or cancelled) before it could finish, so I have marked this ticket Blocked. Logs: \($logs). Move it back to To Do to have me retry.\n\n"}},
+                {text: {content: "‹agent-flywheel›"}, annotations: {color: "gray"}}]}' |
+              curl -fsS -X POST "${h[@]}" "$api/comments" -d @- >/dev/null
+          fi
