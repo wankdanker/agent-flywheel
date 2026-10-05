@@ -45,6 +45,49 @@ export function parseChain(body: string): ChainLink | undefined {
 // A ticket's place in a chain, trusting the header only from a trusted author.
 export const chainOf = (t: Pick<Ticket, "body" | "trust">): ChainLink | undefined => (t.trust === "trusted" ? parseChain(t.body) : undefined);
 
+// A hub issue can name the repo its work lands in (#63): a `Target: owner/repo` line in the same
+// first-paragraph header block, alongside a chain header or not. The value is a project path on
+// the hub's own forge, never a URL or host, so the forge token and API stay the hub's. Like the
+// chain header, it's only believed from a trusted author (targetOf), and it's still bounded by
+// AGENT_REPO_ALLOWLIST (run.ts's fetchAllowedTicket). Any `Target:` line in the header block that
+// isn't exactly one valid path is `invalid`, which blocks the run: never silently ignored.
+export type TargetHeader = { path: string } | { invalid: string };
+
+const SEGMENT = /^[A-Za-z0-9_.-]+$/;
+
+export function parseTarget(body: string, platform?: "github" | "gitlab"): TargetHeader | undefined {
+  const head = body.replace(/\r\n/g, "\n").split("\n\n")[0]!;
+  const lines = head.split("\n").filter((l) => /^\s*target\s*:/i.test(l));
+  if (!lines.length) return undefined;
+  if (lines.length > 1) return { invalid: `the issue has ${lines.length} \`Target:\` lines; give exactly one` };
+  const m = /^Target: (.*)$/.exec(lines[0]!.replace(/\s+$/, ""));
+  const value = m?.[1] ?? "";
+  const bad = (why: string) => ({ invalid: `\`${lines[0]!.trim().replace(/`/g, "'").slice(0, 200)}\` isn't a valid target: ${why}` });
+  if (!m) return bad("write it as `Target: owner/repo`");
+  if (!value) return bad("it names no repo");
+  if (/\s/.test(value)) return bad("a repo path can't contain whitespace");
+  if (/:\/\/|^[^/]*:|@/.test(value)) return bad("give a repo path on this forge (owner/repo), not a URL or a host");
+  if (/\.git$/i.test(value)) return bad("drop the trailing .git");
+  const segments = value.split("/");
+  if (segments.some((s) => !s)) return bad("a repo path can't have empty segments or a leading/trailing slash");
+  if (segments.some((s) => s === "." || s === "..")) return bad("a repo path can't contain `.` or `..`");
+  if (!segments.every((s) => SEGMENT.test(s))) return bad("a repo path may only contain letters, digits, `_`, `-` and `.`");
+  if (segments.length < 2) return bad("give the full path, owner/repo");
+  if (segments[0]!.includes(".")) return bad("that looks like a host; give a repo path on this forge (owner/repo)");
+  if (platform === "github" && segments.length !== 2) return bad("a GitHub repo is exactly owner/repo");
+  return { path: value };
+}
+
+// A ticket's target header, believed only from a trusted author (same rule as chainOf).
+export const targetOf = (t: Pick<Ticket, "body" | "trust">, platform?: "github" | "gitlab"): TargetHeader | undefined =>
+  t.trust === "trusted" ? parseTarget(t.body, platform) : undefined;
+
+// The valid target repo path, if the ticket has one.
+export const targetRepo = (t: Pick<Ticket, "body" | "trust">): string | undefined => {
+  const h = targetOf(t);
+  return h && "path" in h ? h.path : undefined;
+};
+
 // What a run starts from, is validated against, and targets with its PR/MR.
 export const baseBranchFor = (t: Pick<Ticket, "body" | "trust">, defaultBranch: string) => {
   const link = chainOf(t);

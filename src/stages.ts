@@ -14,7 +14,6 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isAllowedRepo } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo } from "./clone.ts";
 import { chainedRuns, chainMarker, CONTINUE_COMMAND, RESUME_HINT, type Trigger } from "./dispatch.ts";
@@ -22,8 +21,8 @@ import { clearOutcome, HandoffError, readOutcome, readPrepared, resetHandoff, wr
 import { FORGE_TOKEN_VARS, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
 import { gitPublisher } from "./publish.ts";
 import {
-  ConfigError, configExit, credentialFor, DEFAULT_PLUGIN_DIR, detectTracker, EXIT_CODES, EXIT_SKIPPED, fetchAllowedTicket, guarded,
-  guardTracker, parseMaxBudgetUsd, parseMaxChainedRuns, parseMaxTurns, parseTrigger, publishAfterCrash, requireModelCredential, settleIncomplete, startProxyFromEnv, triggerStillApplies,
+  checkOrigin, ConfigError, configExit, credentialFor, DEFAULT_PLUGIN_DIR, detectTracker, EXIT_CODES, EXIT_SKIPPED, fetchAllowedTicket, guarded,
+  guardTracker, parseMaxBudgetUsd, parseMaxChainedRuns, parseMaxTurns, parseTrigger, publishAfterCrash, refuseInvalidTarget, requireModelCredential, settleIncomplete, startProxyFromEnv, triggerStillApplies,
   workDirFor, type RunDeps,
 } from "./run.ts";
 import { STATE_LABELS, type Ticket, type Tracker } from "./tracker.ts";
@@ -80,20 +79,22 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
   const prepareRepo = deps.prepareRepo ?? realPrepareRepo;
   const originUrl = deps.originUrl ?? realOriginUrl;
 
-  let tracker: Tracker, trigger: Trigger | undefined, maxChained: number;
+  let hub: Tracker, trigger: Trigger | undefined, maxChained: number;
   try {
     refuseModelCredential(env, "prepare");
     trigger = parseTrigger(env);
     maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
-    tracker = deps.tracker ?? detectTracker(env);
+    hub = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
   }
-  const allowed = await fetchAllowedTicket(tracker, env);
+  const allowed = await fetchAllowedTicket(hub, env);
   if (!allowed) return 2;
-  const { ticket, repo, allowlist } = allowed;
+  const { ticket, tracker } = allowed;
   // Before `working`: a skipped run leaves the issue exactly as it was.
   if (!triggerStillApplies(ticket, trigger, env, maxChained)) return EXIT_SKIPPED;
+  if (allowed.invalidTarget !== undefined) return refuseInvalidTarget(tracker, ticket, env, allowed.invalidTarget);
+  const { repo, allowlist } = allowed;
   const guard = guardTracker(tracker, ticket);
 
   // Success leaves the issue on `working` for the publish stage to settle; a failure here
@@ -109,9 +110,7 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
 
     const target = { cloneUrl: repo.cloneUrl, workDir, branch: branchFor(ticket), defaultBranch: baseBranchFor(ticket, repo.defaultBranch) };
     prepareRepo({ ...target, credential: credentialFor(tracker.platform, env) });
-    if (!isAllowedRepo(originUrl(workDir), allowlist)) {
-      throw new ConfigError(`refusing to continue: ${workDir} is a clone of a repo outside the allowlist.`);
-    }
+    checkOrigin(originUrl(workDir), repo, allowlist, workDir);
     writePrepared(workDir, { platform: tracker.platform, ticket, repo });
     console.log(`[prepare] ${workDir} is on ${branchFor(ticket)}; ready for the agent stage`);
     return 0;
@@ -180,24 +179,27 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
   const createPublisher = deps.publisher ?? gitPublisher;
 
-  let tracker: Tracker, maxTurns: number, maxChained: number;
+  let hub: Tracker, maxTurns: number, maxChained: number;
   try {
     refuseModelCredential(env, "publish");
     maxTurns = parseMaxTurns(env.MAX_TURNS);
     maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
-    tracker = deps.tracker ?? detectTracker(env);
+    hub = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
   }
-  // The issue, its title and the branch name come from the forge, never from the work dir.
-  const allowed = await fetchAllowedTicket(tracker, env);
+  // The issue, its title, the branch name and the (target) repo come from the forge, never from
+  // the work dir.
+  const allowed = await fetchAllowedTicket(hub, env);
   if (!allowed) return 2;
-  const { ticket, repo } = allowed;
+  const { ticket, tracker } = allowed;
   // The forge's label, which the agent can't touch, is what says there's anything to settle.
   if (!ticket.labels.includes(STATE_LABELS.working)) {
     console.log(`[publish] #${ticket.number} isn't ${STATE_LABELS.working}: an earlier stage already settled it (or never started); nothing to publish`);
     return 0;
   }
+  if (allowed.invalidTarget !== undefined) return refuseInvalidTarget(tracker, ticket, env, allowed.invalidTarget);
+  const { repo } = allowed;
   const guard = guardTracker(tracker, ticket);
 
   return guarded(guard, ticket, env, async () => {

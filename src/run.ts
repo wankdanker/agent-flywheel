@@ -5,8 +5,8 @@
 // label (`agent/review` or `agent/blocked`), never `agent/working`.
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { isAllowedRepo, parseAllowlist } from "./allowlist.ts";
-import { baseBranchFor } from "./chain.ts";
+import { isAllowedRepo, parseAllowlist, repoIdentifier } from "./allowlist.ts";
+import { baseBranchFor, targetOf } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
 import { DEFAULT_MAX_CHAINED_RUNS, recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
 import { botIdentityFromEnv, githubTracker } from "./github.ts";
@@ -14,7 +14,7 @@ import { gitlabTracker } from "./gitlab.ts";
 import { resetHandoff } from "./handoff.ts";
 import { gitPublisher } from "./publish.ts";
 import { credentialFromEnv, sandboxEnv, startModelProxy as realStartModelProxy } from "./model-proxy.ts";
-import type { Ticket, TicketState, Tracker } from "./tracker.ts";
+import type { Repo, Ticket, TicketState, Tracker } from "./tracker.ts";
 import {
   applyOutcome, branchFor, needsDirective, runSession as realRunSession, runTicket as realRunTicket, settle, SettlementError,
   type Outcome, type WorkerConfig,
@@ -203,7 +203,8 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
     if (!c.fromBot) break;
     posted.add(c.text.trim());
   }
-  const guarded: Tracker = {
+  // A retargeted tracker is wrapped the same way, sharing the state and the posted comments.
+  const wrap = (tracker: Tracker): Tracker => ({
     platform: tracker.platform,
     repo: () => tracker.repo(),
     getTicket: () => tracker.getTicket(),
@@ -211,6 +212,7 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
     ensureBranch: (branch, from) => tracker.ensureBranch(branch, from),
     openReview: (input) => tracker.openReview(input),
     dispatchRelay: () => tracker.dispatchRelay(),
+    retarget: (path) => wrap(tracker.retarget(path)),
     async comment(text) {
       const key = text.trim();
       if (posted.has(key)) {
@@ -224,8 +226,8 @@ export function guardTracker(tracker: Tracker, ticket: Ticket) {
       await tracker.setState(s);
       state = s;
     },
-  };
-  return { tracker: guarded, state: () => state };
+  });
+  return { tracker: wrap(tracker), state: () => state };
 }
 
 const isTerminal = (s: TicketState | undefined) => s === "review" || s === "blocked";
@@ -239,22 +241,59 @@ export function configExit(err: unknown): number {
   throw err;
 }
 
+export type AllowedTicket = { tracker: Tracker; ticket: Ticket } & (
+  | { repo: Repo; allowlist: string[]; invalidTarget?: undefined }
+  // A trusted `Target:` header that isn't a valid repo path: the caller blocks with a comment.
+  | { invalidTarget: string }
+);
+
 // The issue and its repo, or undefined (having logged why) if the repo isn't allowlisted.
 // Refuses before granting any credential or running `git clone` at all: an issue's title,
 // body, or comments never get a say in which repo we touch (see README's Trust model for
-// the parallel rule about what the *model* is allowed to read as instructions).
-export async function fetchAllowedTicket(tracker: Tracker, env: NodeJS.ProcessEnv) {
-  const [ticket, repo] = await Promise.all([tracker.getTicket(), tracker.repo()]);
+// the parallel rule about what the *model* is allowed to read as instructions). The one
+// exception is a trusted author's `Target:` header (src/chain.ts's targetOf), which points the
+// code-host side of the run at another repo on the same forge (`Tracker#retarget`); the
+// returned tracker is that retargeted one, and the allowlist applies to the target.
+export async function fetchAllowedTicket(hub: Tracker, env: NodeJS.ProcessEnv): Promise<AllowedTicket | undefined> {
+  const ticket = await hub.getTicket();
   console.log(`[ticket] #${ticket.number} ${ticket.title}, ${ticket.comments.length} comments`);
+  const header = targetOf(ticket, hub.platform);
+  if (header && "invalid" in header) return { tracker: hub, ticket, invalidTarget: header.invalid };
+  const tracker = header ? hub.retarget(header.path) : hub;
+  const repo = await tracker.repo();
+  if (header) console.log(`[target] #${ticket.number} (${ticket.url}) works in ${header.path} (${repo.cloneUrl}), named by its Target: header`);
   const allowlist = parseAllowlist(env);
   if (!isAllowedRepo(repo.cloneUrl, allowlist)) {
     console.error(
-      `refusing to clone ${repo.cloneUrl}: not in the repo allowlist (${allowlist.join(", ") || "<empty>"}). ` +
-        `Set AGENT_REPO_ALLOWLIST to a comma-separated list of owner/repo to allow it.`,
+      `refusing to clone ${repo.cloneUrl}: not in the repo allowlist (${allowlist.join(", ") || "<empty>"})` +
+        (header ? `, as the Target: of hub issue #${ticket.number} (${ticket.url})` : "") +
+        `. Set AGENT_REPO_ALLOWLIST to a comma-separated list of owner/repo to allow it.`,
     );
     return undefined;
   }
-  return { ticket, repo, allowlist };
+  return { tracker, ticket, repo, allowlist };
+}
+
+// An invalid `Target:` header is a config error, but one only the issue's author can fix, so
+// (unlike a refusal) it's said on the issue: blocked, with a comment, exit 2.
+export function refuseInvalidTarget(tracker: Tracker, ticket: Ticket, env: NodeJS.ProcessEnv, problem: string): Promise<number> {
+  console.error(`[target] #${ticket.number}: ${problem}`);
+  return guarded(guardTracker(tracker, ticket), ticket, env, async () => {
+    throw new ConfigError(`invalid Target: header: ${problem}. Fix or remove it in the issue body`);
+  }, { mustSettle: true });
+}
+
+// What's on disk after prepareRepo must be a clone of exactly the repo this run is for, and that
+// repo must still be allowlisted: a cached or persisted work dir from a run against another
+// allowed repo (say, before someone edited the issue's `Target:`) mustn't be worked on here.
+export function checkOrigin(origin: string, repo: Repo, allowlist: string[], workDir: string): void {
+  if (!isAllowedRepo(origin, allowlist)) {
+    throw new ConfigError(`refusing to continue: ${workDir} is a clone of a repo outside the allowlist.`);
+  }
+  const want = repoIdentifier(repo.cloneUrl);
+  if (repoIdentifier(origin) !== want) {
+    throw new ConfigError(`refusing to continue: ${workDir} is a clone of ${repoIdentifier(origin)}, not ${want}, which this run is for.`);
+  }
 }
 
 // Namespaced per issue: if WORK_DIR is cached/persisted across runs (so a failed
@@ -327,22 +366,24 @@ export async function main(deps: RunDeps = {}): Promise<number> {
   const createPublisher = deps.publisher ?? gitPublisher;
 
   // Everything that can be wrong with our config is checked before we touch the issue.
-  let tracker: Tracker, maxTurns: number, maxBudgetUsd: number | undefined, maxChained: number, trigger: Trigger | undefined;
+  let hub: Tracker, maxTurns: number, maxBudgetUsd: number | undefined, maxChained: number, trigger: Trigger | undefined;
   try {
     requireModelCredential(env);
     maxTurns = parseMaxTurns(env.MAX_TURNS);
     maxBudgetUsd = parseMaxBudgetUsd(env.MAX_BUDGET_USD);
     maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
     trigger = parseTrigger(env);
-    tracker = deps.tracker ?? detectTracker(env);
+    hub = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
   }
 
-  const allowed = await fetchAllowedTicket(tracker, env);
+  const allowed = await fetchAllowedTicket(hub, env);
   if (!allowed) return 2;
-  const { ticket, repo, allowlist } = allowed;
+  const { ticket, tracker } = allowed;
   if (!triggerStillApplies(ticket, trigger, env, maxChained)) return EXIT_SKIPPED;
+  if (allowed.invalidTarget !== undefined) return refuseInvalidTarget(tracker, ticket, env, allowed.invalidTarget);
+  const { repo, allowlist } = allowed;
   const guard = guardTracker(tracker, ticket);
 
   // From here on, whatever happens, we owe the issue a terminal label.
@@ -361,11 +402,9 @@ export async function main(deps: RunDeps = {}): Promise<number> {
     const credential = credentialFor(tracker.platform, env);
     prepareRepo({ ...target, credential });
 
-    // A cached work dir from a previous run could in principle predate today's allowlist;
-    // re-check what's actually on disk, not just what we asked to clone.
-    if (!isAllowedRepo(originUrl(workDir), allowlist)) {
-      throw new ConfigError(`refusing to continue: ${workDir} is a clone of a repo outside the allowlist.`);
-    }
+    // A cached work dir from a previous run could in principle predate today's allowlist or
+    // Target:; re-check what's actually on disk, not just what we asked to clone.
+    checkOrigin(originUrl(workDir), repo, allowlist, workDir);
 
     // The real model credential goes only to a loopback proxy; see startProxyFromEnv.
     const proxy = await startProxyFromEnv(env, startModelProxy);
