@@ -424,8 +424,8 @@ export function notionTracker(o: NotionOptions): Tracker {
       throw new Error("Notion tickets can't be split into sub-issues yet");
     },
 
-    repo: () => code().repo(),
-    ensureBranch: (branch, from) => code().ensureBranch(branch, from),
+    repo: async () => code().repo(),
+    ensureBranch: async (branch, from) => code().ensureBranch(branch, from),
     async openReview(input) {
       const review = await code().openReview(input);
       shared.reviewUrl = review.url;
