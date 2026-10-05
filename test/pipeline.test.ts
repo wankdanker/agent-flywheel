@@ -452,9 +452,10 @@ function forgeTracker(cloneUrl: string, over: Partial<Ticket> = {}) {
     async ensureBranch() {
       return true;
     },
-    async openReview() {
+    async openReview(r: { body: string }) {
       t.reviews++;
       t.reviewRepos.push(t.code);
+      t.reviewBodies.push(r.body);
       return { url: "https://example.test/pull/1", created: true };
     },
     async dispatchRelay() {
@@ -464,6 +465,7 @@ function forgeTracker(cloneUrl: string, over: Partial<Ticket> = {}) {
     // still land on this same (hub) record.
     code: cloneUrl,
     reviewRepos: [] as string[],
+    reviewBodies: [] as string[],
     retargets: [] as string[],
     retarget(path: string): Tracker {
       t.retargets.push(path);
@@ -471,7 +473,9 @@ function forgeTracker(cloneUrl: string, over: Partial<Ticket> = {}) {
       return {
         ...t,
         repo: async () => ({ cloneUrl: url, webUrl: url.replace(/\.git$/, ""), defaultBranch: "main" }),
-        openReview: async () => (t.reviews++, t.reviewRepos.push(url), { url: `https://github.com/${path}/pull/1`, created: true }),
+        openReview: async (r: { body: string }) => (
+          t.reviews++, t.reviewRepos.push(url), t.reviewBodies.push(r.body), { url: `https://github.com/${path}/pull/1`, created: true }
+        ),
       };
     },
   };
@@ -512,11 +516,11 @@ function stageDeps(tracker: Tracker, origin?: string) {
   return { deps, seen };
 }
 
-function stageEnvs() {
+function stageEnvs(allowlist = "acme/widgets") {
   const root = mkdtempSync(join(tmpdir(), "allowlist-"));
   const home = join(root, "home");
   mkdirSync(home);
-  const common = { WORK_DIR: join(root, "work"), ISSUE: "7", AGENT_REPO_ALLOWLIST: "acme/widgets", MAX_TURNS: "10", HOME: home, PATH: process.env.PATH };
+  const common = { WORK_DIR: join(root, "work"), ISSUE: "7", AGENT_REPO_ALLOWLIST: allowlist, MAX_TURNS: "10", HOME: home, PATH: process.env.PATH };
   return {
     root,
     workDir: join(root, "work", "issue-7"),
@@ -540,9 +544,9 @@ async function quietly<T>(fn: () => Promise<T>): Promise<{ result: T; logs: stri
   }
 }
 
-async function splitRun(tracker: Tracker, origin?: string) {
+async function splitRun(tracker: Tracker, origin?: string, allowlist?: string) {
   const { prepareStage, agentStage, publishStage } = await import("../src/stages.ts");
-  const e = stageEnvs();
+  const e = stageEnvs(allowlist);
   const { deps, seen } = stageDeps(tracker, origin);
   // The agent stage's leak check runs git in the work dir, or in the process cwd when there is
   // none (the rejected case). Run from the scratch root, not this checkout, whose .git/config may
@@ -561,9 +565,9 @@ async function splitRun(tracker: Tracker, origin?: string) {
   }
 }
 
-async function combinedRun(tracker: Tracker, origin?: string) {
+async function combinedRun(tracker: Tracker, origin?: string, allowlist?: string) {
   const { main } = await import("../src/run.ts");
-  const e = stageEnvs();
+  const e = stageEnvs(allowlist);
   const { deps, seen } = stageDeps(tracker, origin);
   const { result: code, logs } = await quietly(() => main({ ...deps, env: e.combined }));
   return { code, logs, seen, e };
@@ -622,6 +626,12 @@ test("allowlist: a trusted directive or a sub-issue's chain header naming anothe
     },
     // Chain metadata: a sub-issue whose header carries extra repo-looking fields.
     { body: `${chainHeader({ parent: 3, index: 1, total: 2 })}\nRepository: attacker/other-repo\nClone: ${REPO_B}\n\nPart one.` },
+    // A `Target:` header anywhere but a trusted author's first paragraph (#63): in a trusted
+    // directive comment, or further down the body.
+    {
+      body: "Please fix the bug.\n\nTarget: attacker/other-repo",
+      comments: [{ author: "maintainer", trust: "trusted", fromBot: false, text: "Target: attacker/other-repo\n\nDo it there.", at: "2026-09-29T00:00:00Z" }],
+    },
   ];
   for (const over of redirects) {
     for (const run of [splitRun, combinedRun]) {
@@ -630,6 +640,7 @@ test("allowlist: a trusted directive or a sub-issue's chain header naming anothe
       assert.deepEqual(r.seen.clones, [REPO_A], "cloned something other than the forge's own repo");
       assert.deepEqual(r.seen.publishers, [REPO_A], "published somewhere other than the forge's own repo");
       assert.deepEqual(tracker.states, ["working", "review"]);
+      assert.deepEqual(tracker.retargets, [], "retargeted on something other than a trusted Target: header");
     }
   }
 });
@@ -649,5 +660,107 @@ test("allowlist: a work dir whose origin turns out to be another repo is blocked
     assert.doesNotMatch(tracker.comments[0]!, /ghs_|sk-ant-/);
     // Nothing handed to the agent stage.
     assert.ok(!existsSync(join(handoffDirFor(r.e.workDir), "prepared.json")));
+  }
+});
+
+// ---- Cross-repo work: a trusted `Target:` header (#63) ----
+//
+// The hub issue (on REPO_A's forge project) names another repo on the same forge; the code-host
+// side of the run (clone, validation, push, PR) moves there while every label and comment stays
+// on the hub issue. Still bounded by the allowlist, and only from a trusted author.
+
+const TARGET = "https://github.com/acme/api.git";
+const HUB_URL = "https://github.com/acme/widgets/issues/7";
+const BOTH = "acme/widgets,acme/api";
+
+test("target: a trusted Target: header clones, validates and publishes the target; the hub issue gets the labels", async () => {
+  const over = { url: HUB_URL, body: "Target: acme/api\n\nFix the pagination bug." };
+  const split = forgeTracker(REPO_A, over);
+  const s = await splitRun(split, undefined, BOTH);
+  assert.deepEqual(s.codes, [0, 0, 0]);
+  assert.deepEqual(s.seen, { clones: [TARGET], publishers: [TARGET], pushes: 1, proxies: 1, sessions: 1 });
+  assert.deepEqual(split.states, ["working", "review"]);
+  assert.deepEqual(split.reviewRepos, [TARGET]);
+  assert.match(split.reviewBodies[0]!, /Closes acme\/widgets#7$/);
+  assert.match(split.comments.at(-1)!, /Review: https:\/\/github\.com\/acme\/api\/pull\/1/);
+  assert.match(s.logs, /works in acme\/api/);
+
+  const combined = forgeTracker(REPO_A, over);
+  const c = await combinedRun(combined, undefined, BOTH);
+  assert.equal(c.code, 0);
+  assert.deepEqual(c.seen, { clones: [TARGET], publishers: [TARGET], pushes: 1, proxies: 1, sessions: 1 });
+  assert.deepEqual(combined.states, ["working", "review"]);
+  assert.deepEqual(combined.reviewRepos, [TARGET]);
+  assert.match(combined.reviewBodies[0]!, /Closes acme\/widgets#7$/);
+});
+
+test("target: a Target: repo outside the allowlist is refused before any label, clone, model call or push", async () => {
+  const over = { url: HUB_URL, body: "Target: attacker/other-repo\n\nFix it there." };
+  const split = forgeTracker(REPO_A, over);
+  const s = await splitRun(split, undefined, BOTH);
+  assert.deepEqual(s.codes, [2, 0, 2]);
+  assert.deepEqual(split.states, []);
+  assert.deepEqual(split.comments, []);
+  assert.deepEqual(s.seen, { clones: [], publishers: [], pushes: 0, proxies: 0, sessions: 0 });
+  assert.ok(workDirUntouched(s.e));
+  // The refusal names both the target and the hub issue.
+  assert.match(s.logs, /refusing to clone https:\/\/github\.com\/attacker\/other-repo\.git: not in the repo allowlist \(acme\/widgets, acme\/api\), as the Target: of hub issue #7 \(https:\/\/github\.com\/acme\/widgets\/issues\/7\)/);
+
+  const combined = forgeTracker(REPO_A, over);
+  const c = await combinedRun(combined, undefined, BOTH);
+  assert.equal(c.code, 2);
+  assert.deepEqual(combined.states, []);
+  assert.deepEqual(combined.comments, []);
+  assert.deepEqual(c.seen, { clones: [], publishers: [], pushes: 0, proxies: 0, sessions: 0 });
+  assert.ok(workDirUntouched(c.e));
+});
+
+test("target: an untrusted author's Target: header is ignored; the run works the hub like any untrusted issue", async () => {
+  const over: Partial<Ticket> = {
+    url: HUB_URL, trust: "untrusted", author: "stranger", body: "Target: acme/api\n\nDo it.",
+    comments: [{ author: "maintainer", trust: "trusted", fromBot: false, text: "/agent continue\n\nFix the pagination bug.", at: "2026-09-29T00:00:00Z" }],
+  };
+  for (const run of [splitRun, combinedRun]) {
+    const tracker = forgeTracker(REPO_A, over);
+    const r = await run(tracker, undefined, BOTH);
+    assert.deepEqual(tracker.retargets, []);
+    assert.deepEqual(r.seen.clones, [REPO_A]);
+    assert.deepEqual(r.seen.publishers, [REPO_A]);
+    assert.deepEqual(tracker.states, ["working", "review"]);
+    assert.match(tracker.reviewBodies[0]!, /Closes #7$/);
+  }
+});
+
+test("target: a cached work dir cloned from the hub, on an issue now targeting another allowed repo, is blocked before the model", async () => {
+  const over = { url: HUB_URL, body: "Target: acme/api\n\nFix it." };
+  for (const run of [splitRun, combinedRun]) {
+    const tracker = forgeTracker(REPO_A, over);
+    const r = await run(tracker, REPO_A, BOTH);
+    assert.deepEqual("codes" in r ? r.codes : [r.code], "codes" in r ? [2, 0, 0] : [2]);
+    assert.deepEqual(r.seen.clones, [TARGET]);
+    assert.equal(r.seen.proxies, 0);
+    assert.equal(r.seen.sessions, 0);
+    assert.equal(r.seen.pushes, 0);
+    assert.equal(tracker.reviews, 0);
+    assert.deepEqual(tracker.states, ["working", "blocked"]);
+    assert.equal(tracker.comments.length, 1);
+    assert.match(tracker.comments[0]!, /is a clone of acme\/widgets, not acme\/api/);
+    assert.ok(!existsSync(join(handoffDirFor(r.e.workDir), "prepared.json")));
+  }
+});
+
+test("target: an invalid Target: header blocks with a comment, before any clone or model call", async () => {
+  for (const body of ["Target: https://github.com/acme/api\n\nFix it.", "Target: acme/api\nTarget: acme/web\n\nFix it."]) {
+    for (const run of [splitRun, combinedRun]) {
+      const tracker = forgeTracker(REPO_A, { url: HUB_URL, body });
+      const r = await run(tracker, undefined, BOTH);
+      assert.deepEqual("codes" in r ? r.codes : [r.code], "codes" in r ? [2, 0, 0] : [2]);
+      assert.deepEqual(r.seen, { clones: [], publishers: [], pushes: 0, proxies: 0, sessions: 0 });
+      assert.deepEqual(tracker.retargets, []);
+      assert.deepEqual(tracker.states, ["blocked"]);
+      assert.equal(tracker.comments.length, 1);
+      assert.match(tracker.comments[0]!, /^I didn't start: this issue has an invalid `Target:` header\. (`Target: [^`]*` isn't a valid target: |There are 2 `Target:` lines)/);
+      assert.ok(workDirUntouched(r.e));
+    }
   }
 });

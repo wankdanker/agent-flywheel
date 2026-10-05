@@ -277,9 +277,17 @@ export async function fetchAllowedTicket(hub: Tracker, env: NodeJS.ProcessEnv): 
 // An invalid `Target:` header is a config error, but one only the issue's author can fix, so
 // (unlike a refusal) it's said on the issue: blocked, with a comment, exit 2.
 export function refuseInvalidTarget(tracker: Tracker, ticket: Ticket, env: NodeJS.ProcessEnv, problem: string): Promise<number> {
-  console.error(`[target] #${ticket.number}: ${problem}`);
-  return guarded(guardTracker(tracker, ticket), ticket, env, async () => {
-    throw new ConfigError(`invalid Target: header: ${problem}. Fix or remove it in the issue body`);
+  console.error(`[target] #${ticket.number} has an invalid Target: header: ${problem}`);
+  const guard = guardTracker(tracker, ticket);
+  return guarded(guard, ticket, env, async () => {
+    await settle({ kind: "blocked", detail: problem }, [
+      () => guard.tracker.comment(
+        `I didn't start: this issue has an invalid \`Target:\` header. ${problem}.\n\n` +
+          `Fix or remove it in the issue body: one \`Target: owner/repo\` line, a repo path on this forge, in the first paragraph.\n\n${RESUME_HINT}`,
+      ),
+      () => guard.tracker.setState("blocked"),
+    ]);
+    return 2;
   }, { mustSettle: true });
 }
 

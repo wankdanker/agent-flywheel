@@ -59,7 +59,7 @@ export function parseTarget(body: string, platform?: "github" | "gitlab"): Targe
   const head = body.replace(/\r\n/g, "\n").split("\n\n")[0]!;
   const lines = head.split("\n").filter((l) => /^\s*target\s*:/i.test(l));
   if (!lines.length) return undefined;
-  if (lines.length > 1) return { invalid: `the issue has ${lines.length} \`Target:\` lines; give exactly one` };
+  if (lines.length > 1) return { invalid: `There are ${lines.length} \`Target:\` lines; give exactly one` };
   const m = /^Target: (.*)$/.exec(lines[0]!.replace(/\s+$/, ""));
   const value = m?.[1] ?? "";
   const bad = (why: string) => ({ invalid: `\`${lines[0]!.trim().replace(/`/g, "'").slice(0, 200)}\` isn't a valid target: ${why}` });
