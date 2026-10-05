@@ -682,6 +682,47 @@ test("allowlist: a work dir whose origin turns out to be another repo is blocked
   }
 });
 
+test("allowlist: a malformed AGENT_REPO_ALLOWLIST exits 2 before any label, clone, model call or push", async () => {
+  for (const bad of ["*/widgets", "acme/**/x", "acme//widgets", "https://github.com/acme/widgets", "acme/wid gets"]) {
+    const split = forgeTracker(REPO_A);
+    const s = await splitRun(split, undefined, bad);
+    // prepare and publish refuse as config errors; the agent stage finds nothing prepared.
+    assert.deepEqual(s.codes, [2, 0, 2], bad);
+    assert.deepEqual(split.states, []);
+    assert.deepEqual(split.comments, []);
+    assert.deepEqual(s.seen, { clones: [], publishers: [], pushes: 0, proxies: 0, sessions: 0 });
+    assert.ok(workDirUntouched(s.e));
+    assert.match(s.logs, /AGENT_REPO_ALLOWLIST entry .* is invalid/);
+
+    const combined = forgeTracker(REPO_A);
+    const c = await combinedRun(combined, undefined, bad);
+    assert.equal(c.code, 2, bad);
+    assert.deepEqual(combined.states, []);
+    assert.deepEqual(combined.comments, []);
+    assert.deepEqual(c.seen, { clones: [], publishers: [], pushes: 0, proxies: 0, sessions: 0 });
+    assert.ok(workDirUntouched(c.e));
+    assert.match(c.logs, /AGENT_REPO_ALLOWLIST entry .* is invalid/);
+  }
+});
+
+test("allowlist: with acme/*, a run on acme/widgets proceeds and one on evil/widgets is refused", async () => {
+  for (const run of [splitRun, combinedRun]) {
+    const ok = forgeTracker(REPO_A);
+    const r = await run(ok, undefined, "acme/*");
+    assert.deepEqual("codes" in r ? r.codes : [r.code], "codes" in r ? [0, 0, 0] : [0]);
+    assert.deepEqual(r.seen, { clones: [REPO_A], publishers: [REPO_A], pushes: 1, proxies: 1, sessions: 1 });
+    assert.deepEqual(ok.states, ["working", "review"]);
+
+    const evil = forgeTracker("https://github.com/evil/widgets.git");
+    const x = await run(evil, undefined, "acme/*");
+    assert.deepEqual("codes" in x ? x.codes : [x.code], "codes" in x ? [2, 0, 2] : [2]);
+    assert.deepEqual(evil.states, []);
+    assert.deepEqual(x.seen, { clones: [], publishers: [], pushes: 0, proxies: 0, sessions: 0 });
+    // The refusal shows the raw entries.
+    assert.match(x.logs, /refusing to clone https:\/\/github\.com\/evil\/widgets\.git: not in the repo allowlist \(acme\/\*\)/);
+  }
+});
+
 // ---- Cross-repo work: a trusted `Target:` header (#63) ----
 //
 // The hub issue (on REPO_A's forge project) names another repo on the same forge; the code-host

@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { repoIdentifier } from "./allowlist.ts";
+import { parseAllowlist, repoIdentifier } from "./allowlist.ts";
 import { baseBranchFor } from "./chain.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo } from "./clone.ts";
 import { chainedRuns, chainMarker, CONTINUE_COMMAND, RESUME_HINT, type Trigger } from "./dispatch.ts";
@@ -85,6 +85,7 @@ export async function prepareStage(deps: RunDeps = {}): Promise<number> {
     refuseModelCredential(env, "prepare");
     trigger = parseTrigger(env);
     maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
+    parseAllowlist(env); // a malformed entry is a ConfigError here, before the issue is read
     hub = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
@@ -185,6 +186,7 @@ export async function publishStage(deps: RunDeps = {}): Promise<number> {
     refuseModelCredential(env, "publish");
     maxTurns = parseMaxTurns(env.MAX_TURNS);
     maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
+    parseAllowlist(env); // a malformed entry is a ConfigError here, before the issue is read
     hub = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);

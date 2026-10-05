@@ -7,6 +7,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isAllowedRepo, parseAllowlist, repoIdentifier } from "./allowlist.ts";
 import { baseBranchFor, targetOf } from "./chain.ts";
+import { ConfigError } from "./config-error.ts";
 import { originUrl as realOriginUrl, prepareRepo as realPrepareRepo, type Credential } from "./clone.ts";
 import { DEFAULT_MAX_CHAINED_RUNS, recheckTrigger, RESUME_HINT, triggerFromEnv, type Trigger } from "./dispatch.ts";
 import { botIdentityFromEnv, githubTracker } from "./github.ts";
@@ -28,14 +29,8 @@ export const EXIT_CODES: Record<Outcome["kind"], number> = { ready_for_review: 0
 // The trigger no longer applies (src/dispatch.ts's recheckTrigger): nothing ran, nothing changed.
 export const EXIT_SKIPPED = 30;
 
-// Bad or missing configuration: exit 2, and (when it's found before we set `working`)
-// without touching the issue at all.
-export class ConfigError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ConfigError";
-  }
-}
+// Bad or missing configuration: exit 2; see config-error.ts.
+export { ConfigError };
 
 export type RunDeps = {
   env?: NodeJS.ProcessEnv;
@@ -267,7 +262,7 @@ export async function fetchAllowedTicket(hub: Tracker, env: NodeJS.ProcessEnv): 
     console.error(
       `refusing to clone ${repo.cloneUrl}: not in the repo allowlist (${allowlist.join(", ") || "<empty>"})` +
         (header ? `, as the Target: of hub issue #${ticket.number} (${ticket.url})` : "") +
-        `. Set AGENT_REPO_ALLOWLIST to a comma-separated list of owner/repo to allow it.`,
+        `. Set AGENT_REPO_ALLOWLIST to a comma-separated list of owner/repo (or owner/*, group/**) to allow it.`,
     );
     return undefined;
   }
@@ -381,6 +376,7 @@ export async function main(deps: RunDeps = {}): Promise<number> {
     maxBudgetUsd = parseMaxBudgetUsd(env.MAX_BUDGET_USD);
     maxChained = parseMaxChainedRuns(env.MAX_CHAINED_RUNS);
     trigger = parseTrigger(env);
+    parseAllowlist(env); // a malformed entry is a ConfigError here, before the issue is read
     hub = deps.tracker ?? detectTracker(env);
   } catch (err) {
     return configExit(err);
