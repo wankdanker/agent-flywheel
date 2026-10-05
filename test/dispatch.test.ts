@@ -166,6 +166,15 @@ test("recheckTrigger(relay): blocked, announced, and within MAX_CHAINED_RUNS", (
   assert.equal(recheckTrigger("relay", ["agent/blocked"], [relayAnnouncement(1)]).run, false);
 });
 
+test("recheckTrigger(pickup): a poller's dispatch runs only an unstarted ticket that's still opted in", () => {
+  assert.equal(triggerFromEnv({ AGENT_TRIGGER: "pickup" }), "pickup");
+  assert.equal(recheckTrigger("pickup", ["agent"]).run, true);
+  for (const state of ["agent/working", "agent/blocked", "agent/review", "agent/queued"]) {
+    assert.equal(recheckTrigger("pickup", ["agent", state]).run, false, state);
+  }
+  assert.equal(recheckTrigger("pickup", []).run, false);
+});
+
 // ---- GitHub: agent.yml's gate, evaluated ----
 
 // Just enough of GitHub Actions' expression language for agent.yml's gates: literals, property

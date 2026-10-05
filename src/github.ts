@@ -1,5 +1,5 @@
 // Our thin GitHub REST client for one issue.
-import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type ChainForge, type Tracker } from "./tracker.ts";
+import { OPT_IN_LABEL, STATE_LABELS, toComment, withMarker, type ChainForge, type CodeHost, type Tracker } from "./tracker.ts";
 import { trustFromGithubAssociation, type Trust } from "./trust.ts";
 
 // A runaway-loop guard, not a thread-size limit: 1000 pages of 100 is far past any real issue.
@@ -81,37 +81,71 @@ export function workerIdentity(o: { token: string; apiUrl?: string; self?: BotId
   };
 }
 
+const githubHeaders = (token: string) => ({
+  Authorization: `Bearer ${token}`,
+  Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28",
+  "Content-Type": "application/json",
+});
+
+// The code-host calls on one repo, which need no issue: a githubTracker's (its own repo, or its
+// `Target:`), and a Notion tracker's (src/notion.ts), whose tickets aren't GitHub issues at all.
+export function githubCodeHost(o: { token: string; repo: string; apiUrl?: string }): CodeHost {
+  const apiUrl = o.apiUrl ?? "https://api.github.com";
+  async function gh(path: string, init: RequestInit = {}) {
+    const res = await fetch(`${apiUrl}/repos/${o.repo}${path}`, { ...init, headers: githubHeaders(o.token) });
+    if (!res.ok) throw new Error(`GitHub ${init.method ?? "GET"} ${path}: ${res.status} ${await res.text()}`);
+    return res.json();
+  }
+  // Like gh(), but undefined for a 404 instead of throwing.
+  async function ghMaybe(path: string) {
+    const res = await fetch(`${apiUrl}/repos/${o.repo}${path}`, { headers: { Authorization: `Bearer ${o.token}`, Accept: "application/vnd.github+json" } });
+    if (res.status === 404) return undefined;
+    if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status} ${await res.text()}`);
+    return res.json();
+  }
+  return {
+    async repo() {
+      const r = await gh("");
+      return { cloneUrl: r.clone_url, webUrl: r.html_url, defaultBranch: r.default_branch };
+    },
+
+    async ensureBranch(branch, from) {
+      if (await ghMaybe(`/git/ref/heads/${branch}`)) return false;
+      const base = await gh(`/git/ref/heads/${from}`);
+      await gh("/git/refs", { method: "POST", body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: base.object.sha }) });
+      return true;
+    },
+
+    // Pushing the branch already updated an open PR; only open one if there isn't one yet.
+    async openReview({ branch, base, title, body }) {
+      const owner = o.repo.split("/")[0]!;
+      const open = await gh(`/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`);
+      if (Array.isArray(open) && open.length) return { url: open[0].html_url, created: false };
+      const pr = await gh("/pulls", { method: "POST", body: JSON.stringify({ title, head: branch, base, body }) });
+      return { url: pr.html_url, created: true };
+    },
+  };
+}
+
 // `self` pins the worker's identity; see workerIdentity.
 // `code` is the repo the code-host calls act on (see Tracker#retarget); the issue's own by default.
 export function githubTracker(o: { token: string; repo: string; issue: number; apiUrl?: string; self?: BotIdentity; code?: string }): Tracker {
   const apiUrl = o.apiUrl ?? "https://api.github.com";
   const issue = `/issues/${o.issue}`;
-  const code = o.code ?? o.repo;
+  const code = githubCodeHost({ ...o, repo: o.code ?? o.repo });
 
   async function request(url: string, init: RequestInit, label: string, okStatus: number[] = []) {
     const res = await fetch(url, {
       ...init,
-      headers: {
-        Authorization: `Bearer ${o.token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/json",
-      },
+      headers: githubHeaders(o.token),
     });
     if (!res.ok && !okStatus.includes(res.status)) throw new Error(`GitHub ${init.method ?? "GET"} ${label}: ${res.status} ${await res.text()}`);
     return res;
   }
 
-  async function gh(path: string, init: RequestInit = {}, repo = o.repo) {
-    return (await request(`${apiUrl}/repos/${repo}${path}`, init, path)).json();
-  }
-
-  // Like gh(), but undefined for a 404 instead of throwing.
-  async function ghMaybe(path: string, repo = o.repo) {
-    const res = await fetch(`${apiUrl}/repos/${repo}${path}`, { headers: { Authorization: `Bearer ${o.token}`, Accept: "application/vnd.github+json" } });
-    if (res.status === 404) return undefined;
-    if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status} ${await res.text()}`);
-    return res.json();
+  async function gh(path: string, init: RequestInit = {}) {
+    return (await request(`${apiUrl}/repos/${o.repo}${path}`, init, path)).json();
   }
 
   // Native relations are a nicety on top of the chain header (src/chain.ts), and these APIs
@@ -147,10 +181,9 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
   return {
     platform: "github",
 
-    async repo() {
-      const r = await gh("", {}, code);
-      return { cloneUrl: r.clone_url, webUrl: r.html_url, defaultBranch: r.default_branch };
-    },
+    repo: () => code.repo(),
+    ensureBranch: (branch, from) => code.ensureBranch(branch, from),
+    openReview: (input) => code.openReview(input),
 
     async getTicket() {
       const [i, comments, me] = await Promise.all([gh(issue), ghAll(`${issue}/comments?per_page=100`), identity()]);
@@ -205,22 +238,6 @@ export function githubTracker(o: { token: string; repo: string; issue: number; a
         });
       }
       return { number: created.number, url: created.html_url };
-    },
-
-    async ensureBranch(branch, from) {
-      if (await ghMaybe(`/git/ref/heads/${branch}`, code)) return false;
-      const base = await gh(`/git/ref/heads/${from}`, {}, code);
-      await gh("/git/refs", { method: "POST", body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: base.object.sha }) }, code);
-      return true;
-    },
-
-    // Pushing the branch already updated an open PR; only open one if there isn't one yet.
-    async openReview({ branch, base, title, body }) {
-      const owner = code.split("/")[0]!;
-      const open = await gh(`/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`, {}, code);
-      if (Array.isArray(open) && open.length) return { url: open[0].html_url, created: false };
-      const pr = await gh("/pulls", { method: "POST", body: JSON.stringify({ title, head: branch, base, body }) }, code);
-      return { url: pr.html_url, created: true };
     },
 
     // workflow_dispatch is one of the few events GITHUB_TOKEN may start a workflow with. Answers 204.

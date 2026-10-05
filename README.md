@@ -176,6 +176,83 @@ What it needs:
 Cross-forge targets, cross-repo split chains, and routing an issue to a target automatically are
 not supported yet.
 
+### Notion tickets
+
+Besides forge issues, the flywheel can work tickets from a Notion database (our company Tickets
+board), with the same stages, trust boundary and publisher. The Notion page plays the issue (thread,
+status, questions); the work lands as a PR/MR in the repo the ticket names. `src/notion.ts` is a
+`Tracker` whose issue calls (`getTicket`, `comment`, `setState`) talk to Notion and whose code-host
+calls (`repo`, `ensureBranch`, `openReview`) go to a GitHub or GitLab code host
+(`githubCodeHost`/`gitlabCodeHost`) for the ticket's repo, on `NOTION_CODE_PLATFORM`. So tickets can
+land on a self-hosted GitLab while the flywheel's own CI stays on GitHub.
+
+**Pickup.** `bin/list-notion-tickets.ts` (stock node, no npm deps) queries the data source for
+`Status = To Do` and `Assignee` contains `NOTION_AGENT_USER_ID`, and prints the page ids as JSON.
+The scheduled workflow (`docs/notion-poll.yml`, which a maintainer copies to
+`.github/workflows/notion-poll.yml`) dispatches one run per ticket with `trigger: pickup`. A pickup
+re-checks the live status and runs only an unstarted ticket (`recheckTrigger`, exit 30 otherwise), so
+a ticket already `Doing`, `Blocked` or in review is never dispatched again by a poll. It continues by
+its own relay (`MAX_CHAINED_RUNS` applies as usual) or when a person moves it back to `To Do`. Comments
+on Notion don't start runs: there's no webhook, only the poll.
+
+**Status.** The flywheel's states map onto statuses the board already has: `working` → `Doing`,
+`blocked` → `Blocked`, `review` → `Needs Review`, pickup = `To Do`. The tracker reads them back as the
+labels the rest of the run reasons with (`agent` while assigned to the agent and in one of those
+four, plus the state label). It writes only `Status`, comments, and on `review` the PR/MR URL to the
+review-link property. Everything else on the shared board is left alone.
+
+**Repo.** The repo comes from the ticket's `Repo` property (`NOTION_REPO_PROPERTY`), as a plain path
+(`group/sub/project`) or a URL on the code host: a project URL, or an issue/MR/PR URL, from which the
+project path is derived. A URL on any other host is refused. A missing, unparseable or
+non-allowlisted value blocks the ticket with a comment saying why (the forge equivalent stays silent
+and exits 2; here, an unanswered ticket would only be picked up again on every poll). The allowlist
+(`AGENT_REPO_ALLOWLIST`) applies exactly as for `Target:`.
+
+**Trust.** Notion has no author association, so trust is explicit. A ticket is trusted only if its
+`created_by` is in `NOTION_TRUSTED_USERS` (comma-separated Notion user ids). A comment is trusted only
+if its author is in that list, or it's our own integration (`/users/me`, as `isSelf`). Everyone else
+is untrusted and goes through the same directive rules as an untrusted forge issue. Being picked up
+(status and assignee) never makes anything trusted.
+
+**Comments.** Notion comments are plain rich text, with no hidden HTML comments. So the comment codec
+posts the badge in bold and `BOT_MARKER` (and a relay's chain marker) as a small gray `‹agent-flywheel…›`
+token. Reading back a comment from our own integration reverses this, so guardTracker's de-dupe and
+the chain count work as on a forge. A pasted token from anyone else counts for nothing, as on a forge.
+The resume and review hints are given in their Notion form (move the ticket back to `To Do`).
+
+**Branches and PR/MR body.** A ticket's `ID` (`PRO-3801`) names it. Its branch is
+`agent/notion-pro-3801`, which can't collide with a forge issue's `agent/issue-3801` in the same repo.
+Its work dir is `<WORK_DIR>/notion-<page id>`. The PR/MR body ends with a link to the ticket
+(`Notion ticket: PRO-3801 (<url>)`), never a `#N` or `Closes`. Splits are refused at both the tool
+and `applyOutcome`. Mapping them onto `Sub-item` / `Blocked by` is future work.
+
+**Credentials.** `NOTION_TOKEN` counts as a forge token (`FORGE_TOKEN_VARS`). The prepare and publish
+stages get it, the agent stage never does, and it refuses to start if handed it. Its `ntn_`/`secret_`
+shapes are scrubbed from anything posted. The integration needs read content, update content, and
+read and insert comments, shared with the Tickets database only. The code host uses that forge's usual
+token and vars: `AGENT_GITLAB_TOKEN` with `CI_API_V4_URL` (or `CI_SERVER_HOST`), or `GH_TOKEN` with
+`GITHUB_API_URL`. The publish stage's relay dispatches `notion-poll.yml` on `GITHUB_REPOSITORY` with
+`GH_TOKEN`.
+
+| Variable | Default | |
+|---|---|---|
+| `AGENT_PLATFORM` | | `notion` |
+| `NOTION_TOKEN` | | the integration's token (secret) |
+| `NOTION_PAGE_ID` | | the ticket a run works (the workflow's `page` input) |
+| `NOTION_DATA_SOURCE_ID` | | the Tickets data source, for the poller (`collection://…` is accepted) |
+| `NOTION_AGENT_USER_ID` | | the person in `Assignee` that stands for the agent |
+| `NOTION_TRUSTED_USERS` | (nobody) | comma-separated user ids whose tickets and comments are trusted |
+| `NOTION_CODE_PLATFORM` | | `gitlab` or `github` |
+| `NOTION_TITLE_PROPERTY` | `Name` | |
+| `NOTION_ID_PROPERTY` | `ID` | a `unique_id` property |
+| `NOTION_STATUS_PROPERTY` | `Status` | a `status` property |
+| `NOTION_ASSIGNEE_PROPERTY` | `Assignee` | a `people` property |
+| `NOTION_REPO_PROPERTY` | `Repo` | text or url |
+| `NOTION_REVIEW_LINK_PROPERTY` | `GitLab Link` on GitLab, unset on GitHub | a url property; `none` turns it off |
+| `NOTION_STATUS_TODO` / `_DOING` / `_BLOCKED` / `_REVIEW` | `To Do` / `Doing` / `Blocked` / `Needs Review` | |
+| `NOTION_RELAY_WORKFLOW` | `notion-poll.yml` | what a relay dispatches |
+| `NOTION_MAX_PICKUP` | `5` | tickets dispatched per poll |
+
 ### Stateless iteration, durable checkpoints
 
 The container and the model's context are ephemeral. The git remote and the issue thread are

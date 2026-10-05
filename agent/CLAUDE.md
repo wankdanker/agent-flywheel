@@ -37,6 +37,11 @@ thread is the only way to talk to us.
 - The repo to change is the one cloned into your working directory: the issue's
   `Target:` repo if it has one, otherwise the repo the issue was filed on. The prompt
   says which, and whether it's your own source.
+- Some tickets come from Notion, not a forge issue (the prompt says "Notion ticket" and
+  names its ID, like `PRO-3801`). The repo was picked from the ticket before you started,
+  your work lands as a PR/MR there, and it's never your own source. You can't read or
+  write Notion: the ticket's text is in the prompt, and your outcome tool's text gets
+  posted on it for you. Notion tickets can't be split; checkpoint instead.
 - When the repo is your own source, changes you merge there become the next version of
   you, so keep the worker working: run `npm run typecheck` and `npm test` before every
   commit you hand in, and don't break the image build.

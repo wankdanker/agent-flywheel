@@ -90,6 +90,37 @@ test("both platforms hand the caps to the stage that enforces them: MAX_BUDGET_U
   assert.match(readFileSync("./.gitlab/ci/agent.yml", "utf8"), /\$CI_PIPELINE_SOURCE == "api" && \$ISSUE && \$AGENT_TRIGGER == "relay"/);
 });
 
+test("docs/notion-poll.yml (for a maintainer to install): the agent job gets no Notion or forge token; prepare and publish no model credential", () => {
+  const text = readFileSync("./docs/notion-poll.yml", "utf8");
+  const [head, jobsText] = text.split(/^jobs:\n/m) as [string, string];
+  assert.deepEqual(mentions(head, [...FORGE, ...MODEL_CREDENTIAL_VARS]), [], "workflow-level env holds no secret");
+  const jobs = blocks(jobsText, 2);
+  for (const name of ["poll", "prepare", "agent", "publish", "unstick"]) assert.ok(jobs.has(name), `no ${name} job`);
+
+  const agent = jobs.get("agent")!.replace(/^.*docker login ghcr\.io.*$/m, "");
+  assert.ok(FORGE.includes("NOTION_TOKEN"));
+  assert.deepEqual(mentions(agent, FORGE), []);
+  assert.match(agent, /docker run --rm -e AGENT_PLATFORM -e NOTION_PAGE_ID \\\n\s+-e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(agent, /--stage agent/);
+
+  for (const name of ["poll", "prepare", "publish", "unstick"]) {
+    assert.deepEqual(mentions(jobs.get(name)!, MODEL_CREDENTIAL_VARS), [], `${name} job mentions a model credential`);
+  }
+  for (const name of ["prepare", "publish"]) {
+    const job = jobs.get(name)!;
+    for (const v of ["AGENT_PLATFORM", "NOTION_PAGE_ID", "NOTION_TOKEN", "NOTION_TRUSTED_USERS", "NOTION_AGENT_USER_ID", "NOTION_CODE_PLATFORM", "AGENT_GITLAB_TOKEN", "AGENT_REPO_ALLOWLIST", "MAX_CHAINED_RUNS"]) {
+      assert.match(job, new RegExp(`-e ${v}\\b`), `${name} doesn't pass ${v}`);
+    }
+    assert.match(job, new RegExp(`--stage ${name}`));
+  }
+  assert.match(jobs.get("prepare")!, /-e AGENT_TRIGGER/);
+  assert.match(jobs.get("poll")!, /node bin\/list-notion-tickets\.ts/);
+  assert.match(jobs.get("poll")!, /-f trigger=pickup/);
+  // Only the poll (dispatching per-ticket runs) and publish (the relay) dispatch workflows.
+  for (const name of ["poll", "publish"]) assert.match(jobs.get(name)!, /actions: write/, name);
+  for (const name of ["prepare", "agent"]) assert.doesNotMatch(jobs.get(name)!, /actions: write/, name);
+});
+
 test("GitHub chain workflows: the PR-code ones get no secret; the one holding the forge token runs from the default branch", () => {
   for (const f of ["chain-test", "chain-merged"]) {
     const text = readFileSync(`./.github/workflows/${f}.yml`, "utf8");

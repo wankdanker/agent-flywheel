@@ -25,8 +25,11 @@ export function isContinueCommand(body: string): boolean {
 //   manual   workflow_dispatch / a manual pipeline / a local run: always runs.
 //   relay    our own publish stage re-dispatching a checkpointed issue (see "Chained runs"
 //            below): runs only while that relay is still the latest word on a blocked issue.
-export type Trigger = "label" | "command" | "comment" | "manual" | "relay";
-export const TRIGGERS: readonly Trigger[] = ["label", "command", "comment", "manual", "relay"];
+//   pickup   a poller found the ticket ready (Notion: To Do, assigned to the agent; see
+//            src/notion.ts): runs only while it's still unstarted, so a poll that raced a run
+//            already under way, or queued behind one that has since settled, does nothing.
+export type Trigger = "label" | "command" | "comment" | "manual" | "relay" | "pickup";
+export const TRIGGERS: readonly Trigger[] = ["label", "command", "comment", "manual", "relay", "pickup"];
 export type Decision = { run: boolean; reason: string };
 
 export type CommentEvent = {
@@ -98,6 +101,7 @@ export function recheckTrigger(trigger: Trigger | undefined, labels: string[], c
   if (trigger === "label") return run(`\`${OPT_IN_LABEL}\` label added`);
   if (trigger === "command") return run(`explicit \`${CONTINUE_COMMAND}\``);
   const state = stateOf(labels);
+  if (trigger === "pickup") return state ? skip(`ticket is already \`${state}\`; only an unstarted one is picked up`) : run("picked up, unstarted");
   if (trigger === "relay") {
     if (state !== STATE_LABELS.blocked) return skip(`issue is now ${state ? `\`${state}\`` : "unstarted"}, not the \`${STATE_LABELS.blocked}\` a relay continues`);
     const n = pendingRelay(comments);
